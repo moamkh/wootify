@@ -1,0 +1,14 @@
+fastapi
+uvicorn[standard]
+httpx
+socksio
+pydantic
+pydantic-settings
+SQLAlchemy
+alembic
+python-multipart
+requests
+aiofiles
+cryptography
+python-bale-bot
+python-telegram-bot>=22,<23
