@@ -46,6 +46,7 @@ from app.services.enterprise_document_service import EnterpriseDocumentService
 from app.services.enterprise_gre_service import EnterpriseGreValidator
 from app.services.instance_service import InstanceService
 from app.utils.crypto_utils import encryptor
+from app.utils.logging_utils import log_sms_to_file
 
 logger = logging.getLogger("app.services.enterprise_bale")
 sms_logger = logging.getLogger("app.services.enterprise_sms")
@@ -429,6 +430,14 @@ class EnterpriseBaleService:
                     normalized_phone,
                 )
                 dropped += 1
+                # Optional file logging
+                if settings.ENTERPRISE_SMS_FILE_LOG_ENABLED:
+                    log_sms_to_file(
+                        phone_number=normalized_phone,
+                        text=text,
+                        status="dropped: user_not_found",
+                        sms_id=item_id,
+                    )
                 continue
 
             sms_logger.debug(
@@ -450,20 +459,57 @@ class EnterpriseBaleService:
                         normalized_phone,
                     )
                     dropped += 1
+                    # Optional file logging
+                    if settings.ENTERPRISE_SMS_FILE_LOG_ENABLED:
+                        log_sms_to_file(
+                            phone_number=normalized_phone,
+                            text=text,
+                            status="dropped: missing_chat_id",
+                            sms_id=item_id,
+                        )
                     continue
                 try:
-                    await self._send_text(instance_key, chat_id, text)
-                    sms_logger.debug(
-                        "sync.delivery_sent instance=%s sms_id=%s user_id=%s chat_id=%s lookup_phone=%s",
+                    sms_logger.info(
+                        "sync.item_send_start instance=%s sms_id=%s user_id=%s chat_id=%s text_len=%s lookup_phone=%s",
                         instance_key,
                         item_id,
                         user.id,
                         chat_id,
+                        len(text or ""),
+                        normalized_phone,
+                    )
+                    await self._send_text(instance_key, chat_id, text)
+                    sms_logger.info(
+                        "sync.delivery_sent instance=%s sms_id=%s user_id=%s chat_id=%s text_len=%s lookup_phone=%s",
+                        instance_key,
+                        item_id,
+                        user.id,
+                        chat_id,
+                        len(text or ""),
                         normalized_phone,
                     )
                     delivered += 1
-                except Exception:
+                    # Optional file logging
+                    if settings.ENTERPRISE_SMS_FILE_LOG_ENABLED:
+                        log_sms_to_file(
+                            phone_number=normalized_phone,
+                            text=text,
+                            status="sent",
+                            sms_id=item_id,
+                        )
+                except Exception as exc:
                     failed += 1
+                    sms_logger.error(
+                        "sync.delivery_failed instance=%s user_id=%s chat_id=%s sms_id=%s text_len=%s error_type=%s error=%s",
+                        instance_key,
+                        user.id,
+                        chat_id,
+                        item_id,
+                        len(text or ""),
+                        type(exc).__name__,
+                        str(exc),
+                        exc_info=True,
+                    )
                     logger.exception(
                         "enterprise.sms_delivery_failed instance=%s user_id=%s chat_id=%s sms_id=%s",
                         instance_key,
@@ -471,6 +517,14 @@ class EnterpriseBaleService:
                         chat_id,
                         item_id,
                     )
+                    # Optional file logging
+                    if settings.ENTERPRISE_SMS_FILE_LOG_ENABLED:
+                        log_sms_to_file(
+                            phone_number=normalized_phone,
+                            text=text,
+                            status=f"failed: {type(exc).__name__}",
+                            sms_id=item_id,
+                        )
 
         sms_logger.info(
             "sync.done instance=%s fetched=%s delivered=%s dropped=%s failed=%s last_id=%s",
@@ -1183,6 +1237,7 @@ class EnterpriseBaleService:
             user,
             chat_id,
             platform_metadata=runtime.platform_metadata,
+            send_prompt_text=False,
         )
 
     async def _enter_live_route(
@@ -1875,11 +1930,16 @@ class EnterpriseBaleService:
         *,
         platform_metadata: Optional[dict[str, Any]] = None,
         rebuild_keyboard: bool = False,
+        send_prompt_text: bool = True,
     ) -> None:
         """Render the correct GRE-root menu."""
         markup = self._root_menu_markup(user.gre_status)
-        prompt_text = self._message_text(
-            platform_metadata, "enterprise_menu_prompt_text", MENU_PROMPT_TEXT
+        prompt_text = (
+            self._message_text(
+                platform_metadata, "enterprise_menu_prompt_text", MENU_PROMPT_TEXT
+            )
+            if send_prompt_text
+            else ""
         )
         logger.info(
             "enterprise.menu_send instance=%s chat_id=%s menu=root gre_status=%s rebuild=%s items=%s",
@@ -1899,21 +1959,23 @@ class EnterpriseBaleService:
             await asyncio.sleep(0.15)
         if user.gre_status == EnterpriseGreStatus.eligible:
             user.current_state = EnterpriseUserState.eligible_root
+            if prompt_text:  # Only send message if text is not empty
+                await self._send_text(
+                    instance_key,
+                    chat_id,
+                    prompt_text,
+                    reply_markup=markup,
+                )
+            return
+
+        user.current_state = EnterpriseUserState.ineligible_root
+        if prompt_text:  # Only send message if text is not empty
             await self._send_text(
                 instance_key,
                 chat_id,
                 prompt_text,
                 reply_markup=markup,
             )
-            return
-
-        user.current_state = EnterpriseUserState.ineligible_root
-        await self._send_text(
-            instance_key,
-            chat_id,
-            prompt_text,
-            reply_markup=markup,
-        )
 
     async def _send_phone_prompt(
         self,

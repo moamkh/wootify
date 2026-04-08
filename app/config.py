@@ -52,6 +52,7 @@ class Settings(BaseSettings):
     ENTERPRISE_SMS_POLL_INTERVAL_MINUTES: int = 20
     ENTERPRISE_SMS_INITIAL_LAST_ID: int = 0
     ENTERPRISE_SMS_HTTP_TIMEOUT_SECONDS: int = 30
+    ENTERPRISE_SMS_FILE_LOG_ENABLED: bool = False
 
     TELEGRAM_API_BASE_URL: str = 'https://api.telegram.org/bot'
     TELEGRAM_FILE_BASE_URL: str = 'https://api.telegram.org/file/bot'

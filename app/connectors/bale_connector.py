@@ -409,10 +409,11 @@ class BaleBotConnector(BaleConnector):
                 )
             else:
                 self._logger.info(
-                    "send_text instance=%s chat_id=%s text_len=%s reply_markup=%s",
+                    "send_text instance=%s chat_id=%s text_len=%s text_is_empty=%s reply_markup=%s",
                     instance,
                     chat_id,
                     len(text or ""),
+                    not bool(text or "").strip(),
                     self._reply_markup_summary(components),
                 )
             result = await self._request(
@@ -428,9 +429,12 @@ class BaleBotConnector(BaleConnector):
             }
         except Exception as exc:
             self._logger.error(
-                "send_text failed instance=%s chat_id=%s error=%s",
+                "send_text failed instance=%s chat_id=%s text_len=%s text_is_empty=%s error_type=%s error=%s",
                 instance,
                 chat_id,
+                len(text or ""),
+                not bool(text or "").strip(),
+                type(exc).__name__,
                 str(exc),
                 exc_info=True,
             )
