@@ -13,12 +13,16 @@ import {
   createInstance,
   deleteEnterpriseCatalog,
   deleteEnterpriseManual,
+  patchEnterpriseManual,
+  deleteEnterpriseManualGroup,
   deleteInstance,
   getEnterpriseSmsSyncConfig,
   getEnterpriseCatalog,
   listConversationMessages,
   listConversations,
   listEnterpriseManuals,
+  listEnterpriseManualGroups,
+  listEnterpriseManualGroupManuals,
   listEnterpriseSessions,
   listFeatures,
   listInstances,
@@ -29,6 +33,10 @@ import {
   uploadEnterpriseManual,
   updateEnterpriseSmsSyncConfig,
   updateInstance,
+  createEnterpriseManualGroup,
+  renameEnterpriseManualGroup,
+  addManualToEnterpriseGroup,
+  removeManualFromEnterpriseGroup,
 } from './api.js';
 
 const PLATFORM_BALE = 'bale';
@@ -384,11 +392,17 @@ export default function App() {
     parent_platform_message_id: '',
   });
   const [enterpriseManuals, setEnterpriseManuals] = useState([]);
+  const [enterpriseManualGroups, setEnterpriseManualGroups] = useState([]);
+  const [manualGroupByAssetId, setManualGroupByAssetId] = useState({});
   const [enterpriseCatalog, setEnterpriseCatalog] = useState(null);
   const [enterpriseSessions, setEnterpriseSessions] = useState([]);
   const [manualDisplayName, setManualDisplayName] = useState('');
   const [manualLinkUrl, setManualLinkUrl] = useState('');
   const [manualFile, setManualFile] = useState(null);
+  const [editingManualId, setEditingManualId] = useState('');
+  const [editingManualDisplayName, setEditingManualDisplayName] = useState('');
+  const [editingManualLinkUrl, setEditingManualLinkUrl] = useState('');
+  const [editingManualGroupId, setEditingManualGroupId] = useState('');
   const [catalogDisplayName, setCatalogDisplayName] = useState('');
   const [catalogLinkUrl, setCatalogLinkUrl] = useState('');
   const [catalogFile, setCatalogFile] = useState(null);
@@ -473,6 +487,7 @@ export default function App() {
   async function loadEnterpriseResources(instanceKey) {
     if (!instanceKey) {
       setEnterpriseManuals([]);
+      setManualGroupByAssetId({});
       setEnterpriseCatalog(null);
       setEnterpriseSessions([]);
       return;
@@ -481,17 +496,36 @@ export default function App() {
     const row = instanceMap[instanceKey];
     if (row?.platform_type_key !== PLATFORM_BALE_ENTERPRISE) {
       setEnterpriseManuals([]);
+      setEnterpriseManualGroups([]);
+      setManualGroupByAssetId({});
       setEnterpriseCatalog(null);
       setEnterpriseSessions([]);
       return;
     }
 
-    const [manuals, catalog, sessions] = await Promise.all([
+    const [manuals, groups, catalog, sessions] = await Promise.all([
       listEnterpriseManuals(instanceKey),
+      listEnterpriseManualGroups(instanceKey),
       getEnterpriseCatalog(instanceKey),
       listEnterpriseSessions(instanceKey),
     ]);
+    const groupManualLists = await Promise.all(
+      (groups || []).map(async (group) => ({
+        groupId: group.id,
+        manuals: await listEnterpriseManualGroupManuals(instanceKey, group.id),
+      })),
+    );
+    const groupMap = {};
+    for (const entry of groupManualLists) {
+      for (const manual of entry.manuals || []) {
+        if (manual?.id) {
+          groupMap[manual.id] = entry.groupId;
+        }
+      }
+    }
     setEnterpriseManuals(manuals || []);
+    setEnterpriseManualGroups(groups || []);
+    setManualGroupByAssetId(groupMap);
     setEnterpriseCatalog(catalog || null);
     setEnterpriseSessions(sessions || []);
   }
@@ -525,6 +559,8 @@ export default function App() {
     if (!selectedKey) return;
     loadEnterpriseResources(selectedKey).catch(() => {
       setEnterpriseManuals([]);
+      setEnterpriseManualGroups([]);
+      setManualGroupByAssetId({});
       setEnterpriseCatalog(null);
       setEnterpriseSessions([]);
     });
@@ -680,6 +716,7 @@ export default function App() {
     setSelectedKey('');
     setForm(defaultForm(features));
     setEnterpriseManuals([]);
+    setEnterpriseManualGroups([]);
     setEnterpriseCatalog(null);
     setEnterpriseSessions([]);
     setManualDisplayName('');
@@ -826,8 +863,8 @@ export default function App() {
       alert('Save the instance first');
       return;
     }
-    if (!manualDisplayName.trim() || !manualLinkUrl.trim() || !manualFile) {
-      alert('Manual display name, link URL, and PDF file are required');
+    if (!manualDisplayName.trim() || !manualFile) {
+      alert('Manual display name and PDF file are required');
       return;
     }
     setBusy(true);
@@ -854,6 +891,108 @@ export default function App() {
     setBusy(true);
     try {
       await deleteEnterpriseManual(selectedKey, assetId);
+      await loadEnterpriseResources(selectedKey);
+    } catch (e) {
+      alert(e?.message || String(e));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  function onStartEditManual(item) {
+    setEditingManualId(item.id);
+    setEditingManualDisplayName(item.display_name || item.original_filename || '');
+    setEditingManualLinkUrl(item.link_url || '');
+    setEditingManualGroupId(manualGroupByAssetId[item.id] || '');
+  }
+
+  function onCancelEditManual() {
+    setEditingManualId('');
+    setEditingManualDisplayName('');
+    setEditingManualLinkUrl('');
+    setEditingManualGroupId('');
+  }
+
+  async function onSaveEditManual(assetId) {
+    if (!selectedKey) return;
+    const nextName = editingManualDisplayName.trim();
+    const nextLink = editingManualLinkUrl.trim();
+    if (!nextName) {
+      alert('Display name is required');
+      return;
+    }
+    setBusy(true);
+    try {
+      const patchBody = {
+        display_name: nextName,
+      };
+      if (nextLink) {
+        patchBody.link_url = nextLink;
+      }
+      await patchEnterpriseManual(selectedKey, assetId, {
+        ...patchBody,
+      });
+
+      const currentGroupId = manualGroupByAssetId[assetId] || '';
+      const nextGroupId = editingManualGroupId || '';
+      if (currentGroupId && currentGroupId !== nextGroupId) {
+        await removeManualFromEnterpriseGroup(selectedKey, currentGroupId, assetId);
+      }
+      if (nextGroupId && currentGroupId !== nextGroupId) {
+        await addManualToEnterpriseGroup(selectedKey, nextGroupId, assetId);
+      }
+
+      onCancelEditManual();
+      await loadEnterpriseResources(selectedKey);
+    } catch (e) {
+      alert(e?.message || String(e));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function onAddGroupFromManualEdit() {
+    if (!selectedKey) return;
+    const name = prompt('New group name:');
+    if (!name || !name.trim()) return;
+    setBusy(true);
+    try {
+      const created = await createEnterpriseManualGroup(selectedKey, name.trim());
+      await loadEnterpriseResources(selectedKey);
+      if (created?.id) {
+        setEditingManualGroupId(created.id);
+      }
+    } catch (e) {
+      alert(e?.message || String(e));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function onRenameGroupFromManualEdit(group) {
+    if (!selectedKey || !group?.id) return;
+    const nextName = prompt('Edit group name:', group.name || '');
+    if (!nextName || !nextName.trim()) return;
+    setBusy(true);
+    try {
+      await renameEnterpriseManualGroup(selectedKey, group.id, nextName.trim());
+      await loadEnterpriseResources(selectedKey);
+    } catch (e) {
+      alert(e?.message || String(e));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function onDeleteGroupFromManualEdit(group) {
+    if (!selectedKey || !group?.id) return;
+    if (!confirm(`Delete group "${group.name}"?`)) return;
+    setBusy(true);
+    try {
+      await deleteEnterpriseManualGroup(selectedKey, group.id);
+      if (editingManualGroupId === group.id) {
+        setEditingManualGroupId('');
+      }
       await loadEnterpriseResources(selectedKey);
     } catch (e) {
       alert(e?.message || String(e));
@@ -2197,24 +2336,131 @@ export default function App() {
                   {enterpriseManuals.map((item) => (
                     <div key={item.id} className="list-item">
                       <div className="list-main">
-                        <div className="list-title">{item.display_name || item.original_filename}</div>
-                        <div className="list-meta">
-                          {item.original_filename} · {(item.size_bytes / 1024).toFixed(1)} KB
-                        </div>
-                        <div className="list-meta">
-                          Link:{' '}
-                          {item.link_url ? (
-                            <a href={item.link_url} target="_blank" rel="noreferrer">
-                              {item.link_url}
-                            </a>
-                          ) : (
-                            '-'
-                          )}
-                        </div>
+                        {(() => {
+                          const groupId = manualGroupByAssetId[item.id] || '';
+                          const groupName = groupId
+                            ? (enterpriseManualGroups.find((g) => g.id === groupId)?.name || '-')
+                            : 'Unassigned';
+                          return (
+                            <>
+                        {editingManualId === item.id ? (
+                          <div className="row">
+                            <label>
+                              Display Name
+                              <input
+                                value={editingManualDisplayName}
+                                onChange={(e) => setEditingManualDisplayName(e.target.value)}
+                              />
+                            </label>
+                            <label>
+                              Link URL
+                              <input
+                                type="url"
+                                value={editingManualLinkUrl}
+                                onChange={(e) => setEditingManualLinkUrl(e.target.value)}
+                              />
+                            </label>
+                            <label>
+                              Group
+                              <select
+                                value={editingManualGroupId}
+                                onChange={(e) => setEditingManualGroupId(e.target.value)}
+                              >
+                                <option value="">Unassigned</option>
+                                {enterpriseManualGroups.map((group) => (
+                                  <option key={group.id} value={group.id}>
+                                    {group.name}
+                                  </option>
+                                ))}
+                              </select>
+                              <div className="list-actions" style={{ marginTop: 8 }}>
+                                <button
+                                  className="btn ghost"
+                                  type="button"
+                                  disabled={busy || !selectedKey}
+                                  onClick={onAddGroupFromManualEdit}
+                                >
+                                  + Add Group
+                                </button>
+                              </div>
+                              {enterpriseManualGroups.length > 0 ? (
+                                <div style={{ marginTop: 8 }}>
+                                  {enterpriseManualGroups.map((group) => (
+                                    <div
+                                      key={`group-manage-${group.id}`}
+                                      style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 8, marginBottom: 4 }}
+                                    >
+                                      <span>{group.name}</span>
+                                      <div style={{ display: 'flex', gap: 6 }}>
+                                        <button
+                                          className="btn ghost"
+                                          type="button"
+                                          title="Edit group name"
+                                          aria-label={`Edit group ${group.name}`}
+                                          disabled={busy}
+                                          onClick={() => onRenameGroupFromManualEdit(group)}
+                                        >
+                                          ✏
+                                        </button>
+                                        <button
+                                          className="btn danger"
+                                          type="button"
+                                          title="Delete group"
+                                          aria-label={`Delete group ${group.name}`}
+                                          disabled={busy}
+                                          onClick={() => onDeleteGroupFromManualEdit(group)}
+                                        >
+                                          🗑
+                                        </button>
+                                      </div>
+                                    </div>
+                                  ))}
+                                </div>
+                              ) : null}
+                            </label>
+                          </div>
+                        ) : (
+                          <>
+                            <div className="list-title">{item.display_name || item.original_filename}</div>
+                            <div className="list-meta">
+                              {item.original_filename} · {(item.size_bytes / 1024).toFixed(1)} KB
+                            </div>
+                            <div className="list-meta">Group: {groupName}</div>
+                            <div className="list-meta">
+                              Link:{' '}
+                              {item.link_url ? (
+                                <a href={item.link_url} target="_blank" rel="noreferrer">
+                                  {item.link_url}
+                                </a>
+                              ) : (
+                                '-'
+                              )}
+                            </div>
+                          </>
+                        )}
+                            </>
+                          );
+                        })()}
                       </div>
-                      <button className="btn danger" type="button" disabled={busy} onClick={() => onDeleteManual(item.id)}>
-                        Delete
-                      </button>
+                      <div className="list-actions">
+                        {editingManualId === item.id ? (
+                          <>
+                            <button className="btn" type="button" disabled={busy} onClick={() => onSaveEditManual(item.id)}>
+                              Save
+                            </button>
+                            <button className="btn ghost" type="button" disabled={busy} onClick={onCancelEditManual}>
+                              Cancel
+                            </button>
+                          </>
+                        ) : (
+                          <button className="btn" type="button" disabled={busy} onClick={() => onStartEditManual(item)}>
+                            Edit
+                          </button>
+                        )}
+                        <button className="btn danger" type="button" disabled={busy} onClick={() => onDeleteManual(item.id)}>
+                          Delete
+                        </button>
+                      </div>
                     </div>
                   ))}
                 </div>

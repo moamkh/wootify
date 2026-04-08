@@ -125,6 +125,17 @@ export function deleteEnterpriseManual(instanceKey, assetId) {
   );
 }
 
+export function patchEnterpriseManual(instanceKey, assetId, body) {
+  return fetchJSON(
+    `/api/v1/instances/${encodeURIComponent(instanceKey)}/enterprise/manuals/${encodeURIComponent(assetId)}`,
+    {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    },
+  );
+}
+
 export async function getEnterpriseCatalog(instanceKey) {
   const data = await fetchJSON(`/api/v1/instances/${encodeURIComponent(instanceKey)}/enterprise/catalog`);
   return data?.item || null;
@@ -145,6 +156,50 @@ export function replaceEnterpriseCatalog(instanceKey, { displayName, linkUrl, fi
 
 export function deleteEnterpriseCatalog(instanceKey) {
   return fetchJSON(`/api/v1/instances/${encodeURIComponent(instanceKey)}/enterprise/catalog`, { method: 'DELETE' });
+}
+
+export async function listEnterpriseManualGroups(instanceKey) {
+  const data = await fetchJSON(`/api/v1/instances/${encodeURIComponent(instanceKey)}/enterprise/manual-groups`);
+  return data?.items || [];
+}
+
+export function createEnterpriseManualGroup(instanceKey, groupName) {
+  return fetchJSON(`/api/v1/instances/${encodeURIComponent(instanceKey)}/enterprise/manual-groups`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ name: groupName }),
+  });
+}
+
+export function renameEnterpriseManualGroup(instanceKey, groupId, newName) {
+  return fetchJSON(`/api/v1/instances/${encodeURIComponent(instanceKey)}/enterprise/manual-groups/${encodeURIComponent(groupId)}`, {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ name: newName }),
+  });
+}
+
+export function deleteEnterpriseManualGroup(instanceKey, groupId) {
+  return fetchJSON(`/api/v1/instances/${encodeURIComponent(instanceKey)}/enterprise/manual-groups/${encodeURIComponent(groupId)}`, {
+    method: 'DELETE',
+  });
+}
+
+export async function listEnterpriseManualGroupManuals(instanceKey, groupId) {
+  const data = await fetchJSON(`/api/v1/instances/${encodeURIComponent(instanceKey)}/enterprise/manual-groups/${encodeURIComponent(groupId)}/manuals`);
+  return data?.items || [];
+}
+
+export function addManualToEnterpriseGroup(instanceKey, groupId, assetId) {
+  return fetchJSON(`/api/v1/instances/${encodeURIComponent(instanceKey)}/enterprise/manual-groups/${encodeURIComponent(groupId)}/manuals/${encodeURIComponent(assetId)}`, {
+    method: 'POST',
+  });
+}
+
+export function removeManualFromEnterpriseGroup(instanceKey, groupId, assetId) {
+  return fetchJSON(`/api/v1/instances/${encodeURIComponent(instanceKey)}/enterprise/manual-groups/${encodeURIComponent(groupId)}/manuals/${encodeURIComponent(assetId)}`, {
+    method: 'DELETE',
+  });
 }
 
 export async function listEnterpriseSessions(instanceKey) {

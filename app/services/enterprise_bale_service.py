@@ -39,6 +39,9 @@ from app.repositories.enterprise_bale_user_repository import (
 from app.repositories.enterprise_document_asset_repository import (
     EnterpriseDocumentAssetRepository,
 )
+from app.repositories.enterprise_manual_group_repository import (
+    EnterpriseManualGroupRepository,
+)
 from app.repositories.enterprise_pending_message_repository import (
     EnterprisePendingMessageRepository,
 )
@@ -677,7 +680,10 @@ class EnterpriseBaleService:
             db.commit()
             return {"message": "phone_saved", "status": "ok"}
 
-        if user.current_state == EnterpriseUserState.manual_menu:
+        if user.current_state in {
+            EnterpriseUserState.manual_menu,
+            EnterpriseUserState.manual_group_menu,
+        }:
             handled = await self._handle_manual_menu(
                 db, runtime, user, str(chat_id), text
             )
@@ -971,18 +977,36 @@ class EnterpriseBaleService:
         """Handle eligible-root user actions."""
         action = ELIGIBLE_ACTIONS.get(self._normalize_action_text(text))
         if action == "user_manual":
-            self._set_user_state(db, user, EnterpriseUserState.manual_menu)
-            await self._send_text(
-                runtime.instance.instance_key,
-                chat_id,
-                self._message_text(
-                    runtime.platform_metadata,
-                    "enterprise_menu_prompt_text",
-                    MENU_PROMPT_TEXT,
-                ),
-                reply_markup=self._manual_menu_markup(db, runtime.instance.id),
-            )
-            return {"message": "manual_menu_opened", "status": "ok"}
+            # Check if manual groups are configured
+            groups = EnterpriseManualGroupRepository(db).list_by_instance(runtime.instance.id, active_only=True)
+            if groups:
+                # Show group menu first
+                self._set_user_state(db, user, EnterpriseUserState.manual_group_menu)
+                await self._send_text(
+                    runtime.instance.instance_key,
+                    chat_id,
+                    self._message_text(
+                        runtime.platform_metadata,
+                        "enterprise_menu_prompt_text",
+                        MENU_PROMPT_TEXT,
+                    ),
+                    reply_markup=self._manual_group_menu_markup(groups),
+                )
+                return {"message": "manual_group_menu_opened", "status": "ok"}
+            else:
+                # Fallback: show manuals directly if no groups
+                self._set_user_state(db, user, EnterpriseUserState.manual_menu)
+                await self._send_text(
+                    runtime.instance.instance_key,
+                    chat_id,
+                    self._message_text(
+                        runtime.platform_metadata,
+                        "enterprise_menu_prompt_text",
+                        MENU_PROMPT_TEXT,
+                    ),
+                    reply_markup=self._manual_menu_markup(db, runtime.instance.id),
+                )
+                return {"message": "manual_menu_opened", "status": "ok"}
         if action == "customer_service_addresses":
             self._set_user_state(db, user, EnterpriseUserState.address_menu)
             await self._send_text(
@@ -1074,11 +1098,15 @@ class EnterpriseBaleService:
         chat_id: str,
         text: str,
     ) -> dict[str, Any]:
-        """Handle manual-menu selections."""
+        """Handle manual-menu and manual-group-menu selections."""
         if user.gre_status == EnterpriseGreStatus.ineligible:
             return {"message": "phone_recheck_requested", "status": "ok"}
 
         if self._is_back_to_menu(text):
+            # Clear group selection when going back to root
+            user.current_group_id = None
+            db.add(user)
+            db.flush()
             await self._show_root_menu(
                 runtime.instance.instance_key,
                 user,
@@ -1090,7 +1118,75 @@ class EnterpriseBaleService:
             )
             return {"message": "manual_menu_closed", "status": "ok"}
 
-        manuals = self._documents.list_manuals(db, runtime.instance.instance_key)
+        # Handle group selection (if in manual_group_menu state)
+        if user.current_state == EnterpriseUserState.manual_group_menu:
+            # Check if text matches a group name
+            groups = EnterpriseManualGroupRepository(db).list_by_instance(runtime.instance.id, active_only=True)
+            selected_group = next(
+                (g for g in groups if str(g.name).strip() == str(text or "").strip()),
+                None,
+            )
+            if selected_group:
+                # Store group selection and transition to manual_menu
+                user.current_group_id = selected_group.id
+                self._set_user_state(db, user, EnterpriseUserState.manual_menu)
+                # Show manuals in this group
+                manuals = EnterpriseDocumentAssetRepository(db).list_by_group(selected_group.id, active_only=True)
+                if not manuals:
+                    await self._send_text(
+                        runtime.instance.instance_key,
+                        chat_id,
+                        self._message_text(
+                            runtime.platform_metadata,
+                            "enterprise_no_manuals_text",
+                            NO_MANUALS_TEXT,
+                        ),
+                        reply_markup=self._manual_menu_markup(db, runtime.instance.id),
+                    )
+                else:
+                    # Build keyboard with manuals from this group
+                    keyboard = [
+                        [{"text": str(m.display_name or m.original_filename).strip()}]
+                        for m in manuals
+                    ]
+                    keyboard.append([{"text": BACK_TO_MENU_LABEL}])
+                    markup = {
+                        "keyboard": keyboard,
+                        "resize_keyboard": True,
+                        "one_time_keyboard": True,
+                    }
+                    await self._send_text(
+                        runtime.instance.instance_key,
+                        chat_id,
+                        self._message_text(
+                            runtime.platform_metadata,
+                            "enterprise_menu_prompt_text",
+                            MENU_PROMPT_TEXT,
+                        ),
+                        reply_markup=markup,
+                    )
+                return {"message": "manual_menu_opened_for_group", "status": "ok"}
+            else:
+                # Invalid selection, show groups again
+                await self._send_text(
+                    runtime.instance.instance_key,
+                    chat_id,
+                    self._message_text(
+                        runtime.platform_metadata,
+                        "enterprise_menu_prompt_text",
+                        MENU_PROMPT_TEXT,
+                    ),
+                    reply_markup=self._manual_group_menu_markup(groups),
+                )
+                return {"message": "group_not_found", "detail": "selection_invalid"}
+
+        # Handle manual selection (if in manual_menu state)
+        # If a group is selected, show only manuals from that group
+        if user.current_group_id:
+            manuals = EnterpriseDocumentAssetRepository(db).list_by_group(user.current_group_id, active_only=True)
+        else:
+            manuals = self._documents.list_manuals(db, runtime.instance.instance_key)
+
         selected = next(
             (
                 item
@@ -1138,6 +1234,10 @@ class EnterpriseBaleService:
                 db, runtime.instance.id, user.gre_status
             ),
         )
+        # Clear group selection after sending manual
+        user.current_group_id = None
+        db.add(user)
+        db.flush()
         return {"message": "manual_sent", "status": "ok"}
 
     async def _handle_address_menu(
@@ -2276,6 +2376,20 @@ class EnterpriseBaleService:
         keyboard = [
             [{"text": str(row.display_name or row.original_filename).strip()}]
             for row in rows
+        ]
+        keyboard.append([{"text": BACK_TO_MENU_LABEL}])
+        return {
+            "keyboard": keyboard,
+            "resize_keyboard": True,
+            "one_time_keyboard": True,
+        }
+
+    @staticmethod
+    def _manual_group_menu_markup(groups: list) -> dict[str, Any]:
+        """Build the manual-group selection keyboard."""
+        keyboard = [
+            [{"text": str(group.name).strip()}]
+            for group in groups
         ]
         keyboard.append([{"text": BACK_TO_MENU_LABEL}])
         return {

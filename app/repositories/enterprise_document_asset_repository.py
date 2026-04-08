@@ -10,7 +10,7 @@ from typing import Optional
 
 from sqlalchemy.orm import Session
 
-from app.models import EnterpriseDocumentAsset, EnterpriseDocumentAssetType
+from app.models import EnterpriseDocumentAsset, EnterpriseDocumentAssetType, EnterpriseManualGroupAssignment
 
 
 class EnterpriseDocumentAssetRepository:
@@ -78,3 +78,40 @@ class EnterpriseDocumentAssetRepository:
         self.db.add(row)
         self.db.flush()
         return row
+
+    def list_by_group(
+        self,
+        group_id: str,
+        *,
+        active_only: bool = True,
+    ) -> list[EnterpriseDocumentAsset]:
+        """List manuals assigned to a group, ordered by assignment sort order."""
+        query = (
+            self.db.query(EnterpriseDocumentAsset)
+            .join(EnterpriseManualGroupAssignment)
+            .filter(EnterpriseManualGroupAssignment.group_id == group_id)
+        )
+        if active_only:
+            query = query.filter(EnterpriseDocumentAsset.is_active.is_(True))
+        return query.order_by(EnterpriseManualGroupAssignment.sort_order).all()
+
+    def list_unassigned_for_instance(
+        self,
+        instance_id: str,
+        *,
+        active_only: bool = True,
+    ) -> list[EnterpriseDocumentAsset]:
+        """List manuals not assigned to any group for an instance."""
+        query = (
+            self.db.query(EnterpriseDocumentAsset)
+            .filter(
+                EnterpriseDocumentAsset.instance_id == instance_id,
+                EnterpriseDocumentAsset.asset_type == EnterpriseDocumentAssetType.manual,
+                ~self.db.query(EnterpriseManualGroupAssignment).filter(
+                    EnterpriseManualGroupAssignment.asset_id == EnterpriseDocumentAsset.id
+                ).exists(),
+            )
+        )
+        if active_only:
+            query = query.filter(EnterpriseDocumentAsset.is_active.is_(True))
+        return query.order_by(EnterpriseDocumentAsset.sort_order, EnterpriseDocumentAsset.created_at).all()

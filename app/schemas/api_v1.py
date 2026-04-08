@@ -212,6 +212,12 @@ class EnterpriseDocumentListResponse(BaseModel):
     items: list[EnterpriseDocumentAssetResponse]
 
 
+class EnterpriseDocumentAssetPatchRequest(BaseModel):
+    """Patch request schema for enterprise document asset metadata."""
+    display_name: Optional[str] = Field(None, min_length=1, max_length=255)
+    link_url: Optional[str] = None
+
+
 class EnterpriseCatalogResponse(BaseModel):
     """Response schema for the active enterprise catalog."""
     item: Optional[EnterpriseDocumentAssetResponse] = None
@@ -285,3 +291,33 @@ class EnterpriseSmsSyncRunResponse(BaseModel):
     failed: int = 0
     last_id: Optional[int] = None
     detail: Optional[str] = None
+
+
+class EnterpriseManualGroupResponse(BaseModel):
+    """Response schema for enterprise manual groups."""
+    id: str
+    name: str
+    sort_order: int
+    is_active: bool
+    created_at: datetime
+    updated_at: datetime
+
+
+class EnterpriseManualGroupListResponse(BaseModel):
+    """Response schema for enterprise manual groups list operations."""
+    items: list[EnterpriseManualGroupResponse]
+
+
+class EnterpriseManualGroupCreateRequest(BaseModel):
+    """Create request schema for enterprise manual groups."""
+    name: str = Field(..., min_length=1, max_length=255)
+
+
+class EnterpriseManualGroupUpdateRequest(BaseModel):
+    """Update request schema for enterprise manual groups."""
+    name: str = Field(..., min_length=1, max_length=255)
+
+
+class EnterpriseManualGroupManualsResponse(BaseModel):
+    """Response schema for manuals in an enterprise manual group."""
+    items: list[EnterpriseDocumentAssetResponse]

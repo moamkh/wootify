@@ -49,12 +49,12 @@ class EnterpriseDocumentService:
         instance_key: str,
         *,
         display_name: str,
-        link_url: str,
+        link_url: Optional[str],
         upload: UploadFile,
     ) -> EnterpriseDocumentAsset:
         """Upload a new manual asset."""
         runtime = self._require_enterprise_runtime(db, instance_key)
-        normalized_link_url = self._normalize_required_link_url(link_url)
+        normalized_link_url = self._normalize_optional_link_url(link_url)
         filename = self._safe_filename(upload.filename)
         if not filename:
             raise ValueError('manual file is required')
@@ -141,6 +141,43 @@ class EnterpriseDocumentService:
         db.commit()
         self._delete_file_quietly(storage_path)
         return True
+
+    def update_manual_metadata(
+        self,
+        db: Session,
+        instance_key: str,
+        asset_id: str,
+        *,
+        display_name: Optional[str] = None,
+        link_url: Optional[str] = None,
+    ) -> Optional[EnterpriseDocumentAsset]:
+        """Update manual display name and/or link URL without changing file content."""
+        runtime = self._require_enterprise_runtime(db, instance_key)
+        row = self._repo_cls(db).get_by_id(asset_id)
+        if not row or row.instance_id != runtime.instance.id:
+            return None
+        if row.asset_type != EnterpriseDocumentAssetType.manual:
+            raise ValueError('asset is not a manual')
+
+        changed = False
+        if display_name is not None:
+            normalized_name = str(display_name).strip()
+            if not normalized_name:
+                raise ValueError('display_name cannot be empty')
+            row.display_name = normalized_name
+            changed = True
+
+        if link_url is not None:
+            row.link_url = self._normalize_optional_link_url(link_url)
+            changed = True
+
+        if not changed:
+            raise ValueError('nothing to update')
+
+        self._repo_cls(db).save(row)
+        db.commit()
+        db.refresh(row)
+        return row
 
     def read_asset_bytes(self, db: Session, asset_id: str) -> tuple[EnterpriseDocumentAsset, bytes]:
         """Load an asset payload from storage."""
@@ -255,6 +292,17 @@ class EnterpriseDocumentService:
         text = str(value or '').strip()
         if not text:
             raise ValueError('link_url is required')
+        parsed = urlparse(text)
+        if parsed.scheme.lower() not in {'http', 'https'} or not parsed.netloc:
+            raise ValueError('link_url must be a valid absolute http(s) URL')
+        return text
+
+    @staticmethod
+    def _normalize_optional_link_url(value: Optional[str]) -> str:
+        """Validate and normalize optional HTTP(S) link values."""
+        text = str(value or '').strip()
+        if not text:
+            return ''
         parsed = urlparse(text)
         if parsed.scheme.lower() not in {'http', 'https'} or not parsed.netloc:
             raise ValueError('link_url must be a valid absolute http(s) URL')

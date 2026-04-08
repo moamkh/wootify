@@ -72,6 +72,7 @@ class EnterpriseUserState(str, enum.Enum):
     awaiting_phone_input = "awaiting_phone_input"
     eligible_root = "eligible_root"
     ineligible_root = "ineligible_root"
+    manual_group_menu = "manual_group_menu"
     manual_menu = "manual_menu"
     address_menu = "address_menu"
     live_customer_service = "live_customer_service"
@@ -196,6 +197,11 @@ class Instance(Base):
     )
     enterprise_document_assets = relationship(
         "EnterpriseDocumentAsset",
+        back_populates="instance",
+        cascade="all, delete-orphan",
+    )
+    enterprise_manual_groups = relationship(
+        "EnterpriseManualGroup",
         back_populates="instance",
         cascade="all, delete-orphan",
     )
@@ -425,6 +431,12 @@ class EnterpriseBaleUser(Base):
         nullable=False,
         default=EnterpriseUserState.awaiting_phone_input,
     )
+    current_group_id = Column(
+        String(36),
+        ForeignKey("enterprise_manual_groups.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
     created_at = Column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )
@@ -436,6 +448,7 @@ class EnterpriseBaleUser(Base):
     )
 
     instance = relationship("Instance", back_populates="enterprise_users")
+    current_group = relationship("EnterpriseManualGroup")
     sessions = relationship(
         "EnterpriseBaleSession", back_populates="user", cascade="all, delete-orphan"
     )
@@ -561,3 +574,78 @@ class EnterpriseDocumentAsset(Base):
     )
 
     instance = relationship("Instance", back_populates="enterprise_document_assets")
+    group_assignments = relationship(
+        "EnterpriseManualGroupAssignment",
+        back_populates="asset",
+        cascade="all, delete-orphan",
+    )
+
+
+class EnterpriseManualGroup(Base):
+    """Represents a group/category of enterprise manuals."""
+
+    __tablename__ = "enterprise_manual_groups"
+
+    id = Column(String(36), primary_key=True, default=_uuid)
+    instance_id = Column(
+        String(36),
+        ForeignKey("instances.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    name = Column(String(255), nullable=False)
+    sort_order = Column(Integer, nullable=False, default=0, index=True)
+    is_active = Column(Boolean, nullable=False, default=True, index=True)
+    created_at = Column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    updated_at = Column(
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=func.now(),
+        onupdate=func.now(),
+    )
+
+    __table_args__ = (
+        UniqueConstraint("instance_id", "name", name="uq_enterprise_manual_group_instance_name"),
+        Index("ix_enterprise_manual_groups_sort_order", "instance_id", "sort_order"),
+    )
+
+    instance = relationship("Instance", back_populates="enterprise_manual_groups")
+    assignments = relationship(
+        "EnterpriseManualGroupAssignment",
+        back_populates="group",
+        cascade="all, delete-orphan",
+    )
+
+
+class EnterpriseManualGroupAssignment(Base):
+    """Represents an assignment of a manual to a group."""
+
+    __tablename__ = "enterprise_manual_group_assignments"
+
+    id = Column(String(36), primary_key=True, default=_uuid)
+    group_id = Column(
+        String(36),
+        ForeignKey("enterprise_manual_groups.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    asset_id = Column(
+        String(36),
+        ForeignKey("enterprise_document_assets.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    sort_order = Column(Integer, nullable=False, default=0, index=True)
+    created_at = Column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+    __table_args__ = (
+        UniqueConstraint("group_id", "asset_id", name="uq_enterprise_manual_group_assignment_group_asset"),
+        Index("ix_enterprise_manual_group_assignments_sort_order", "group_id", "sort_order"),
+    )
+
+    group = relationship("EnterpriseManualGroup", back_populates="assignments")
+    asset = relationship("EnterpriseDocumentAsset", back_populates="group_assignments")

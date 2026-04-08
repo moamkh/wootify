@@ -23,7 +23,13 @@ from app.schemas.api_v1 import (
     EnterpriseAutoCreateInboxResponse,
     EnterpriseCatalogResponse,
     EnterpriseDocumentAssetResponse,
+    EnterpriseDocumentAssetPatchRequest,
     EnterpriseDocumentListResponse,
+    EnterpriseManualGroupCreateRequest,
+    EnterpriseManualGroupListResponse,
+    EnterpriseManualGroupManualsResponse,
+    EnterpriseManualGroupResponse,
+    EnterpriseManualGroupUpdateRequest,
     EnterpriseRouteInboxResponse,
     EnterpriseSessionListResponse,
     EnterpriseSessionResponse,
@@ -45,6 +51,7 @@ from app.services.bridge_service import BridgeService
 from app.services.conversation_mapping_service import ConversationMappingService
 from app.services.enterprise_bale_service import EnterpriseBaleService
 from app.services.enterprise_document_service import EnterpriseDocumentService
+from app.services.enterprise_manual_group_service import EnterpriseManualGroupService
 from app.services.instance_service import InstanceService
 from app.services.message_mapping_service import MessageMappingService
 from app.services.platform_registry_service import PlatformRegistryService
@@ -56,6 +63,7 @@ instances = InstanceService()
 bridge = BridgeService()
 enterprise = EnterpriseBaleService()
 enterprise_documents = EnterpriseDocumentService()
+enterprise_manual_groups = EnterpriseManualGroupService()
 conversations = ConversationMappingService()
 messages = MessageMappingService()
 logger = logging.getLogger('app.controllers.api_v1')
@@ -722,6 +730,18 @@ def _enterprise_session_to_response(row) -> EnterpriseSessionResponse:
     )
 
 
+def _enterprise_manual_group_to_response(row) -> EnterpriseManualGroupResponse:
+    """Convert an enterprise manual group row to its response schema."""
+    return EnterpriseManualGroupResponse(
+        id=row.id,
+        name=row.name,
+        sort_order=int(row.sort_order or 0),
+        is_active=bool(row.is_active),
+        created_at=row.created_at,
+        updated_at=row.updated_at,
+    )
+
+
 @router.get('/instances/{instance_key}/conversations', response_model=ConversationListResponse)
 def list_instance_conversations(instance_key: str, q: Optional[str] = None, db: Session = Depends(get_db)):
     """List instance conversations."""
@@ -764,7 +784,7 @@ def list_enterprise_manuals(instance_key: str, db: Session = Depends(get_db)):
 async def upload_enterprise_manual(
     instance_key: str,
     display_name: str = Form(...),
-    link_url: str = Form(...),
+    link_url: Optional[str] = Form(None),
     file: UploadFile = File(...),
     db: Session = Depends(get_db),
 ):
@@ -796,6 +816,53 @@ def delete_enterprise_manual(instance_key: str, asset_id: str, db: Session = Dep
         raise
     except Exception as exc:
         _raise_http_error(status_code=500, detail='internal server error', endpoint='delete_enterprise_manual', exc=exc, instance_key=instance_key, asset_id=asset_id)
+
+
+@router.patch('/instances/{instance_key}/enterprise/manuals/{asset_id}', response_model=EnterpriseDocumentAssetResponse)
+def patch_enterprise_manual(
+    instance_key: str,
+    asset_id: str,
+    request: EnterpriseDocumentAssetPatchRequest,
+    db: Session = Depends(get_db),
+):
+    """Patch enterprise manual metadata (display name and/or link URL)."""
+    try:
+        row = enterprise_documents.update_manual_metadata(
+            db,
+            instance_key,
+            asset_id,
+            display_name=request.display_name,
+            link_url=request.link_url,
+        )
+        if not row:
+            _raise_http_error(
+                status_code=404,
+                detail='asset not found',
+                endpoint='patch_enterprise_manual',
+                instance_key=instance_key,
+                asset_id=asset_id,
+            )
+        return _enterprise_asset_to_response(row)
+    except HTTPException:
+        raise
+    except ValueError as exc:
+        _raise_http_error(
+            status_code=400,
+            detail=str(exc),
+            endpoint='patch_enterprise_manual',
+            exc=exc,
+            instance_key=instance_key,
+            asset_id=asset_id,
+        )
+    except Exception as exc:
+        _raise_http_error(
+            status_code=500,
+            detail='internal server error',
+            endpoint='patch_enterprise_manual',
+            exc=exc,
+            instance_key=instance_key,
+            asset_id=asset_id,
+        )
 
 
 @router.get('/instances/{instance_key}/enterprise/catalog', response_model=EnterpriseCatalogResponse)
@@ -847,6 +914,115 @@ def delete_enterprise_catalog(instance_key: str, db: Session = Depends(get_db)):
         raise
     except Exception as exc:
         _raise_http_error(status_code=500, detail='internal server error', endpoint='delete_enterprise_catalog', exc=exc, instance_key=instance_key)
+
+
+@router.get('/instances/{instance_key}/enterprise/manual-groups', response_model=EnterpriseManualGroupListResponse)
+def list_enterprise_manual_groups(instance_key: str, db: Session = Depends(get_db)):
+    """List manual groups for an instance."""
+    try:
+        rows = enterprise_manual_groups.list_groups(db, instance_key)
+        return EnterpriseManualGroupListResponse(items=[_enterprise_manual_group_to_response(item) for item in rows])
+    except ValueError as exc:
+        _raise_http_error(status_code=400, detail=str(exc), endpoint='list_enterprise_manual_groups', exc=exc, instance_key=instance_key)
+    except Exception as exc:
+        _raise_http_error(status_code=500, detail='internal server error', endpoint='list_enterprise_manual_groups', exc=exc, instance_key=instance_key)
+
+
+@router.post('/instances/{instance_key}/enterprise/manual-groups', response_model=EnterpriseManualGroupResponse, status_code=status.HTTP_201_CREATED)
+def create_enterprise_manual_group(
+    instance_key: str,
+    request: EnterpriseManualGroupCreateRequest,
+    db: Session = Depends(get_db),
+):
+    """Create a new manual group for an instance."""
+    try:
+        row = enterprise_manual_groups.create_group(db, instance_key, request.name)
+        return _enterprise_manual_group_to_response(row)
+    except ValueError as exc:
+        _raise_http_error(status_code=400, detail=str(exc), endpoint='create_enterprise_manual_group', exc=exc, instance_key=instance_key)
+    except Exception as exc:
+        _raise_http_error(status_code=500, detail='internal server error', endpoint='create_enterprise_manual_group', exc=exc, instance_key=instance_key)
+
+
+@router.put('/instances/{instance_key}/enterprise/manual-groups/{group_id}', response_model=EnterpriseManualGroupResponse)
+def update_enterprise_manual_group(
+    instance_key: str,
+    group_id: str,
+    request: EnterpriseManualGroupUpdateRequest,
+    db: Session = Depends(get_db),
+):
+    """Update a manual group (rename)."""
+    try:
+        row = enterprise_manual_groups.rename_group(db, instance_key, group_id, request.name)
+        return _enterprise_manual_group_to_response(row)
+    except ValueError as exc:
+        _raise_http_error(status_code=400, detail=str(exc), endpoint='update_enterprise_manual_group', exc=exc, instance_key=instance_key, group_id=group_id)
+    except Exception as exc:
+        _raise_http_error(status_code=500, detail='internal server error', endpoint='update_enterprise_manual_group', exc=exc, instance_key=instance_key, group_id=group_id)
+
+
+@router.delete('/instances/{instance_key}/enterprise/manual-groups/{group_id}', response_model=GenericMessageResponse)
+def delete_enterprise_manual_group(instance_key: str, group_id: str, db: Session = Depends(get_db)):
+    """Delete a manual group."""
+    try:
+        deleted = enterprise_manual_groups.delete_group(db, instance_key, group_id)
+        if not deleted:
+            _raise_http_error(status_code=404, detail='group not found', endpoint='delete_enterprise_manual_group', instance_key=instance_key, group_id=group_id)
+        return GenericMessageResponse(message='deleted', status='ok')
+    except HTTPException:
+        raise
+    except Exception as exc:
+        _raise_http_error(status_code=500, detail='internal server error', endpoint='delete_enterprise_manual_group', exc=exc, instance_key=instance_key, group_id=group_id)
+
+
+@router.get('/instances/{instance_key}/enterprise/manual-groups/{group_id}/manuals', response_model=EnterpriseManualGroupManualsResponse)
+def list_enterprise_manual_group_manuals(instance_key: str, group_id: str, db: Session = Depends(get_db)):
+    """List manuals assigned to a group."""
+    try:
+        rows = enterprise_manual_groups.list_group_manuals(db, instance_key, group_id)
+        return EnterpriseManualGroupManualsResponse(items=[_enterprise_asset_to_response(item) for item in rows])
+    except ValueError as exc:
+        _raise_http_error(status_code=400, detail=str(exc), endpoint='list_enterprise_manual_group_manuals', exc=exc, instance_key=instance_key, group_id=group_id)
+    except Exception as exc:
+        _raise_http_error(status_code=500, detail='internal server error', endpoint='list_enterprise_manual_group_manuals', exc=exc, instance_key=instance_key, group_id=group_id)
+
+
+@router.post('/instances/{instance_key}/enterprise/manual-groups/{group_id}/manuals/{asset_id}', response_model=GenericMessageResponse, status_code=status.HTTP_201_CREATED)
+def add_manual_to_enterprise_group(
+    instance_key: str,
+    group_id: str,
+    asset_id: str,
+    db: Session = Depends(get_db),
+):
+    """Add a manual to a group."""
+    try:
+        enterprise_manual_groups.add_manual_to_group(db, instance_key, group_id, asset_id)
+        return GenericMessageResponse(message='added', status='ok')
+    except ValueError as exc:
+        _raise_http_error(status_code=400, detail=str(exc), endpoint='add_manual_to_enterprise_group', exc=exc, instance_key=instance_key, group_id=group_id, asset_id=asset_id)
+    except Exception as exc:
+        _raise_http_error(status_code=500, detail='internal server error', endpoint='add_manual_to_enterprise_group', exc=exc, instance_key=instance_key, group_id=group_id, asset_id=asset_id)
+
+
+@router.delete('/instances/{instance_key}/enterprise/manual-groups/{group_id}/manuals/{asset_id}', response_model=GenericMessageResponse)
+def remove_manual_from_enterprise_group(
+    instance_key: str,
+    group_id: str,
+    asset_id: str,
+    db: Session = Depends(get_db),
+):
+    """Remove a manual from a group."""
+    try:
+        deleted = enterprise_manual_groups.remove_manual_from_group(db, instance_key, group_id, asset_id)
+        if not deleted:
+            _raise_http_error(status_code=404, detail='assignment not found', endpoint='remove_manual_from_enterprise_group', instance_key=instance_key, group_id=group_id, asset_id=asset_id)
+        return GenericMessageResponse(message='removed', status='ok')
+    except HTTPException:
+        raise
+    except ValueError as exc:
+        _raise_http_error(status_code=400, detail=str(exc), endpoint='remove_manual_from_enterprise_group', exc=exc, instance_key=instance_key, group_id=group_id, asset_id=asset_id)
+    except Exception as exc:
+        _raise_http_error(status_code=500, detail='internal server error', endpoint='remove_manual_from_enterprise_group', exc=exc, instance_key=instance_key, group_id=group_id, asset_id=asset_id)
 
 
 @router.post('/instances/{instance_key}/enterprise/chatwoot/inboxes/{route_key}', response_model=EnterpriseRouteInboxResponse)
