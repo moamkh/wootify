@@ -5,7 +5,7 @@
  * Documentation Standard: module/class/public-method comments.
  */
 
-import React, { useEffect, useMemo, useState } from 'react';
+import React, { Suspense, lazy, useEffect, useMemo, useState } from 'react';
 import {
   API_BASE,
   createInbox,
@@ -38,6 +38,10 @@ import {
   addManualToEnterpriseGroup,
   removeManualFromEnterpriseGroup,
 } from './api.js';
+import PageLoader from './components/PageLoader.jsx';
+
+const InstancesPage = lazy(() => import('./pages/InstancesPage.jsx'));
+const InstanceWorkspacePage = lazy(() => import('./pages/InstanceWorkspacePage.jsx'));
 
 const PLATFORM_BALE = 'bale';
 const PLATFORM_BALE_ENTERPRISE = 'bale_enterprise';
@@ -65,6 +69,8 @@ const ENTERPRISE_DEFAULTS = {
   sales_accepted_text: 'کارشناس فروش به گفتگو متصل شد. پیام خود را ارسال کنید.',
   sales_unread_text:
     'شما در بخش ارتباط با کارشناسان فروش پیام های خوانده نشده دارید. برای ادامه گفتگو وارد همین بخش شوید.',
+  user_manual_link_template:
+    'برای دریافت راهنمای کاربری مورد نظر بر روی متن زیر ضربه بزنید:\n[{{user_manual_name}}]({{user_manual_url}})',
 };
 
 function toFeatureMap(overrides = []) {
@@ -108,6 +114,7 @@ function defaultForm(features) {
     enterprise_invalid_phone_text: ENTERPRISE_DEFAULTS.invalid_phone_text,
     enterprise_address_tehran_alborz_text: ENTERPRISE_DEFAULTS.address_tehran_alborz_text,
     enterprise_address_other_provinces_text: ENTERPRISE_DEFAULTS.address_other_provinces_text,
+    enterprise_user_manual_link_template: ENTERPRISE_DEFAULTS.user_manual_link_template,
     enterprise_customer_service_inbox_id: '',
     enterprise_customer_service_inbox_name: 'novin-customer-service',
     enterprise_customer_service_webhook_url: '',
@@ -187,6 +194,8 @@ function createPayload(form, { patch = false } = {}) {
     platformMetadata.enterprise_address_tehran_alborz_text = form.enterprise_address_tehran_alborz_text?.trim() || undefined;
     platformMetadata.enterprise_address_other_provinces_text =
       form.enterprise_address_other_provinces_text?.trim() || undefined;
+    platformMetadata.enterprise_user_manual_link_template =
+      form.enterprise_user_manual_link_template?.trim() || undefined;
     platformMetadata.enterprise_customer_service_inbox_id =
       Number(form.enterprise_customer_service_inbox_id) > 0 ? Number(form.enterprise_customer_service_inbox_id) : undefined;
     platformMetadata.enterprise_customer_service_inbox_name =
@@ -374,6 +383,7 @@ export default function App() {
   const [error, setError] = useState('');
   const [selectedKey, setSelectedKey] = useState('');
   const [viewMode, setViewMode] = useState('list');
+  const [activeTab, setActiveTab] = useState('config');
 
   const [form, setForm] = useState(defaultForm([]));
 
@@ -619,6 +629,9 @@ export default function App() {
       enterprise_address_other_provinces_text:
         row.platform_metadata?.enterprise_address_other_provinces_text ||
         ENTERPRISE_DEFAULTS.address_other_provinces_text,
+      enterprise_user_manual_link_template:
+        row.platform_metadata?.enterprise_user_manual_link_template ||
+        ENTERPRISE_DEFAULTS.user_manual_link_template,
       enterprise_customer_service_inbox_id: String(row.platform_metadata?.enterprise_customer_service_inbox_id ?? ''),
       enterprise_customer_service_inbox_name: row.platform_metadata?.enterprise_customer_service_inbox_name || 'novin-customer-service',
       enterprise_customer_service_webhook_url: row.chatwoot?.enterprise_customer_service_webhook_url || '',
@@ -710,6 +723,7 @@ export default function App() {
   function openInstanceDetail(instanceKey) {
     onSelectInstance(instanceKey);
     setViewMode('detail');
+    setActiveTab('config');
   }
 
   function onNewInstance() {
@@ -726,6 +740,7 @@ export default function App() {
     setCatalogLinkUrl('');
     setCatalogFile(null);
     setViewMode('detail');
+    setActiveTab('config');
   }
 
   function isFeatureSupported(featureKey) {
@@ -1162,12 +1177,118 @@ export default function App() {
     }
   }
 
+  const heroProps = {
+    selectedKey,
+    form,
+    selectedInstance,
+    enabledFeatureCount,
+    conversationsCount: conversations.length,
+    mappingsCount: mappings.length,
+    busy,
+    isBalePlatform,
+    isTelegramPlatform,
+    isEnterpriseBalePlatform,
+    maskTokenValue,
+    onToggleEnabled,
+    onCreateInbox,
+    onCreateEnterpriseInbox,
+    onDelete,
+  };
+
+  const formProps = {
+    selectedKey,
+    platformTypes,
+    features,
+    form,
+    setForm,
+    busy,
+    loading,
+    selectedInstance,
+    isBalePlatform,
+    isStandardBalePlatform,
+    isEnterpriseBalePlatform,
+    isTelegramPlatform,
+    isFeatureSupported,
+    onSave,
+    onNewInstance,
+    onCreateEnterpriseInbox,
+    onSaveEnterpriseSmsSync,
+    onRunEnterpriseSmsSyncNow,
+    copyTextToClipboard,
+  };
+
+  const mappingProps = {
+    selectedKey,
+    instances,
+    conversations,
+    mappings,
+    search,
+    busy,
+    selectedConversationId,
+    setSelectedConversationId,
+    setSearch,
+    onSearchConversations,
+    openInstanceDetail,
+  };
+
+  const enterpriseAssetProps = {
+    selectedKey,
+    busy,
+    enterpriseManuals,
+    enterpriseManualGroups,
+    manualGroupByAssetId,
+    enterpriseCatalog,
+    manualDisplayName,
+    setManualDisplayName,
+    manualLinkUrl,
+    setManualLinkUrl,
+    setManualFile,
+    editingManualId,
+    editingManualDisplayName,
+    setEditingManualDisplayName,
+    editingManualLinkUrl,
+    setEditingManualLinkUrl,
+    editingManualGroupId,
+    setEditingManualGroupId,
+    catalogDisplayName,
+    setCatalogDisplayName,
+    catalogLinkUrl,
+    setCatalogLinkUrl,
+    setCatalogFile,
+    onUploadManual,
+    onDeleteManual,
+    onStartEditManual,
+    onSaveEditManual,
+    onCancelEditManual,
+    onAddGroupFromManualEdit,
+    onRenameGroupFromManualEdit,
+    onDeleteGroupFromManualEdit,
+    onReplaceCatalog,
+    onDeleteCatalog,
+  };
+
+  const enterpriseOperationsProps = {
+    enterpriseSessions,
+  };
+
+  const simulationProps = {
+    simEvent,
+    setSimEvent,
+    onSimulate,
+    busy,
+  };
+
   return (
-    <div className="page">
-      <header className="header">
+    <div className="page app-shell">
+      <header className="header app-header">
         <div>
-          <h1>Wootify Admin Console</h1>
-          <p className="muted">Manage instances, capabilities, and Chatwoot/platform mapping records.</p>
+          <p className="section-eyebrow">Wootify control plane</p>
+          <h1>{isDetailView ? 'Instance Workspace' : 'Wootify Admin Console'}</h1>
+          <p className="muted">
+            {isDetailView
+              ? 'A structured operational workspace for configuration, observability, and enterprise workflows.'
+              : 'Manage instances, capabilities, and Chatwoot platform mappings with a faster, modular UI.'}
+          </p>
         </div>
         <div className="header-actions">
           <button className="btn" disabled={busy || loading} onClick={refreshBootstrap}>
@@ -1190,1420 +1311,60 @@ export default function App() {
 
       {error ? <div className="alert error">Error: {error}</div> : null}
 
-      <div className={`grid ${isDetailView ? 'detail-grid' : ''}`}>
+      <section className="card command-bar">
+        <div className="instance-toolbar">
+          <label>
+            Search
+            <input
+              value={instanceSearch}
+              onChange={(e) => setInstanceSearch(e.target.value)}
+              placeholder="Search by key, bot name, department..."
+            />
+          </label>
+          <label>
+            Status
+            <select value={instanceStatusFilter} onChange={(e) => setInstanceStatusFilter(e.target.value)}>
+              <option value="all">All</option>
+              <option value="enabled">Enabled</option>
+              <option value="disabled">Disabled</option>
+            </select>
+          </label>
+        </div>
+      </section>
+
+      <Suspense fallback={<PageLoader label={isDetailView ? 'Loading instance workspace' : 'Loading instance directory'} />}>
         {isDetailView ? (
-          <section className="card detail-hero">
-            <div className="row between">
-              <div>
-                <h2>{selectedKey || 'New Instance'}</h2>
-                <p className="muted">Instance dashboard and configuration.</p>
-              </div>
-              <span className={`status-pill ${form.is_enabled ? 'good' : 'warn'}`}>{form.is_enabled ? 'Enabled' : 'Disabled'}</span>
-            </div>
-            {isBalePlatform ? (
-              <div className="instance-token">{maskTokenValue(form.bale_token || selectedInstance?.platform_metadata?.bale_token)}</div>
-            ) : null}
-            {isTelegramPlatform ? (
-              <div className="instance-token">
-                {maskTokenValue(form.telegram_token || selectedInstance?.platform_metadata?.telegram_token)}
-              </div>
-            ) : null}
-            <div className="instance-meta">
-              {isBalePlatform ? (
-                <>
-                  <div>
-                    <span className="k">Bot Name</span>
-                    <span className="v">{form.bale_bot_name || '-'}</span>
-                  </div>
-                  <div>
-                    <span className="k">Bot ID</span>
-                    <span className="v">{form.bale_bot_id || '-'}</span>
-                  </div>
-                  <div>
-                    <span className="k">Department</span>
-                    <span className="v">{form.bale_department || '-'}</span>
-                  </div>
-                </>
-              ) : null}
-              {isTelegramPlatform ? (
-                <>
-                  <div>
-                    <span className="k">Bot Name</span>
-                    <span className="v">{form.telegram_bot_name || '-'}</span>
-                  </div>
-                  <div>
-                    <span className="k">Bot ID</span>
-                    <span className="v">{form.telegram_bot_id || '-'}</span>
-                  </div>
-                  <div>
-                    <span className="k">Department</span>
-                    <span className="v">{form.telegram_department || '-'}</span>
-                  </div>
-                </>
-              ) : null}
-              <div>
-                <span className="k">Features Enabled</span>
-                <span className="v">{enabledFeatureCount}</span>
-              </div>
-              <div>
-                <span className="k">Conversations</span>
-                <span className="v">{conversations.length}</span>
-              </div>
-              <div>
-                <span className="k">Selected Mapping Rows</span>
-                <span className="v">{mappings.length}</span>
-              </div>
-            </div>
-            {selectedInstance ? (
-              <div className="list-actions">
-                <button
-                  className="btn"
-                  disabled={busy}
-                  onClick={() => onToggleEnabled(selectedInstance.instance_key, selectedInstance.is_enabled)}
-                >
-                  {selectedInstance.is_enabled ? 'Disable' : 'Enable'}
-                </button>
-                {selectedInstance.platform_type_key === PLATFORM_BALE_ENTERPRISE ? (
-                  <>
-                    <button className="btn" disabled={busy} onClick={() => onCreateEnterpriseInbox('customer_service')}>
-                      Service Inbox
-                    </button>
-                    <button className="btn" disabled={busy} onClick={() => onCreateEnterpriseInbox('sales')}>
-                      Sales Inbox
-                    </button>
-                  </>
-                ) : (
-                  <button className="btn" disabled={busy} onClick={() => onCreateInbox(selectedInstance.instance_key)}>
-                    Create Inbox
-                  </button>
-                )}
-                <button className="btn danger" disabled={busy} onClick={() => onDelete(selectedInstance.instance_key)}>
-                  Delete
-                </button>
-              </div>
-            ) : null}
-          </section>
-        ) : null}
-        {isDetailView ? (
-          <section className="card">
-          <div className="row between">
-            <h2>{selectedKey ? 'Edit Instance' : 'Create Instance'}</h2>
-            <button className="btn secondary" onClick={onNewInstance} disabled={busy}>
-              New
-            </button>
-          </div>
-
-          <form className="form" onSubmit={onSave}>
-            <div className="row">
-              <label>
-                Instance Key
-                <input
-                  value={form.instance_key}
-                  onChange={(e) => setForm((s) => ({ ...s, instance_key: e.target.value }))}
-                  disabled={Boolean(selectedKey)}
-                  required
-                />
-              </label>
-              <label>
-                Platform
-                <select
-                  value={form.platform_type_key}
-                  onChange={(e) => setForm((s) => ({ ...s, platform_type_key: e.target.value }))}
-                >
-                  {platformTypes.map((item) => (
-                    <option key={item.key} value={item.key}>
-                      {item.display_name || item.key}
-                    </option>
-                  ))}
-                </select>
-              </label>
-            </div>
-
-            <label className="checkbox">
-              <input
-                type="checkbox"
-                checked={form.is_enabled}
-                onChange={(e) => setForm((s) => ({ ...s, is_enabled: e.target.checked }))}
-              />
-              Instance enabled
-            </label>
-
-            {isBalePlatform ? (
-              <>
-                <h3>{isEnterpriseBalePlatform ? 'Bale Enterprise Metadata' : 'Bale Metadata'}</h3>
-                <div className="row">
-                  <label>
-                    Bale Token
-                    <input
-                      value={form.bale_token}
-                      onChange={(e) => setForm((s) => ({ ...s, bale_token: e.target.value }))}
-                      placeholder="123456:abc..."
-                    />
-                  </label>
-                  <label>
-                    Poll Interval
-                    <input
-                      value={form.bale_poll_interval}
-                      onChange={(e) => setForm((s) => ({ ...s, bale_poll_interval: e.target.value }))}
-                      placeholder="5"
-                    />
-                  </label>
-                </div>
-                <label>
-                  Bale API Base URL
-                  <input
-                    value={form.bale_api_base_url}
-                    onChange={(e) => setForm((s) => ({ ...s, bale_api_base_url: e.target.value }))}
-                  />
-                </label>
-                <label>
-                  Bale File Base URL
-                  <input
-                    value={form.bale_file_base_url}
-                    onChange={(e) => setForm((s) => ({ ...s, bale_file_base_url: e.target.value }))}
-                  />
-                </label>
-                <div className="row">
-                  <label>
-                    Bot Name
-                    <input
-                      value={form.bale_bot_name}
-                      onChange={(e) => setForm((s) => ({ ...s, bale_bot_name: e.target.value }))}
-                      placeholder="Support Bot"
-                    />
-                  </label>
-                  <label>
-                    Bot ID
-                    <input
-                      value={form.bale_bot_id}
-                      onChange={(e) => setForm((s) => ({ ...s, bale_bot_id: e.target.value }))}
-                      placeholder="bot_12345"
-                    />
-                  </label>
-                </div>
-                <label>
-                  Department
-                  <input
-                    value={form.bale_department}
-                    onChange={(e) => setForm((s) => ({ ...s, bale_department: e.target.value }))}
-                    placeholder="Customer Support"
-                  />
-                </label>
-
-                {isStandardBalePlatform ? (
-                  <>
-                    <h3>Bale Phone Prompt</h3>
-                    <label className="checkbox">
-                      <input
-                        type="checkbox"
-                        checked={Boolean(form.bale_share_phone_prompt_enabled)}
-                        onChange={(e) => setForm((s) => ({ ...s, bale_share_phone_prompt_enabled: e.target.checked }))}
-                      />
-                      Enable share-phone prompt
-                    </label>
-                    <label className="checkbox">
-                      <input
-                        type="checkbox"
-                        checked={Boolean(form.bale_share_phone_prompt_only_if_missing_phone)}
-                        onChange={(e) =>
-                          setForm((s) => ({ ...s, bale_share_phone_prompt_only_if_missing_phone: e.target.checked }))
-                        }
-                      />
-                      Send prompt only if Chatwoot contact has no phone number
-                    </label>
-                    <label>
-                      Share-Phone Prompt Text
-                      <textarea
-                        rows={3}
-                        value={form.bale_share_phone_prompt_text}
-                        onChange={(e) => setForm((s) => ({ ...s, bale_share_phone_prompt_text: e.target.value }))}
-                      />
-                    </label>
-                  </>
-                ) : null}
-
-                {isEnterpriseBalePlatform ? (
-                  <>
-                    <h3>Enterprise Messages</h3>
-                    <label>
-                      Welcome Text
-                      <textarea
-                        rows={3}
-                        value={form.enterprise_welcome_text}
-                        onChange={(e) => setForm((s) => ({ ...s, enterprise_welcome_text: e.target.value }))}
-                      />
-                    </label>
-                    <label>
-                      Phone Prompt Text
-                      <textarea
-                        rows={3}
-                        value={form.enterprise_phone_prompt_text}
-                        onChange={(e) => setForm((s) => ({ ...s, enterprise_phone_prompt_text: e.target.value }))}
-                      />
-                    </label>
-                    <label>
-                      Root Menu Prompt
-                      <textarea
-                        rows={3}
-                        value={form.enterprise_menu_prompt_text}
-                        onChange={(e) => setForm((s) => ({ ...s, enterprise_menu_prompt_text: e.target.value }))}
-                      />
-                    </label>
-                    <label>
-                      Address Menu Prompt
-                      <textarea
-                        rows={3}
-                        value={form.enterprise_address_prompt_text}
-                        onChange={(e) => setForm((s) => ({ ...s, enterprise_address_prompt_text: e.target.value }))}
-                      />
-                    </label>
-                    <label>
-                      Number Not Found Text
-                      <textarea
-                        rows={3}
-                        value={form.enterprise_number_not_found_text}
-                        onChange={(e) => setForm((s) => ({ ...s, enterprise_number_not_found_text: e.target.value }))}
-                      />
-                    </label>
-                    <label>
-                      Invalid Phone Text
-                      <textarea
-                        rows={3}
-                        value={form.enterprise_invalid_phone_text}
-                        onChange={(e) => setForm((s) => ({ ...s, enterprise_invalid_phone_text: e.target.value }))}
-                      />
-                    </label>
-                    <label>
-                      No Manuals Text
-                      <textarea
-                        rows={3}
-                        value={form.enterprise_no_manuals_text}
-                        onChange={(e) => setForm((s) => ({ ...s, enterprise_no_manuals_text: e.target.value }))}
-                      />
-                    </label>
-                    <label>
-                      No Catalog Text
-                      <textarea
-                        rows={3}
-                        value={form.enterprise_no_catalog_text}
-                        onChange={(e) => setForm((s) => ({ ...s, enterprise_no_catalog_text: e.target.value }))}
-                      />
-                    </label>
-                    <label>
-                      Missing Configuration Fallback
-                      <textarea
-                        rows={3}
-                        value={form.enterprise_not_configured_text}
-                        onChange={(e) => setForm((s) => ({ ...s, enterprise_not_configured_text: e.target.value }))}
-                      />
-                    </label>
-                    <label>
-                      Live Session Resume Text
-                      <textarea
-                        rows={3}
-                        value={form.enterprise_live_mode_resume_text}
-                        onChange={(e) =>
-                          setForm((s) => ({ ...s, enterprise_live_mode_resume_text: e.target.value }))
-                        }
-                      />
-                    </label>
-
-                    <h3>Enterprise Addresses</h3>
-                    <label>
-                      Tehran and Alborz Text
-                      <textarea
-                        rows={4}
-                        value={form.enterprise_address_tehran_alborz_text}
-                        onChange={(e) => setForm((s) => ({ ...s, enterprise_address_tehran_alborz_text: e.target.value }))}
-                      />
-                    </label>
-                    <label>
-                      Other Provinces Text
-                      <textarea
-                        rows={4}
-                        value={form.enterprise_address_other_provinces_text}
-                        onChange={(e) => setForm((s) => ({ ...s, enterprise_address_other_provinces_text: e.target.value }))}
-                      />
-                    </label>
-                  </>
-                ) : null}
-              </>
-            ) : null}
-            {isTelegramPlatform ? (
-              <>
-                <h3>Telegram Metadata</h3>
-                <div className="row">
-                  <label>
-                    Telegram Token
-                    <input
-                      value={form.telegram_token}
-                      onChange={(e) => setForm((s) => ({ ...s, telegram_token: e.target.value }))}
-                      placeholder="123456:abc..."
-                    />
-                  </label>
-                  <label>
-                    Poll Interval
-                    <input
-                      value={form.telegram_poll_interval}
-                      onChange={(e) => setForm((s) => ({ ...s, telegram_poll_interval: e.target.value }))}
-                      placeholder="5"
-                    />
-                  </label>
-                </div>
-                <label>
-                  Telegram API Base URL
-                  <input
-                    value={form.telegram_api_base_url}
-                    onChange={(e) => setForm((s) => ({ ...s, telegram_api_base_url: e.target.value }))}
-                  />
-                </label>
-                <label>
-                  Telegram File Base URL
-                  <input
-                    value={form.telegram_file_base_url}
-                    onChange={(e) => setForm((s) => ({ ...s, telegram_file_base_url: e.target.value }))}
-                  />
-                </label>
-                <div className="row">
-                  <label>
-                    Bot Name
-                    <input
-                      value={form.telegram_bot_name}
-                      onChange={(e) => setForm((s) => ({ ...s, telegram_bot_name: e.target.value }))}
-                      placeholder="Support Bot"
-                    />
-                  </label>
-                  <label>
-                    Bot ID
-                    <input
-                      value={form.telegram_bot_id}
-                      onChange={(e) => setForm((s) => ({ ...s, telegram_bot_id: e.target.value }))}
-                      placeholder="bot_12345"
-                    />
-                  </label>
-                </div>
-                <label>
-                  Department
-                  <input
-                    value={form.telegram_department}
-                    onChange={(e) => setForm((s) => ({ ...s, telegram_department: e.target.value }))}
-                    placeholder="Customer Support"
-                  />
-                </label>
-
-                <h3>Telegram Phone Prompt</h3>
-                <label className="checkbox">
-                  <input
-                    type="checkbox"
-                    checked={Boolean(form.telegram_share_phone_prompt_enabled)}
-                    onChange={(e) => setForm((s) => ({ ...s, telegram_share_phone_prompt_enabled: e.target.checked }))}
-                  />
-                  Enable share-phone prompt
-                </label>
-                <label className="checkbox">
-                  <input
-                    type="checkbox"
-                    checked={Boolean(form.telegram_share_phone_prompt_only_if_missing_phone)}
-                    onChange={(e) =>
-                      setForm((s) => ({ ...s, telegram_share_phone_prompt_only_if_missing_phone: e.target.checked }))
-                    }
-                  />
-                  Send prompt only if Chatwoot contact has no phone number
-                </label>
-                <label>
-                  Share-Phone Prompt Text
-                  <textarea
-                    rows={3}
-                    value={form.telegram_share_phone_prompt_text}
-                    onChange={(e) => setForm((s) => ({ ...s, telegram_share_phone_prompt_text: e.target.value }))}
-                  />
-                </label>
-              </>
-            ) : null}
-
-            <h3>Proxy</h3>
-            <label className="checkbox">
-              <input
-                type="checkbox"
-                checked={Boolean(form.proxy_enabled)}
-                onChange={(e) => setForm((s) => ({ ...s, proxy_enabled: e.target.checked }))}
-              />
-              Enable per-instance platform proxy
-            </label>
-            <div className="row">
-              <label>
-                Protocol
-                <select
-                  value={form.proxy_protocol}
-                  onChange={(e) => setForm((s) => ({ ...s, proxy_protocol: e.target.value }))}
-                  disabled={!form.proxy_enabled}
-                >
-                  <option value="http">http</option>
-                  <option value="https">https</option>
-                  <option value="socks5">socks5</option>
-                </select>
-              </label>
-              <label>
-                Port
-                <input
-                  value={form.proxy_port}
-                  onChange={(e) => setForm((s) => ({ ...s, proxy_port: e.target.value }))}
-                  placeholder="8080"
-                  disabled={!form.proxy_enabled}
-                />
-              </label>
-            </div>
-            <label>
-              Host
-              <input
-                value={form.proxy_host}
-                onChange={(e) => setForm((s) => ({ ...s, proxy_host: e.target.value }))}
-                placeholder="127.0.0.1"
-                disabled={!form.proxy_enabled}
-              />
-            </label>
-            <div className="row">
-              <label>
-                Username
-                <input
-                  value={form.proxy_username}
-                  onChange={(e) => setForm((s) => ({ ...s, proxy_username: e.target.value }))}
-                  disabled={!form.proxy_enabled}
-                />
-              </label>
-              <label>
-                Password
-                <input
-                  value={form.proxy_password}
-                  onChange={(e) => setForm((s) => ({ ...s, proxy_password: e.target.value }))}
-                  disabled={!form.proxy_enabled}
-                />
-              </label>
-            </div>
-
-            <h3>Chatwoot</h3>
-            <label>
-              Base URL
-              <input
-                value={form.chatwoot_base_url}
-                onChange={(e) => setForm((s) => ({ ...s, chatwoot_base_url: e.target.value }))}
-              />
-            </label>
-            <label>
-              API Access Token
-              <input
-                value={form.chatwoot_api_access_token}
-                onChange={(e) => setForm((s) => ({ ...s, chatwoot_api_access_token: e.target.value }))}
-              />
-            </label>
-            <label>
-              Account ID
-              <input
-                value={form.chatwoot_account_id}
-                onChange={(e) => setForm((s) => ({ ...s, chatwoot_account_id: e.target.value }))}
-              />
-            </label>
-            {isStandardBalePlatform ? (
-              <>
-                <div className="row">
-                  <label>
-                    Inbox ID
-                    <input
-                      value={form.chatwoot_inbox_id}
-                      onChange={(e) => setForm((s) => ({ ...s, chatwoot_inbox_id: e.target.value }))}
-                    />
-                  </label>
-                  <label>
-                    Inbox Name
-                    <input
-                      value={form.chatwoot_inbox_name}
-                      onChange={(e) => setForm((s) => ({ ...s, chatwoot_inbox_name: e.target.value }))}
-                    />
-                  </label>
-                </div>
-                <label className="checkbox">
-                  <input
-                    type="checkbox"
-                    checked={form.chatwoot_auto_create}
-                    onChange={(e) => setForm((s) => ({ ...s, chatwoot_auto_create: e.target.checked }))}
-                  />
-                  Auto create Chatwoot inbox
-                </label>
-                <label className="checkbox">
-                  <input
-                    type="checkbox"
-                    checked={form.chatwoot_reopen_conversation}
-                    onChange={(e) => setForm((s) => ({ ...s, chatwoot_reopen_conversation: e.target.checked }))}
-                  />
-                  Reopen resolved Chatwoot conversation on inbound reply
-                </label>
-              </>
-            ) : null}
-            {!isEnterpriseBalePlatform ? (
-              <label>
-                Webhook URL
-                <div className="row">
-                  <input
-                    value={form.chatwoot_webhook_url}
-                    readOnly
-                    placeholder="Save the instance to generate the webhook URL"
-                  />
-                  <button
-                    type="button"
-                    className="btn secondary"
-                    disabled={!form.chatwoot_webhook_url}
-                    onClick={async () => {
-                      try {
-                        await copyTextToClipboard(form.chatwoot_webhook_url);
-                        alert('Webhook URL copied');
-                      } catch (e) {
-                        alert(e?.message || String(e));
-                      }
-                    }}
-                  >
-                    Copy
-                  </button>
-                </div>
-              </label>
-            ) : null}
-
-            {isEnterpriseBalePlatform ? (
-              <>
-                <h3>Customer Service Route</h3>
-                <div className="row">
-                  <label>
-                    Inbox ID
-                    <input
-                      value={form.enterprise_customer_service_inbox_id}
-                      onChange={(e) => setForm((s) => ({ ...s, enterprise_customer_service_inbox_id: e.target.value }))}
-                    />
-                  </label>
-                  <label>
-                    Inbox Name
-                    <input
-                      value={form.enterprise_customer_service_inbox_name}
-                      onChange={(e) =>
-                        setForm((s) => ({ ...s, enterprise_customer_service_inbox_name: e.target.value }))
-                      }
-                    />
-                  </label>
-                </div>
-                <label>
-                  Customer Service Webhook URL
-                  <div className="row">
-                    <input
-                      value={form.enterprise_customer_service_webhook_url}
-                      readOnly
-                      placeholder="Save the instance to generate the customer service webhook URL"
-                    />
-                    <button
-                      type="button"
-                      className="btn secondary"
-                      disabled={!form.enterprise_customer_service_webhook_url}
-                      onClick={async () => {
-                        try {
-                          await copyTextToClipboard(form.enterprise_customer_service_webhook_url);
-                          alert('Customer service webhook URL copied');
-                        } catch (e) {
-                          alert(e?.message || String(e));
-                        }
-                      }}
-                    >
-                      Copy
-                    </button>
-                  </div>
-                </label>
-                <label className="checkbox">
-                  <input
-                    type="checkbox"
-                    checked={Boolean(form.enterprise_customer_service_auto_create)}
-                    onChange={(e) =>
-                      setForm((s) => ({ ...s, enterprise_customer_service_auto_create: e.target.checked }))
-                    }
-                  />
-                  Auto create customer service inbox
-                </label>
-                <label>
-                  Waiting Text
-                  <textarea
-                    rows={3}
-                    value={form.enterprise_customer_service_waiting_text}
-                    onChange={(e) =>
-                      setForm((s) => ({ ...s, enterprise_customer_service_waiting_text: e.target.value }))
-                    }
-                  />
-                </label>
-                <label>
-                  Accepted Text
-                  <textarea
-                    rows={3}
-                    value={form.enterprise_customer_service_accepted_text}
-                    onChange={(e) =>
-                      setForm((s) => ({ ...s, enterprise_customer_service_accepted_text: e.target.value }))
-                    }
-                  />
-                </label>
-                <label>
-                  Unread Notification Text
-                  <textarea
-                    rows={3}
-                    value={form.enterprise_customer_service_unread_text}
-                    onChange={(e) =>
-                      setForm((s) => ({ ...s, enterprise_customer_service_unread_text: e.target.value }))
-                    }
-                  />
-                </label>
-                <button
-                  type="button"
-                  className="btn"
-                  disabled={busy || !selectedKey}
-                  onClick={() => onCreateEnterpriseInbox('customer_service')}
-                >
-                  Create or Link Customer Service Inbox
-                </button>
-
-                <h3>Sales Route</h3>
-                <div className="row">
-                  <label>
-                    Inbox ID
-                    <input
-                      value={form.enterprise_sales_inbox_id}
-                      onChange={(e) => setForm((s) => ({ ...s, enterprise_sales_inbox_id: e.target.value }))}
-                    />
-                  </label>
-                  <label>
-                    Inbox Name
-                    <input
-                      value={form.enterprise_sales_inbox_name}
-                      onChange={(e) => setForm((s) => ({ ...s, enterprise_sales_inbox_name: e.target.value }))}
-                    />
-                  </label>
-                </div>
-                <label>
-                  Sales Webhook URL
-                  <div className="row">
-                    <input
-                      value={form.enterprise_sales_webhook_url}
-                      readOnly
-                      placeholder="Save the instance to generate the sales webhook URL"
-                    />
-                    <button
-                      type="button"
-                      className="btn secondary"
-                      disabled={!form.enterprise_sales_webhook_url}
-                      onClick={async () => {
-                        try {
-                          await copyTextToClipboard(form.enterprise_sales_webhook_url);
-                          alert('Sales webhook URL copied');
-                        } catch (e) {
-                          alert(e?.message || String(e));
-                        }
-                      }}
-                    >
-                      Copy
-                    </button>
-                  </div>
-                </label>
-                <label className="checkbox">
-                  <input
-                    type="checkbox"
-                    checked={Boolean(form.enterprise_sales_auto_create)}
-                    onChange={(e) => setForm((s) => ({ ...s, enterprise_sales_auto_create: e.target.checked }))}
-                  />
-                  Auto create sales inbox
-                </label>
-                <label>
-                  Waiting Text
-                  <textarea
-                    rows={3}
-                    value={form.enterprise_sales_waiting_text}
-                    onChange={(e) => setForm((s) => ({ ...s, enterprise_sales_waiting_text: e.target.value }))}
-                  />
-                </label>
-                <label>
-                  Accepted Text
-                  <textarea
-                    rows={3}
-                    value={form.enterprise_sales_accepted_text}
-                    onChange={(e) => setForm((s) => ({ ...s, enterprise_sales_accepted_text: e.target.value }))}
-                  />
-                </label>
-                <label>
-                  Unread Notification Text
-                  <textarea
-                    rows={3}
-                    value={form.enterprise_sales_unread_text}
-                    onChange={(e) => setForm((s) => ({ ...s, enterprise_sales_unread_text: e.target.value }))}
-                  />
-                </label>
-                <button
-                  type="button"
-                  className="btn"
-                  disabled={busy || !selectedKey}
-                  onClick={() => onCreateEnterpriseInbox('sales')}
-                >
-                  Create or Link Sales Inbox
-                </button>
-
-                <h3>External SMS Sync (Novin)</h3>
-                <label className="checkbox">
-                  <input
-                    type="checkbox"
-                    checked={Boolean(form.enterprise_sms_sync_enabled)}
-                    onChange={(e) => setForm((s) => ({ ...s, enterprise_sms_sync_enabled: e.target.checked }))}
-                  />
-                  Enable SMS sync to Bale users by shared phone number
-                </label>
-                <label>
-                  API URL
-                  <input
-                    value={form.enterprise_sms_api_url}
-                    onChange={(e) => setForm((s) => ({ ...s, enterprise_sms_api_url: e.target.value }))}
-                    placeholder="https://apiserver.novinmed.com/SoftNoNTFC/LastId"
-                  />
-                </label>
-                <label>
-                  API Token
-                  <input
-                    value={form.enterprise_sms_api_token}
-                    onChange={(e) => setForm((s) => ({ ...s, enterprise_sms_api_token: e.target.value }))}
-                    placeholder="token value"
-                  />
-                </label>
-                <div className="row">
-                  <label>
-                    Token Header
-                    <input
-                      value={form.enterprise_sms_token_header}
-                      onChange={(e) => setForm((s) => ({ ...s, enterprise_sms_token_header: e.target.value }))}
-                      placeholder="Authorization"
-                    />
-                  </label>
-                  <label>
-                    Token Prefix
-                    <input
-                      value={form.enterprise_sms_token_prefix}
-                      onChange={(e) => setForm((s) => ({ ...s, enterprise_sms_token_prefix: e.target.value }))}
-                      placeholder="(empty for raw token)"
-                    />
-                  </label>
-                </div>
-                <div className="row">
-                  <label>
-                    Poll Interval (minutes)
-                    <input
-                      value={form.enterprise_sms_poll_interval_minutes}
-                      onChange={(e) =>
-                        setForm((s) => ({ ...s, enterprise_sms_poll_interval_minutes: e.target.value }))
-                      }
-                      placeholder="20"
-                    />
-                  </label>
-                  <label>
-                    HTTP Timeout (seconds)
-                    <input
-                      value={form.enterprise_sms_http_timeout_seconds}
-                      onChange={(e) =>
-                        setForm((s) => ({ ...s, enterprise_sms_http_timeout_seconds: e.target.value }))
-                      }
-                      placeholder="30"
-                    />
-                  </label>
-                </div>
-                <label>
-                  LastId Cursor
-                  <input
-                    value={form.enterprise_sms_last_id}
-                    onChange={(e) => setForm((s) => ({ ...s, enterprise_sms_last_id: e.target.value }))}
-                    placeholder="0"
-                  />
-                </label>
-                <div className="row">
-                  <button
-                    type="button"
-                    className="btn"
-                    disabled={busy || !selectedKey}
-                    onClick={onSaveEnterpriseSmsSync}
-                  >
-                    Save SMS Sync Config
-                  </button>
-                  <button
-                    type="button"
-                    className="btn secondary"
-                    disabled={busy || !selectedKey}
-                    onClick={onRunEnterpriseSmsSyncNow}
-                  >
-                    Run SMS Sync Now
-                  </button>
-                </div>
-              </>
-            ) : null}
-
-            <h3>Features</h3>
-            {features.map((feature) => {
-              const supported = isFeatureSupported(feature.key);
-              const runtimeOverride = (instanceMap[selectedKey]?.feature_overrides || []).find(
-                (item) => item.feature_key === feature.key,
-              );
-              const reason = !supported
-                ? 'unsupported for selected platform'
-                : runtimeOverride?.disabled_reason || '';
-              return (
-                <label className="checkbox" key={feature.key} title={feature.description}>
-                  <input
-                    type="checkbox"
-                    checked={Boolean(form.feature_overrides[feature.key])}
-                    disabled={!supported}
-                    onChange={(e) =>
-                      setForm((s) => ({
-                        ...s,
-                        feature_overrides: { ...s.feature_overrides, [feature.key]: e.target.checked },
-                      }))
-                    }
-                  />
-                  {feature.display_name}
-                  {reason ? ` (${reason})` : ''}
-                </label>
-              );
-            })}
-
-            <button className="btn primary" type="submit" disabled={busy || loading}>
-              {selectedKey ? 'Update Instance' : 'Create Instance'}
-            </button>
-          </form>
-          </section>
-        ) : null}
-
-        {!isDetailView ? (
-          <section className="card instance-browser">
-          <h2>Instances</h2>
-          <div className="instance-toolbar">
-            <label>
-              Search
-              <input
-                value={instanceSearch}
-                onChange={(e) => setInstanceSearch(e.target.value)}
-                placeholder="Search by key, bot name, department..."
-              />
-            </label>
-            <label>
-              Status
-              <select value={instanceStatusFilter} onChange={(e) => setInstanceStatusFilter(e.target.value)}>
-                <option value="all">All</option>
-                <option value="enabled">Enabled</option>
-                <option value="disabled">Disabled</option>
-              </select>
-            </label>
-          </div>
-          {loading ? (
-            <div className="muted">Loading...</div>
-          ) : filteredInstances.length === 0 ? (
-            <div className="muted">No instances found.</div>
-          ) : (
-            <div className="instance-card-grid">
-              {filteredInstances.map((item) => {
-                const isSelected = selectedKey === item.instance_key;
-                const statusLabel = item.is_enabled ? 'Enabled' : 'Disabled';
-                const isTelegram = item.platform_type_key === PLATFORM_TELEGRAM;
-                const botName = isTelegram
-                  ? item.platform_metadata?.telegram_bot_name || '-'
-                  : item.platform_metadata?.bale_bot_name || '-';
-                const botId = isTelegram
-                  ? item.platform_metadata?.telegram_bot_id || '-'
-                  : item.platform_metadata?.bale_bot_id || '-';
-                const department = isTelegram
-                  ? item.platform_metadata?.telegram_department || '-'
-                  : item.platform_metadata?.bale_department || '-';
-                const maskedToken = maskTokenValue(
-                  isTelegram ? item.platform_metadata?.telegram_token : item.platform_metadata?.bale_token,
-                );
-
-                return (
-                  <article
-                    key={item.instance_key}
-                    className={`instance-card ${item.is_enabled ? 'enabled' : 'disabled'} ${isSelected ? 'selected' : ''}`}
-                    onClick={() => openInstanceDetail(item.instance_key)}
-                  >
-                    <div className="instance-card-head">
-                      <h3>{item.instance_key}</h3>
-                      <span className={`status-pill ${item.is_enabled ? 'good' : 'warn'}`}>{statusLabel}</span>
-                    </div>
-
-                    <div className="instance-token">{maskedToken}</div>
-
-                    <div className="instance-meta">
-                      <div>
-                        <span className="k">Bot</span>
-                        <span className="v">{botName}</span>
-                      </div>
-                      <div>
-                        <span className="k">Bot ID</span>
-                        <span className="v">{botId}</span>
-                      </div>
-                      <div>
-                        <span className="k">Department</span>
-                        <span className="v">{department}</span>
-                      </div>
-                      <div>
-                        <span className="k">Platform</span>
-                        <span className="v">{item.platform_type_key}</span>
-                      </div>
-                      <div>
-                        <span className="k">Account</span>
-                        <span className="v">{item.chatwoot?.account_id ?? '-'}</span>
-                      </div>
-                      <div>
-                        <span className="k">Inbox</span>
-                        <span className="v">{item.chatwoot?.inbox_id ?? '-'}</span>
-                      </div>
-                    </div>
-
-                    <div className="list-actions">
-                      <button
-                        className="btn primary"
-                        disabled={busy}
-                        onClick={(e) => {
-                          e.stopPropagation();
-                          openInstanceDetail(item.instance_key);
-                        }}
-                      >
-                        Open
-                      </button>
-                      <button
-                        className="btn"
-                        disabled={busy}
-                        onClick={(e) => {
-                          e.stopPropagation();
-                          onToggleEnabled(item.instance_key, item.is_enabled);
-                        }}
-                      >
-                        {item.is_enabled ? 'Disable' : 'Enable'}
-                      </button>
-                      <button
-                        className="btn"
-                        disabled={busy}
-                        onClick={(e) => {
-                          e.stopPropagation();
-                          if (item.platform_type_key === PLATFORM_BALE_ENTERPRISE) {
-                            onCreateEnterpriseInbox('customer_service', item.instance_key);
-                          } else {
-                            onCreateInbox(item.instance_key);
-                          }
-                        }}
-                      >
-                        {item.platform_type_key === PLATFORM_BALE_ENTERPRISE ? 'Service Inbox' : 'Create Inbox'}
-                      </button>
-                      {item.platform_type_key === PLATFORM_BALE_ENTERPRISE ? (
-                        <button
-                          className="btn"
-                          disabled={busy}
-                          onClick={(e) => {
-                          e.stopPropagation();
-                            onCreateEnterpriseInbox('sales', item.instance_key);
-                          }}
-                        >
-                          Sales Inbox
-                        </button>
-                      ) : null}
-                      <button
-                        className="btn danger"
-                        disabled={busy}
-                        onClick={(e) => {
-                          e.stopPropagation();
-                          onDelete(item.instance_key);
-                        }}
-                      >
-                        Delete
-                      </button>
-                    </div>
-                  </article>
-                );
-              })}
-            </div>
-          )}
-          </section>
-        ) : null}
-
-        {isDetailView && !isEnterpriseBalePlatform ? (
-          <section className="card">
-            <h2>Mapping Explorer</h2>
-          <div className="form">
-            <div className="row">
-              <label>
-                Instance
-                <select value={selectedKey} onChange={(e) => openInstanceDetail(e.target.value)}>
-                  <option value="">Select instance</option>
-                  {instances.map((item) => (
-                    <option key={item.instance_key} value={item.instance_key}>
-                      {item.instance_key}
-                    </option>
-                  ))}
-                </select>
-              </label>
-              <label>
-                Search
-                <input value={search} onChange={(e) => setSearch(e.target.value)} placeholder="conversation id" />
-              </label>
-            </div>
-            <button className="btn" disabled={busy || !selectedKey} onClick={onSearchConversations}>
-              Filter
-            </button>
-
-            <div className="list">
-              {conversations.map((item) => (
-                <div
-                  key={item.id}
-                  className={`list-item ${selectedConversationId === item.id ? 'active' : ''}`}
-                  onClick={() => setSelectedConversationId(item.id)}
-                  >
-                    <div className="list-main">
-                      <div className="list-title">platform:{item.platform_conversation_id}</div>
-                      <div className="list-meta">
-                        chatwoot:{item.chatwoot_conversation_id} {item.is_active === false ? '(historical)' : '(current)'}
-                      </div>
-                    </div>
-                  </div>
-                ))}
-              </div>
-
-            {selectedConversationId ? (
-              <div className="table-wrap">
-                <table>
-                  <thead>
-                    <tr>
-                      <th>Direction</th>
-                      <th>Chatwoot Msg</th>
-                      <th>Platform Msg</th>
-                      <th>Reply (cw/platform)</th>
-                      <th>Status</th>
-                      <th>Created</th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {mappings.map((item) => (
-                      <tr key={item.id}>
-                        <td>{item.direction}</td>
-                        <td>{item.chatwoot_message_id || '-'}</td>
-                        <td>{item.platform_message_id || '-'}</td>
-                        <td>
-                          {item.chatwoot_parent_message_id || '-'} / {item.platform_parent_message_id || '-'}
-                        </td>
-                        <td>{item.status}</td>
-                        <td>{new Date(item.created_at).toLocaleString()}</td>
-                      </tr>
-                    ))}
-                  </tbody>
-                </table>
-              </div>
-            ) : null}
-          </div>
-          </section>
-        ) : null}
-
-        {isDetailView && isEnterpriseBalePlatform ? (
-          <section className="card">
-            <h2>Enterprise Assets</h2>
-            {!selectedKey ? <div className="muted">Save the instance before uploading manuals or the catalog.</div> : null}
-
-            <div className="form">
-              <h3>Manuals</h3>
-              <div className="row">
-                <label>
-                  Display Name
-                  <input value={manualDisplayName} onChange={(e) => setManualDisplayName(e.target.value)} />
-                </label>
-                <label>
-                  Link URL
-                  <input
-                    type="url"
-                    placeholder="https://example.com/manual"
-                    value={manualLinkUrl}
-                    onChange={(e) => setManualLinkUrl(e.target.value)}
-                  />
-                </label>
-                <label>
-                  PDF File
-                  <input type="file" accept="application/pdf,.pdf" onChange={(e) => setManualFile(e.target.files?.[0] || null)} />
-                </label>
-              </div>
-              <button className="btn" type="button" disabled={busy || !selectedKey} onClick={onUploadManual}>
-                Upload Manual
-              </button>
-              {enterpriseManuals.length === 0 ? (
-                <div className="muted">No manuals uploaded.</div>
-              ) : (
-                <div className="list">
-                  {enterpriseManuals.map((item) => (
-                    <div key={item.id} className="list-item">
-                      <div className="list-main">
-                        {(() => {
-                          const groupId = manualGroupByAssetId[item.id] || '';
-                          const groupName = groupId
-                            ? (enterpriseManualGroups.find((g) => g.id === groupId)?.name || '-')
-                            : 'Unassigned';
-                          return (
-                            <>
-                        {editingManualId === item.id ? (
-                          <div className="row">
-                            <label>
-                              Display Name
-                              <input
-                                value={editingManualDisplayName}
-                                onChange={(e) => setEditingManualDisplayName(e.target.value)}
-                              />
-                            </label>
-                            <label>
-                              Link URL
-                              <input
-                                type="url"
-                                value={editingManualLinkUrl}
-                                onChange={(e) => setEditingManualLinkUrl(e.target.value)}
-                              />
-                            </label>
-                            <label>
-                              Group
-                              <select
-                                value={editingManualGroupId}
-                                onChange={(e) => setEditingManualGroupId(e.target.value)}
-                              >
-                                <option value="">Unassigned</option>
-                                {enterpriseManualGroups.map((group) => (
-                                  <option key={group.id} value={group.id}>
-                                    {group.name}
-                                  </option>
-                                ))}
-                              </select>
-                              <div className="list-actions" style={{ marginTop: 8 }}>
-                                <button
-                                  className="btn ghost"
-                                  type="button"
-                                  disabled={busy || !selectedKey}
-                                  onClick={onAddGroupFromManualEdit}
-                                >
-                                  + Add Group
-                                </button>
-                              </div>
-                              {enterpriseManualGroups.length > 0 ? (
-                                <div style={{ marginTop: 8 }}>
-                                  {enterpriseManualGroups.map((group) => (
-                                    <div
-                                      key={`group-manage-${group.id}`}
-                                      style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 8, marginBottom: 4 }}
-                                    >
-                                      <span>{group.name}</span>
-                                      <div style={{ display: 'flex', gap: 6 }}>
-                                        <button
-                                          className="btn ghost"
-                                          type="button"
-                                          title="Edit group name"
-                                          aria-label={`Edit group ${group.name}`}
-                                          disabled={busy}
-                                          onClick={() => onRenameGroupFromManualEdit(group)}
-                                        >
-                                          ✏
-                                        </button>
-                                        <button
-                                          className="btn danger"
-                                          type="button"
-                                          title="Delete group"
-                                          aria-label={`Delete group ${group.name}`}
-                                          disabled={busy}
-                                          onClick={() => onDeleteGroupFromManualEdit(group)}
-                                        >
-                                          🗑
-                                        </button>
-                                      </div>
-                                    </div>
-                                  ))}
-                                </div>
-                              ) : null}
-                            </label>
-                          </div>
-                        ) : (
-                          <>
-                            <div className="list-title">{item.display_name || item.original_filename}</div>
-                            <div className="list-meta">
-                              {item.original_filename} · {(item.size_bytes / 1024).toFixed(1)} KB
-                            </div>
-                            <div className="list-meta">Group: {groupName}</div>
-                            <div className="list-meta">
-                              Link:{' '}
-                              {item.link_url ? (
-                                <a href={item.link_url} target="_blank" rel="noreferrer">
-                                  {item.link_url}
-                                </a>
-                              ) : (
-                                '-'
-                              )}
-                            </div>
-                          </>
-                        )}
-                            </>
-                          );
-                        })()}
-                      </div>
-                      <div className="list-actions">
-                        {editingManualId === item.id ? (
-                          <>
-                            <button className="btn" type="button" disabled={busy} onClick={() => onSaveEditManual(item.id)}>
-                              Save
-                            </button>
-                            <button className="btn ghost" type="button" disabled={busy} onClick={onCancelEditManual}>
-                              Cancel
-                            </button>
-                          </>
-                        ) : (
-                          <button className="btn" type="button" disabled={busy} onClick={() => onStartEditManual(item)}>
-                            Edit
-                          </button>
-                        )}
-                        <button className="btn danger" type="button" disabled={busy} onClick={() => onDeleteManual(item.id)}>
-                          Delete
-                        </button>
-                      </div>
-                    </div>
-                  ))}
-                </div>
-              )}
-
-              <h3>Catalog</h3>
-              <div className="row">
-                <label>
-                  Display Name
-                  <input value={catalogDisplayName} onChange={(e) => setCatalogDisplayName(e.target.value)} />
-                </label>
-                <label>
-                  Link URL
-                  <input
-                    type="url"
-                    placeholder="https://example.com/catalog"
-                    value={catalogLinkUrl}
-                    onChange={(e) => setCatalogLinkUrl(e.target.value)}
-                  />
-                </label>
-                <label>
-                  PDF File
-                  <input type="file" accept="application/pdf,.pdf" onChange={(e) => setCatalogFile(e.target.files?.[0] || null)} />
-                </label>
-              </div>
-              <div className="list-actions">
-                <button className="btn" type="button" disabled={busy || !selectedKey} onClick={onReplaceCatalog}>
-                  Upload or Replace Catalog
-                </button>
-                <button className="btn danger" type="button" disabled={busy || !enterpriseCatalog} onClick={onDeleteCatalog}>
-                  Delete Catalog
-                </button>
-              </div>
-              {enterpriseCatalog ? (
-                <div className="list-item">
-                  <div className="list-main">
-                    <div className="list-title">{enterpriseCatalog.display_name || enterpriseCatalog.original_filename}</div>
-                    <div className="list-meta">
-                      {enterpriseCatalog.original_filename} · {(enterpriseCatalog.size_bytes / 1024).toFixed(1)} KB
-                    </div>
-                    <div className="list-meta">
-                      Link:{' '}
-                      {enterpriseCatalog.link_url ? (
-                        <a href={enterpriseCatalog.link_url} target="_blank" rel="noreferrer">
-                          {enterpriseCatalog.link_url}
-                        </a>
-                      ) : (
-                        '-'
-                      )}
-                    </div>
-                  </div>
-                </div>
-              ) : (
-                <div className="muted">No catalog uploaded.</div>
-              )}
-            </div>
-          </section>
-        ) : null}
-
-        {isDetailView && isEnterpriseBalePlatform ? (
-          <section className="card">
-            <h2>Enterprise Sessions</h2>
-            {enterpriseSessions.length === 0 ? (
-              <div className="muted">No enterprise sessions yet.</div>
-            ) : (
-              <div className="table-wrap">
-                <table>
-                  <thead>
-                    <tr>
-                      <th>Route</th>
-                      <th>Chat ID</th>
-                      <th>Phone</th>
-                      <th>Conversation</th>
-                      <th>Status</th>
-                      <th>Present</th>
-                      <th>Unread</th>
-                      <th>Updated</th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {enterpriseSessions.map((item) => (
-                      <tr key={item.id}>
-                        <td>{item.route_key}</td>
-                        <td>{item.platform_chat_id}</td>
-                        <td>{item.phone_number || '-'}</td>
-                        <td>{item.chatwoot_conversation_id}</td>
-                        <td>{item.status}</td>
-                        <td>{item.user_present ? 'yes' : 'no'}</td>
-                        <td>{item.unread_count}</td>
-                        <td>{new Date(item.updated_at).toLocaleString()}</td>
-                      </tr>
-                    ))}
-                  </tbody>
-                </table>
-              </div>
-            )}
-          </section>
-        ) : null}
-
-        {isDetailView && !isEnterpriseBalePlatform ? (
-          <section className="card">
-            <h2>Simulate Platform Event</h2>
-          <form className="form" onSubmit={onSimulate}>
-            <div className="row">
-              <label>
-                Instance Key
-                <input
-                  value={simEvent.instance_key}
-                  onChange={(e) => setSimEvent((s) => ({ ...s, instance_key: e.target.value }))}
-                />
-              </label>
-              <label>
-                Chat ID
-                <input value={simEvent.chat_id} onChange={(e) => setSimEvent((s) => ({ ...s, chat_id: e.target.value }))} />
-              </label>
-            </div>
-            <div className="row">
-              <label>
-                Platform Message ID
-                <input
-                  value={simEvent.platform_message_id}
-                  onChange={(e) => setSimEvent((s) => ({ ...s, platform_message_id: e.target.value }))}
-                />
-              </label>
-              <label>
-                Parent Platform Message ID
-                <input
-                  value={simEvent.parent_platform_message_id}
-                  onChange={(e) => setSimEvent((s) => ({ ...s, parent_platform_message_id: e.target.value }))}
-                />
-              </label>
-            </div>
-            <label>
-              Text
-              <textarea value={simEvent.text} onChange={(e) => setSimEvent((s) => ({ ...s, text: e.target.value }))} rows={3} />
-            </label>
-            <button className="btn primary" type="submit" disabled={busy}>
-              Simulate
-            </button>
-          </form>
-          </section>
-        ) : null}
-      </div>
+          <InstanceWorkspacePage
+            activeTab={activeTab}
+            setActiveTab={setActiveTab}
+            isEnterpriseBalePlatform={isEnterpriseBalePlatform}
+            heroProps={heroProps}
+            formProps={formProps}
+            mappingProps={mappingProps}
+            enterpriseAssetProps={enterpriseAssetProps}
+            enterpriseOperationsProps={enterpriseOperationsProps}
+            simulationProps={simulationProps}
+            conversationsCount={conversations.length}
+            enterpriseSessionsCount={enterpriseSessions.length}
+            enterpriseManualsCount={enterpriseManuals.length}
+          />
+        ) : (
+          <InstancesPage
+            loading={loading}
+            filteredInstances={filteredInstances}
+            selectedKey={selectedKey}
+            busy={busy}
+            maskTokenValue={maskTokenValue}
+            openInstanceDetail={openInstanceDetail}
+            onToggleEnabled={onToggleEnabled}
+            onCreateInbox={onCreateInbox}
+            onCreateEnterpriseInbox={onCreateEnterpriseInbox}
+            onDelete={onDelete}
+            PLATFORM_TELEGRAM={PLATFORM_TELEGRAM}
+            PLATFORM_BALE_ENTERPRISE={PLATFORM_BALE_ENTERPRISE}
+          />
+        )}
+      </Suspense>
     </div>
   );
 }

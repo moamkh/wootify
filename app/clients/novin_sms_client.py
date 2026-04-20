@@ -41,7 +41,7 @@ class NovinSmsClient:
         token_prefix: str = "Bearer",
         timeout_seconds: int = 30,
     ) -> dict[str, Any]:
-        """Fetch SMS rows from Novin API where id >= last_id."""
+        """Fetch SMS rows from the upstream Novin API starting from the supplied id boundary."""
         raw_endpoint = str(url or "").strip()
         if not raw_endpoint:
             raise ValueError("enterprise_sms_api_url is required")

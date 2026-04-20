@@ -160,8 +160,18 @@ class BalePollingService:
                         processed_update_id = str(normalized_update_id)
 
                     if platform_key == 'bale_enterprise':
-                        with SessionLocal() as db:
-                            await self._enterprise.handle_platform_update(db, instance_key, update)
+                        try:
+                            with SessionLocal() as db:
+                                await self._enterprise.handle_platform_update(db, instance_key, update)
+                        except Exception as exc:
+                            self._logger.error(
+                                'enterprise_update_error instance=%s update_id=%s error_type=%s error=%s',
+                                instance_key,
+                                processed_update_id,
+                                type(exc).__name__,
+                                str(exc),
+                                exc_info=True,
+                            )
                     else:
                         handled = await self._maybe_handle_local_command(
                             instance_key,

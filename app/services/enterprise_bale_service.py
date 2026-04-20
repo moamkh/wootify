@@ -76,6 +76,7 @@ PRODUCTS_CATALOG_LABEL = "کاتالوگ محصولات"
 CONTACT_CUSTOMER_SERVICE_LABEL = "ارتباط با کارشناسان خدمات پس از فروش"
 CONTACT_SALES_LABEL = "ارتباط با کارشناسان فروش"
 DESIERED_FILE_TEXT = "فایل مورد نظر👆"
+USER_MANUAL_LINK_TEMPLATE = "برای دریافت راهنمای کاربری مورد نظر بر روی متن زیر ضربه بزنید:\n[{{user_manual_name}}]({{user_manual_url}})"
 ROUTE_CUSTOMER_SERVICE = "customer_service"
 ROUTE_SALES = "sales"
 
@@ -328,20 +329,22 @@ class EnterpriseBaleService:
         timeout_seconds = max(5, timeout_seconds)
 
         last_id = int(configured_last_id)
+        fetch_start_id = last_id + 1
 
         sms_logger.info(
-            "sync.start instance=%s enabled=%s api_url=%s last_id=%s timeout_seconds=%s",
+            "sync.start instance=%s enabled=%s api_url=%s processed_last_id=%s fetch_start_id=%s timeout_seconds=%s",
             instance_key,
             True,
             api_url,
             last_id,
+                fetch_start_id,
             timeout_seconds,
         )
 
         try:
             response = await self._novin_sms.fetch_since(
                 url=api_url,
-                last_id=last_id,
+                    last_id=fetch_start_id,
                 token=token,
                 token_header=token_header,
                 token_prefix=token_prefix,
@@ -349,10 +352,11 @@ class EnterpriseBaleService:
             )
         except Exception as exc:
             sms_logger.exception(
-                "sync.fetch_failed instance=%s api_url=%s last_id=%s error=%s",
+                    "sync.fetch_failed instance=%s api_url=%s processed_last_id=%s fetch_start_id=%s error=%s",
                 instance_key,
                 api_url,
                 last_id,
+                    fetch_start_id,
                 str(exc),
             )
             return {
@@ -387,6 +391,14 @@ class EnterpriseBaleService:
 
         for item in items:
             item_id = self._coerce_sms_id(item)
+            if item_id is not None and item_id <= last_id:
+                sms_logger.info(
+                    "sync.item_skip instance=%s reason=already_processed sms_id=%s processed_last_id=%s",
+                    instance_key,
+                    item_id,
+                    last_id,
+                )
+                continue
 
             text = str(item.get("messageText") or "").strip()
             if not text:
@@ -1112,9 +1124,9 @@ class EnterpriseBaleService:
                 user,
                 chat_id,
                 platform_metadata=runtime.platform_metadata,
-                rebuild_keyboard=self._manual_menu_needs_root_rebuild(
-                    db, runtime.instance.id, user.gre_status
-                ),
+                # rebuild_keyboard=self._manual_menu_needs_root_rebuild(
+                #     db, runtime.instance.id, user.gre_status
+                # ),
             )
             return {"message": "manual_menu_closed", "status": "ok"}
 
@@ -1216,23 +1228,55 @@ class EnterpriseBaleService:
             )
             return {"message": "manual_not_found", "detail": "selection_invalid"}
 
-        asset_row, content = self._documents.read_asset_bytes(db, selected.id)
-        await self._send_media(
-            runtime.instance.instance_key,
-            chat_id,
-            content,
-            asset_row.original_filename,
-            caption=asset_row.display_name or None,
-            reply_markup=self._remove_keyboard_markup(),
+        resolved_link = str(selected.link_url or "").strip()
+        if resolved_link:
+            # Encode any literal spaces in the URL so the Markdown parser
+            # (Bale auto-parses all messages as Markdown) doesn't break the
+            # URL at the first space.
+            safe_url = resolved_link.replace(" ", "%20")
+            display_name = (
+                str(selected.display_name or "").strip()
+                or str(selected.original_filename or "").strip()
+                or safe_url
+            )
+            template = self._message_text(
+                runtime.platform_metadata,
+                "enterprise_user_manual_link_template",
+                USER_MANUAL_LINK_TEMPLATE,
+            )
+            message = (
+                template
+                .replace("{{user_manual_name}}", display_name)
+                .replace("{{user_manual_url}}", safe_url)
+            )
+            await self._send_text(
+                runtime.instance.instance_key,
+                chat_id,
+                message,
+                reply_markup=self._remove_keyboard_markup(),
+            )
+        else:
+            asset_row, content = self._documents.read_asset_bytes(db, selected.id)
+            await self._send_media(
+                runtime.instance.instance_key,
+                chat_id,
+                content,
+                asset_row.original_filename,
+                caption=asset_row.display_name or None,
+                reply_markup=self._remove_keyboard_markup(),
+            )
+        # When a link was sent, the link message already dismissed the keyboard
+        # (via _remove_keyboard_markup), so rebuild_keyboard must be False to
+        # avoid sending the "فایل مورد نظر👆" separator message unnecessarily.
+        needs_rebuild = (not resolved_link) and self._manual_menu_needs_root_rebuild(
+            db, runtime.instance.id, user.gre_status
         )
         await self._show_root_menu(
             runtime.instance.instance_key,
             user,
             chat_id,
             platform_metadata=runtime.platform_metadata,
-            rebuild_keyboard=self._manual_menu_needs_root_rebuild(
-                db, runtime.instance.id, user.gre_status
-            ),
+            rebuild_keyboard=needs_rebuild,
         )
         # Clear group selection after sending manual
         user.current_group_id = None
@@ -1830,7 +1874,47 @@ class EnterpriseBaleService:
         if normalized_phone:
             create_payload["phone_number"] = normalized_phone
 
-        created = await client.create_contact(account_id, create_payload)
+        try:
+            created = await client.create_contact(account_id, create_payload)
+        except httpx.HTTPStatusError as exc:
+            if exc.response.status_code != 422:
+                raise
+            # 422 can mean a race-condition duplicate or an invalid phone number.
+            logger.warning(
+                "enterprise_contact_create_422 identifier=%s response=%s",
+                identifier,
+                exc.response.text[:500],
+            )
+            # Re-try the lookup – another worker may have just created the contact.
+            retry_contact = await self._find_contact_by_identifier(
+                client, account_id, identifier
+            )
+            if not retry_contact and normalized_phone:
+                retry_contact = await self._find_contact_by_phone(
+                    client, account_id, normalized_phone
+                )
+            if retry_contact:
+                retry_id = self._extract_id(retry_contact) or self._extract_id(
+                    (retry_contact or {}).get("payload")
+                )
+                if retry_id:
+                    return int(retry_id)
+            # If a phone number was included the 422 may be due to its format;
+            # retry the creation without it as a last resort.
+            if normalized_phone and "phone_number" in create_payload:
+                logger.warning(
+                    "enterprise_contact_create_retry_without_phone identifier=%s",
+                    identifier,
+                )
+                fallback_payload = {
+                    k: v for k, v in create_payload.items() if k != "phone_number"
+                }
+                created = await client.create_contact(account_id, fallback_payload)
+            else:
+                raise RuntimeError(
+                    f"create_contact returned 422 for identifier={identifier!r}: "
+                    f"{exc.response.text[:300]}"
+                ) from exc
         contact_id = self._extract_id(created) or self._extract_id(
             (created or {}).get("payload")
         )
