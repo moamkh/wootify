@@ -18,6 +18,7 @@ from sqlalchemy import engine_from_config, pool
 repo_root = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(repo_root))
 
+from app.config import settings  # noqa: E402
 from app.models import Base  # noqa: E402
 
 config = context.config
@@ -33,8 +34,9 @@ def _get_url() -> str:
     """Get url."""
     try:
         env_url = os.getenv("DATABASE_URL")
-        if env_url:
-            return env_url
+        env_database_name = os.getenv("DATABASE_NAME")
+        if env_url or env_database_name:
+            return settings.resolved_database_url
 
         url = config.get_main_option("sqlalchemy.url")
         if url.startswith("sqlite:///./"):

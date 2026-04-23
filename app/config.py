@@ -4,11 +4,15 @@ Module Overview
 Purpose: Centralized runtime settings loaded from environment variables.
 Documentation Standard: module/class/public-method docstrings.
 """
+from __future__ import annotations
+
 from pathlib import Path
 
+from sqlalchemy.engine import make_url
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 repo_root = Path(__file__).resolve().parents[1]
+default_sqlite_database_url = f"sqlite:///{(repo_root / 'wootify.db').as_posix()}"
 
 
 class Settings(BaseSettings):
@@ -20,7 +24,11 @@ class Settings(BaseSettings):
     )
 
     SERVER_BASE_URL: str = 'http://localhost:8000'
-    DATABASE_URL: str = f"sqlite:///{(repo_root / 'wootify.db').as_posix()}"
+    DATABASE_URL: str = default_sqlite_database_url
+    DATABASE_NAME: str = 'wootify_instance_manager_pg'
+    DATABASE_AUTO_CREATE: bool = True
+    POSTGRES_ADMIN_DATABASE: str = 'postgres'
+    SQLITE_MIGRATION_SOURCE_URL: str = default_sqlite_database_url
     SQLITE_BUSY_TIMEOUT_MS: int = 30000
     SQLITE_JOURNAL_MODE: str = 'WAL'
 
@@ -76,6 +84,35 @@ class Settings(BaseSettings):
     LOG_HTTP_REQUESTS: bool = False
     LOG_COLOR: bool = True
     LOG_COLOR_FORCE: bool = False
+
+    @property
+    def resolved_database_url(self) -> str:
+        """Resolve the final application database URL from environment settings."""
+        raw_url = str(self.DATABASE_URL or '').strip() or default_sqlite_database_url
+        url = make_url(raw_url)
+        if not url.drivername.startswith('postgresql'):
+            return raw_url
+
+        database_name = str(self.DATABASE_NAME or '').strip() or str(url.database or '').strip()
+        if not database_name:
+            raise ValueError('DATABASE_NAME is required for PostgreSQL connections')
+        return url.set(database=database_name).render_as_string(hide_password=False)
+
+    @property
+    def postgres_admin_url(self) -> str | None:
+        """Resolve the PostgreSQL admin URL used to create the target database."""
+        raw_url = str(self.DATABASE_URL or '').strip() or default_sqlite_database_url
+        url = make_url(raw_url)
+        if not url.drivername.startswith('postgresql'):
+            return None
+
+        admin_database = str(self.POSTGRES_ADMIN_DATABASE or '').strip() or 'postgres'
+        return url.set(database=admin_database).render_as_string(hide_password=False)
+
+    @property
+    def sqlite_migration_source_url(self) -> str:
+        """Resolve the SQLite source URL used for one-time Postgres data migration."""
+        return str(self.SQLITE_MIGRATION_SOURCE_URL or '').strip() or default_sqlite_database_url
 
 
 settings = Settings()

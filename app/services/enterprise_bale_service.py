@@ -1864,6 +1864,25 @@ class EnterpriseBaleService:
             response = await client.list_contact_conversations(
                 int(account_id), int(contact_id)
             )
+        except httpx.HTTPStatusError as exc:
+            if self._is_missing_chatwoot_contact(exc.response):
+                logger.info(
+                    "enterprise contact missing remotely; route session will be recreated instance=%s account_id=%s contact_id=%s session_id=%s conversation_id=%s route=%s",
+                    runtime.instance.instance_key,
+                    account_id,
+                    contact_id,
+                    session.id,
+                    session.chatwoot_conversation_id,
+                    session.route_key,
+                )
+                return "resolved"
+            logger.exception(
+                "failed to list enterprise contact conversations instance=%s account_id=%s contact_id=%s",
+                runtime.instance.instance_key,
+                account_id,
+                contact_id,
+            )
+            return None
         except Exception:
             logger.exception(
                 "failed to list enterprise contact conversations instance=%s account_id=%s contact_id=%s",
@@ -3110,6 +3129,16 @@ class EnterpriseBaleService:
     @staticmethod
     def _is_missing_chatwoot_conversation(response: Optional[httpx.Response]) -> bool:
         """Identify deleted or missing Chatwoot conversation responses."""
+        return EnterpriseBaleService._is_missing_chatwoot_resource(response)
+
+    @staticmethod
+    def _is_missing_chatwoot_contact(response: Optional[httpx.Response]) -> bool:
+        """Identify deleted or missing Chatwoot contact responses."""
+        return EnterpriseBaleService._is_missing_chatwoot_resource(response)
+
+    @staticmethod
+    def _is_missing_chatwoot_resource(response: Optional[httpx.Response]) -> bool:
+        """Identify deleted or missing Chatwoot resource responses."""
         if response is None or response.status_code != 404:
             return False
         body = ""

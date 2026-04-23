@@ -594,7 +594,7 @@ class EnterpriseManualGroup(Base):
         index=True,
     )
     name = Column(String(255), nullable=False)
-    sort_order = Column(Integer, nullable=False, default=0, index=True)
+    sort_order = Column(Integer, nullable=False, default=0)
     is_active = Column(Boolean, nullable=False, default=True, index=True)
     created_at = Column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
@@ -637,7 +637,7 @@ class EnterpriseManualGroupAssignment(Base):
         nullable=False,
         index=True,
     )
-    sort_order = Column(Integer, nullable=False, default=0, index=True)
+    sort_order = Column(Integer, nullable=False, default=0)
     created_at = Column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )
