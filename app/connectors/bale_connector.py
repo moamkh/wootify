@@ -413,7 +413,7 @@ class BaleBotConnector(BaleConnector):
                     instance,
                     chat_id,
                     len(text or ""),
-                    not bool(text or "").strip(),
+                    not str(text or "").strip(),
                     self._reply_markup_summary(components),
                 )
             result = await self._request(
@@ -433,7 +433,7 @@ class BaleBotConnector(BaleConnector):
                 instance,
                 chat_id,
                 len(text or ""),
-                not bool(text or "").strip(),
+                not str(text or "").strip(),
                 type(exc).__name__,
                 str(exc),
                 exc_info=True,

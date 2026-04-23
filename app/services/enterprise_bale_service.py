@@ -64,6 +64,9 @@ NO_MANUALS_TEXT = "فایلی برای این بخش تنظیم نشده است.
 NO_CATALOG_TEXT = "کاتالوگی برای این بخش تنظیم نشده است."
 NOT_CONFIGURED_TEXT = "این بخش هنوز در پنل مدیریت تنظیم نشده است."
 LIVE_MODE_RESUME_TEXT = "گفتگو ادامه دارد. پیام خود را ارسال کنید."
+LIVE_SESSION_LOCKED_TEXT = (
+    "در گفتگوی زنده فقط می‌توانید پیام خود را ارسال کنید یا «بازگشت به منو» را بزنید."
+)
 INVALID_PHONE_TEXT = "شماره موبایل معتبر نیست لطفا از دکمه ی اشتراک گذاری شماره تلفین در منو ربات استفاده کنید."
 BACK_TO_MENU_LABEL = "بازگشت به منو"
 RECHECK_PHONE_LABEL = "بررسی مجدد شماره موبایل"
@@ -614,6 +617,30 @@ class EnterpriseBaleService:
         attachments = await self._extract_attachments(instance_key, message)
 
         command = self._normalize_command(text)
+        live_session = self._active_live_session_for_state(db, user)
+        if live_session:
+            handled = await self._handle_live_session_menu_input(
+                db,
+                runtime=runtime,
+                user=user,
+                session=live_session,
+                chat_id=str(chat_id),
+                text=text,
+            )
+            if handled is not None:
+                db.commit()
+                return handled
+            await self._forward_customer_message_to_chatwoot(
+                db,
+                runtime=runtime,
+                user=user,
+                session=live_session,
+                text=text,
+                attachments=attachments,
+            )
+            db.commit()
+            return {"message": "forwarded_to_chatwoot", "status": "sent"}
+
         if command == "/start":
             self._leave_live_session_if_needed(db, user)
             await self._send_text(
@@ -628,29 +655,6 @@ class EnterpriseBaleService:
 
             db.commit()
             return {"message": "start_handled", "status": "ok"}
-        
-        live_session = self._active_live_session_for_state(db, user)
-        if live_session:
-            if self._is_back_to_menu(text):
-                await self._leave_live_route(
-                    instance_key,
-                    user,
-                    live_session,
-                    str(chat_id),
-                    platform_metadata=runtime.platform_metadata,
-                )
-                db.commit()
-                return {"message": "left_live_route", "status": "ok"}
-            await self._forward_customer_message_to_chatwoot(
-                db,
-                runtime=runtime,
-                user=user,
-                session=live_session,
-                text=text,
-                attachments=attachments,
-            )
-            db.commit()
-            return {"message": "forwarded_to_chatwoot", "status": "sent"}
 
 
 
@@ -912,10 +916,9 @@ class EnterpriseBaleService:
     ) -> None:
         """Persist a phone number, validate GRE, and show the correct root menu."""
         result = self._gre.validate_phone(phone_number)
-        if (
-            not result.normalized_phone
-            or result.gre_status == EnterpriseGreStatus.unknown
-        ):
+
+        # Phone format is invalid — ask again.
+        if not result.normalized_phone:
             await self._send_text(
                 runtime.instance.instance_key,
                 chat_id,
@@ -931,7 +934,16 @@ class EnterpriseBaleService:
                 platform_metadata=runtime.platform_metadata,
             )
             return
-        if result.gre_status == EnterpriseGreStatus.ineligible:
+
+        # GRE couldn't determine eligibility — treat as ineligible so the user
+        # always reaches a root menu instead of being stuck in phone-entry.
+        resolved_status = (
+            EnterpriseGreStatus.ineligible
+            if result.gre_status == EnterpriseGreStatus.unknown
+            else result.gre_status
+        )
+
+        if resolved_status == EnterpriseGreStatus.ineligible:
             await self._send_text(
                 runtime.instance.instance_key,
                 chat_id,
@@ -941,8 +953,9 @@ class EnterpriseBaleService:
                     NUMBER_NOT_FOUND_TEXT,
                 ),
             )
+
         user.phone_number = result.normalized_phone
-        user.gre_status = result.gre_status
+        user.gre_status = resolved_status
         self._users(db).save(user)
         await self._show_root_menu(
             runtime.instance.instance_key,
@@ -950,6 +963,8 @@ class EnterpriseBaleService:
             chat_id,
             platform_metadata=runtime.platform_metadata,
         )
+        self._set_user_state(db, user, user.current_state)
+
 
     async def _refresh_gre_and_show_root(
         self,
@@ -1481,6 +1496,90 @@ class EnterpriseBaleService:
             platform_metadata=platform_metadata,
         )
 
+    async def _handle_live_session_menu_input(
+        self,
+        db: Session,
+        *,
+        runtime: Any,
+        user: EnterpriseBaleUser,
+        session: EnterpriseBaleSession,
+        chat_id: str,
+        text: str,
+    ) -> Optional[dict[str, Any]]:
+        """Block commands/menu selections while a live session is active."""
+        normalized = self._normalize_action_text(text)
+        if not normalized:
+            return None
+
+        if self._is_back_to_menu(normalized):
+            await self._leave_live_route(
+                runtime.instance.instance_key,
+                user,
+                session,
+                chat_id,
+                platform_metadata=runtime.platform_metadata,
+            )
+            return {"message": "left_live_route", "status": "ok"}
+
+        if self._is_live_session_restricted_input(
+            db,
+            instance_id=runtime.instance.id,
+            text=normalized,
+        ):
+            await self._send_text(
+                runtime.instance.instance_key,
+                chat_id,
+                self._message_text(
+                    runtime.platform_metadata,
+                    "enterprise_live_session_locked_text",
+                    LIVE_SESSION_LOCKED_TEXT,
+                ),
+                reply_markup=self._live_menu_markup(),
+            )
+            return {"message": "live_session_restricted_input_blocked", "status": "ok"}
+
+        return None
+
+    def _is_live_session_restricted_input(
+        self,
+        db: Session,
+        *,
+        instance_id: str,
+        text: str,
+    ) -> bool:
+        """Return whether a live-session input is a blocked command/menu action."""
+        command = self._normalize_command(text)
+        if command and command not in {"/menu", "/back"}:
+            return True
+        return text in self._known_menu_button_labels(db, instance_id)
+
+    def _known_menu_button_labels(
+        self,
+        db: Session,
+        instance_id: str,
+    ) -> set[str]:
+        """Collect visible enterprise keyboard labels that should never hit Chatwoot."""
+        labels: set[str] = set()
+        for markup in (
+            self._eligible_root_markup(),
+            self._ineligible_root_markup(),
+            self._address_menu_markup(),
+            self._phone_prompt_markup(),
+            self._live_menu_markup(),
+            self._manual_menu_markup(db, instance_id),
+        ):
+            for row in self._keyboard_items(markup):
+                labels.update(item for item in row if item)
+
+        groups = EnterpriseManualGroupRepository(db).list_by_instance(
+            instance_id,
+            active_only=True,
+        )
+        for row in self._keyboard_items(self._manual_group_menu_markup(groups)):
+            labels.update(item for item in row if item)
+
+        return labels
+
     async def _forward_customer_message_to_chatwoot(
         self,
         db: Session,
@@ -1915,10 +2014,17 @@ class EnterpriseBaleService:
                     f"create_contact returned 422 for identifier={identifier!r}: "
                     f"{exc.response.text[:300]}"
                 ) from exc
-        contact_id = self._extract_id(created) or self._extract_id(
-            (created or {}).get("payload")
+        contact_id = (
+            self._extract_id(created)
+            or self._extract_id((created or {}).get("payload"))
+            or self._extract_id(((created or {}).get("payload") or {}).get("contact"))
         )
         if not contact_id:
+            logger.error(
+                "enterprise_contact_create_no_id identifier=%s created_response=%s",
+                identifier,
+                str(created)[:500],
+            )
             raise RuntimeError("failed to create enterprise contact")
         return int(contact_id)
 
@@ -2653,6 +2759,12 @@ class EnterpriseBaleService:
                 "voice.ogg",
                 voice.get("mime_type") or "audio/ogg",
             )
+
+        sticker = message.get("sticker")
+        if isinstance(sticker, dict) and sticker.get("file_id"):
+            thumbnail = sticker.get("thumbnail")
+            thumb_id = thumbnail.get("file_id") if isinstance(thumbnail, dict) else None
+            return str(thumb_id or sticker.get("file_id")), "sticker.webp", "image/webp"
 
         return None, None, None
 

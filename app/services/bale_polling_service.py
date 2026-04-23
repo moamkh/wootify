@@ -708,6 +708,12 @@ class BalePollingService:
         if isinstance(audio, dict) and audio.get('file_id'):
             return str(audio.get('file_id')), audio.get('file_name') or 'audio.ogg', audio.get('mime_type')
 
+        sticker = message.get('sticker')
+        if isinstance(sticker, dict) and sticker.get('file_id'):
+            thumbnail = sticker.get('thumbnail')
+            thumb_id = thumbnail.get('file_id') if isinstance(thumbnail, dict) else None
+            return str(thumb_id or sticker.get('file_id')), 'sticker.webp', 'image/webp'
+
         return None, None, None
 
     @staticmethod

@@ -687,8 +687,12 @@ class BridgeService:
 
         text = str(event.get('text') or '')
         source_id = connector_registry.prefixed_source_id(platform_key, chat_id)
+        attachments = event.get('attachments') or []
+
+        # Chatwoot requires non-empty content; use a fallback label for media-only messages
+        content = text or ('📎 Attachment' if attachments else '')
         data: dict[str, Any] = {
-            'content': text,
+            'content': content,
             'message_type': 'incoming',
             'private': False,
             'source_id': source_id,
@@ -696,8 +700,6 @@ class BridgeService:
 
         if chatwoot_parent_message_id and str(chatwoot_parent_message_id).isdigit():
             data['content_attributes'] = {'in_reply_to': int(chatwoot_parent_message_id)}
-
-        attachments = event.get('attachments') or []
         if db.new or db.dirty or db.deleted:
             db.commit()
         message_kind = MessageKind.media if attachments else MessageKind.text
