@@ -1,58 +1,60 @@
-# Repo Briefing: `eaita_chatwoot_connector`
+# Repo Briefing: `wootify_instance_manager`
 
-## What this report is
-A fast, source-grounded starting point. Verify important claims by opening the referenced files.
+## What this project is
+Wootify Instance Manager is a FastAPI backend plus a React admin UI for managing Chatwoot connector instances. It supports generic Bale/Telegram bridge flows and a dedicated Bale Enterprise mode with live Chatwoot routing, enterprise asset delivery, and optional external SMS synchronization.
 
 ## High-signal files/folders to read
 - `README.md`
-- `docs`
-- `CONTRIBUTING.md`
+- `docs/ARCHITECTURE.md`
+- `docs/API_REFERENCE.md`
+- `docs/DEVELOPMENT.md`
 - `.env.example`
+- `app/main.py`
+- `app/controllers/api_v1_controller.py`
+- `app/services/bridge_service.py`
+- `app/services/enterprise_bale_service.py`
 
 ## Tech signals
-- Languages (by file extension sample): Python (43), HTML (2), JSON (2), JavaScript (2), React (JSX) (2), CSS (1)
-- Dependency/build manifests:
-  - `requirements.txt`
-  - `wootify-instance-manager/package.json`
-  - `wootify-instance-manager/yarn.lock`
-- Frameworks / runtimes (heuristic):
-  - FastAPI (from `requirements.txt`)
-  - SQLAlchemy (from `requirements.txt`)
-  - React (from `wootify-instance-manager/package.json`)
+- Backend: Python, FastAPI, SQLAlchemy, Alembic, HTTPX
+- Frontend: React + Vite (`wootify-instance-manager/`)
+- Database backends:
+  - SQLite for simple local setups
+  - PostgreSQL via `psycopg2` for persistent multi-user deployments
+- External integrations:
+  - Chatwoot REST API + webhooks
+  - Bale Bot API
+  - Telegram Bot API
+  - Optional Novin enterprise SMS source
 
 ## Top-level layout
-- Directories:
-  - `.github/`
-  - `alembic/`
-  - `app/`
-  - `docs/`
-  - `wootify-instance-manager/`
-- Files:
-  - `.env`
-  - `.env.example`
-  - `.gitignore`
-  - `alembic.ini`
-  - `backend.err.log`
-  - `backend.log`
-  - `backend.run.err`
-  - `backend.run.log`
-  - `CODE_OF_CONDUCT.md`
-  - `CONTRIBUTING.md`
-  - `frontend.run.err`
-  - `frontend.run.log`
-  - `LICENSE`
-  - `README.md`
-  - `requirements.txt`
-  - `SECURITY.md`
-  - `wootify.db`
-  - `wootify.db-shm`
-  - `wootify.db-wal`
+- `app/`: backend application code
+- `alembic/`: schema migrations
+- `docs/`: architecture, API, and development documentation
+- `scripts/`: one-off maintenance/migration utilities
+- `wootify-instance-manager/`: React admin UI
+- `.env.example`: documented runtime configuration template
 
 ## Likely entrypoints
-- `app/main.py`
+- `app/main.py`: FastAPI app bootstrap and lifespan hooks
+- `app/controllers/api_v1_controller.py`: HTTP API surface
+- `app/services/bale_polling_service.py`: inbound Bale polling loop
+- `app/services/telegram_polling_service.py`: inbound Telegram polling loop
 
-## Next steps (manual, higher confidence)
-- Open `README*` / `docs/` and write a 5–10 line purpose summary.
-- Identify how to run locally (commands, env vars), and record them verbatim.
-- Trace one main flow end-to-end (API request or job): entry → handler → service → DB/integrations.
-- List key dependencies/integrations (DB, cache, queue, external APIs) with evidence paths.
+## Main flows to understand
+1. Generic outbound sync: Chatwoot webhook -> controller -> `BridgeService` -> connector -> Bale/Telegram.
+2. Generic inbound sync: poller -> connector update -> `BridgeService` -> Chatwoot message/conversation APIs.
+3. Enterprise live routing: Bale enterprise update/webhook -> `EnterpriseBaleService` -> Chatwoot enterprise inbox/conversation/contact APIs.
+4. Enterprise SMS sync: scheduler/manual API call -> `EnterpriseBaleService.sync_external_sms_messages()` -> Bale delivery.
+
+## Current database story
+- The backend resolves its runtime DB URL from `.env`.
+- PostgreSQL setups use:
+  - `DATABASE_URL` for the server/credentials
+  - `DATABASE_NAME` for the target database name
+- On startup, `app/db.py` can auto-create the Postgres database when `DATABASE_AUTO_CREATE=true`.
+- `scripts/migrate_sqlite_to_postgres.py` can copy an existing SQLite dataset into the configured PostgreSQL database.
+
+## Practical next steps
+- Read `.env.example` before changing deployment settings.
+- Verify the active DB with `python -c "from app.config import settings; print(settings.resolved_database_url)"`.
+- Trace one enterprise route flow through `api_v1_controller.py` and `enterprise_bale_service.py` before changing live-chat behavior.

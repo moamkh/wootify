@@ -9,9 +9,19 @@ API prefix: `/api/v1`
 
 Returns active platform types with capabilities and metadata schema.
 
+Supported types:
+- `bale`
+- `bale_enterprise`
+- `telegram`
+
 ### `GET /features`
 
 Returns feature definitions used for per-instance overrides.
+
+Built-in features:
+- `reply_sync` — default `true`
+- `media_sync` — default `true`
+- `payload_debug_store` — default `false` (gated by `STORE_MESSAGE_PAYLOADS=true`)
 
 ## Instance Management
 
@@ -48,8 +58,7 @@ Minimal body example:
 }
 ```
 
-When `chatwoot.auto_create` is `true`, the backend will make a best-effort attempt to create or discover the inbox
-immediately after saving the instance. The response may include:
+When `chatwoot.auto_create` is `true`, the backend will make a best-effort attempt to create or discover the inbox immediately after saving the instance. The response may include:
 
 ```json
 {
@@ -62,8 +71,13 @@ immediately after saving the instance. The response may include:
 }
 ```
 
-When `chatwoot.reopen_conversation` is `true`, inbound platform messages will reopen the mapped Chatwoot
-conversation if Chatwoot currently reports it as `resolved`.
+For `bale_enterprise` instances, `platform_metadata` may also include:
+- `enterprise_customer_service_auto_create`
+- `enterprise_sales_auto_create`
+
+Which trigger route inbox creation and return `enterprise_auto_create_inboxes`.
+
+When `chatwoot.reopen_conversation` is `true`, inbound platform messages will reopen the mapped Chatwoot conversation if Chatwoot currently reports it as `resolved`.
 
 ### `GET /instances/{instance_key}`
 
@@ -83,7 +97,7 @@ Instance responses include a derived Chatwoot webhook URL in `chatwoot.webhook_u
 
 ### `PATCH /instances/{instance_key}`
 
-Partially update an instance.
+Partially update an instance. Supports the same auto-create behaviors as `POST /instances`.
 
 ### `DELETE /instances/{instance_key}`
 
@@ -91,13 +105,22 @@ Delete an instance and related mappings/runtime state.
 
 ### `POST /instances/{instance_key}/chatwoot/inbox`
 
-Create or discover Chatwoot inbox for that instance, then persist `inbox_id`.
+Create or discover Chatwoot inbox for that instance, then persist `inbox_id`. Not available for `bale_enterprise` instances (use the enterprise route inbox endpoint instead).
 
 ## Sync Endpoints
 
 ### `POST /webhooks/chatwoot/{instance_key}`
 
 Chatwoot outbound webhook ingestion endpoint.
+
+### `POST /webhooks/chatwoot/{instance_key}/enterprise/{route_key}`
+
+Route-specific Chatwoot webhook endpoint for Bale Enterprise route inboxes.
+
+Supported `route_key` values:
+
+- `customer_service`
+- `sales`
 
 ### `POST /simulate/platform/{instance_key}`
 
@@ -134,8 +157,19 @@ Upload a manual PDF.
 Required multipart form fields:
 
 - `display_name`
-- `link_url` (absolute `http(s)` URL)
 - `file` (PDF)
+
+Optional multipart form field:
+
+- `link_url` (absolute `http(s)` URL)
+
+### `PATCH /instances/{instance_key}/enterprise/manuals/{asset_id}`
+
+Patch manual metadata (`display_name` and/or `link_url`).
+
+### `DELETE /instances/{instance_key}/enterprise/manuals/{asset_id}`
+
+Delete a manual asset.
 
 ### `GET /instances/{instance_key}/enterprise/catalog`
 
@@ -154,6 +188,96 @@ Optional multipart form field:
 
 - `display_name`
 
+### `DELETE /instances/{instance_key}/enterprise/catalog`
+
+Delete the active catalog asset.
+
+## Enterprise Manual Groups
+
+### `GET /instances/{instance_key}/enterprise/manual-groups`
+
+List enterprise manual groups.
+
+### `POST /instances/{instance_key}/enterprise/manual-groups`
+
+Create an enterprise manual group.
+
+Body:
+
+```json
+{
+  "name": "Group Name"
+}
+```
+
+### `PUT /instances/{instance_key}/enterprise/manual-groups/{group_id}`
+
+Rename an enterprise manual group.
+
+Body:
+
+```json
+{
+  "name": "New Group Name"
+}
+```
+
+### `DELETE /instances/{instance_key}/enterprise/manual-groups/{group_id}`
+
+Delete an enterprise manual group.
+
+### `GET /instances/{instance_key}/enterprise/manual-groups/{group_id}/manuals`
+
+List manuals assigned to a group.
+
+### `POST /instances/{instance_key}/enterprise/manual-groups/{group_id}/manuals/{asset_id}`
+
+Assign a manual to a group.
+
+### `DELETE /instances/{instance_key}/enterprise/manual-groups/{group_id}/manuals/{asset_id}`
+
+Remove a manual from a group.
+
+## Enterprise Live Routing
+
+### `POST /instances/{instance_key}/enterprise/chatwoot/inboxes/{route_key}`
+
+Create or discover a route-specific Chatwoot API inbox for a Bale Enterprise instance.
+
+Supported `route_key` values:
+
+- `customer_service`
+- `sales`
+
+### `GET /instances/{instance_key}/enterprise/sessions`
+
+List enterprise live-chat sessions and their current route/contact/conversation state.
+
+## Enterprise SMS Sync
+
+### `GET /instances/{instance_key}/enterprise/sms-sync`
+
+Get the instance-level SMS sync configuration used by the Bale Enterprise flow.
+
+### `PATCH /instances/{instance_key}/enterprise/sms-sync`
+
+Patch instance-level SMS sync configuration.
+
+Patch fields:
+
+- `enabled`
+- `api_url`
+- `api_token`
+- `token_header`
+- `token_prefix`
+- `poll_interval_minutes`
+- `last_id`
+- `http_timeout_seconds`
+
+### `POST /instances/{instance_key}/enterprise/sms-sync/run`
+
+Run an immediate SMS synchronization cycle and return counters for fetched, delivered, dropped, and failed records.
+
 ## Health
 
 ### `GET /health`
@@ -167,3 +291,4 @@ Service health endpoint.
 - Payload snapshots are persisted only when both:
   - feature `payload_debug_store` is enabled for the instance, and
   - env `STORE_MESSAGE_PAYLOADS=true`
+- Chatwoot webhooks include a fallback resolver that matches by `inbox_id` or `inbox_name` when the requested `instance_key` does not resolve directly.

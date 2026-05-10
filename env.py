@@ -5,7 +5,7 @@ from app.services.enterprise_gre_service import (
 
 validator = EnterpriseGreValidator()
 
-res: EnterpriseGreValidationResult = validator.validate_phone("09122524611")
+res: EnterpriseGreValidationResult = validator.validate_phone("09130786713")
 
 print(res.gre_status)
 print(res.message)

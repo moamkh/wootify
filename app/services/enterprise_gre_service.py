@@ -20,10 +20,8 @@ class EnterpriseGreValidator:
     """Validates whether a phone number is GRE-eligible."""
 
     def validate_phone(self, phone_number: str) -> EnterpriseGreValidationResult:
+        """Normalize the submitted phone and classify the GRE lookup result."""
         normalized_phone = self._normalize_phone_number(phone_number)
-        print(normalized_phone)
-        print(phone_number)
-        print(self._normalize_phone_for_apiserver(normalized_phone))
         if not normalized_phone:
             return EnterpriseGreValidationResult(
                 normalized_phone=None,
@@ -50,7 +48,13 @@ class EnterpriseGreValidator:
             status_code = response_data.get("statusCode", 0)
             message = response_data.get("message", "")
 
-            if self._normalize_phone_for_apiserver(normalized_phone) in ["09136421196","09137307820"]:
+            print(status_code)
+            print(response_data)
+
+            if self._normalize_phone_for_apiserver(normalized_phone) in [
+                "09136421196",
+                "09137307820",
+            ]:
                 return EnterpriseGreValidationResult(
                     normalized_phone=normalized_phone,
                     gre_status=EnterpriseGreStatus.eligible,

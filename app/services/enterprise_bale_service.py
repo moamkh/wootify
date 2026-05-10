@@ -606,9 +606,6 @@ class EnterpriseBaleService:
         user = self._get_or_create_user(
             db, runtime.instance.id, str(chat_id), display_name=from_name
         )
-        print("*****************")
-        print(user.current_state)
-        print("*****************")
         text = str(message.get("text") or message.get("caption") or "").strip()
         contact_payload = self._extract_contact_payload(message)
 
@@ -655,12 +652,8 @@ class EnterpriseBaleService:
 
             db.commit()
             return {"message": "start_handled", "status": "ok"}
-
-
-
         if user.current_state == EnterpriseUserState.awaiting_phone_input:
             if self._is_back_to_menu(text):
-                print("phone is back to menu true")
                 await self._show_root_menu(
                     runtime.instance.instance_key,
                     user,
@@ -1865,6 +1858,9 @@ class EnterpriseBaleService:
                 int(account_id), int(contact_id)
             )
         except httpx.HTTPStatusError as exc:
+            # A missing contact means Chatwoot no longer recognizes the stored
+            # route session. Returning "resolved" lets the existing recreation
+            # path build a fresh contact/conversation pair on the next send.
             if self._is_missing_chatwoot_contact(exc.response):
                 logger.info(
                     "enterprise contact missing remotely; route session will be recreated instance=%s account_id=%s contact_id=%s session_id=%s conversation_id=%s route=%s",

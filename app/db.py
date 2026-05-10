@@ -58,6 +58,8 @@ def ensure_database_exists() -> None:
     if not db_name:
         raise ValueError('database name could not be resolved from DATABASE_URL')
 
+    # Connect to an existing admin database first; the target database may not
+    # exist yet, so the main engine cannot be created safely at this point.
     admin_engine = create_engine(
         admin_url,
         isolation_level='AUTOCOMMIT',
