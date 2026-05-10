@@ -9,7 +9,8 @@ It provides multi-instance routing, inbound polling, outbound webhook handling, 
 - Polls Bale/Telegram for inbound updates and creates/updates Chatwoot conversations.
 - Stores conversation and message mappings for reply threading and observability.
 - Supports per-instance platform metadata, Chatwoot config, feature flags, and proxy config.
-- Includes a dedicated Bale Enterprise flow with route-specific Chatwoot inboxes, live-session handling, enterprise manuals/catalogs, manual groups, GRE validation, and optional SMS sync.
+- Includes dedicated Enterprise flows for Bale and Telegram with route-specific Chatwoot inboxes, live-session handling, enterprise manuals/catalogs, and manual groups.
+- Bale Enterprise adds GRE validation and optional external SMS sync; Telegram Enterprise uses dynamic routes and customizable menu labels with no GRE/SMS.
 - Exposes an API to manage connector instances and inspect mappings.
 
 ## Tech Stack
@@ -17,7 +18,7 @@ It provides multi-instance routing, inbound polling, outbound webhook handling, 
 - Backend: Python 3.11+, FastAPI, SQLAlchemy, Alembic, HTTPX
 - Database: SQLite or PostgreSQL
 - Frontend: React + Vite (`wootify-instance-manager/`)
-- Integrations: Chatwoot API, Bale Bot API, Telegram Bot API, Novin SMS API
+- Integrations: Chatwoot API, Bale Bot API, Telegram Bot API, Novin SMS API (Bale Enterprise only)
 
 ## Repository Structure
 

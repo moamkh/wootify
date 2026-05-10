@@ -9,10 +9,11 @@ Main direction flows:
 1. Chatwoot -> Connector -> Bale/Telegram
 2. Bale/Telegram -> Connector -> Chatwoot
 
-There are two major runtime modes:
+There are three major runtime modes:
 
 - Generic bridge mode for standard Bale/Telegram instances
 - Enterprise Bale mode for route-specific live support/sales sessions, enterprise document delivery, manual groups, GRE validation, and optional external SMS sync
+- Enterprise Telegram mode for dynamic route-based live sessions, enterprise document delivery, manual groups, and customizable menu labels (no GRE validation, no SMS sync)
 
 It keeps persistent mappings for:
 
@@ -38,6 +39,9 @@ It keeps persistent mappings for:
 - `app/services/enterprise_bale_service.py`
   - enterprise Bale runtime orchestration
   - handles live-route session state, Chatwoot route inboxes, enterprise assets, manual groups, GRE validation, and SMS sync
+- `app/services/enterprise_telegram_service.py`
+  - enterprise Telegram runtime orchestration
+  - handles dynamic routes, live-session state, Chatwoot route inboxes, enterprise assets, manual groups, and customizable labels
 - `app/services/instance_service.py`
   - instance lifecycle and normalized decrypted runtime configuration
   - feature override computation and webhook URL building
@@ -85,6 +89,9 @@ Defined in `app/models.py`:
 - `EnterpriseBaleUser`: per-user enterprise state, phone number, and GRE status
 - `EnterpriseBaleSession`: enterprise live route sessions tied to Chatwoot contacts/conversations
 - `EnterprisePendingMessage`: operator messages queued while the enterprise user is away from the live session
+- `EnterpriseTelegramUser`: per-user Telegram enterprise state with dynamic string-based state (no GRE, no phone required)
+- `EnterpriseTelegramSession`: Telegram enterprise live route sessions
+- `EnterpriseTelegramPendingMessage`: operator messages queued for Telegram enterprise users
 - `EnterpriseDocumentAsset`: stored manuals / catalog PDFs
 - `EnterpriseManualGroup`: grouping/category for manuals
 - `EnterpriseManualGroupAssignment`: many-to-many link between groups and assets
@@ -122,6 +129,16 @@ Defined in `app/models.py`:
 6. If Chatwoot contact/conversation IDs are stale, the service recreates the route session before retrying the forward path.
 7. Pending messages are flushed when the user returns to a live session.
 8. Optional SMS sync polls an external provider and forwards matching SMS to enterprise users.
+
+## Enterprise Telegram Flow
+
+1. Telegram Enterprise polling sends updates to `EnterpriseTelegramService.handle_platform_update()`.
+2. The service resolves the enterprise user (no GRE validation needed) and current dynamic state.
+3. Root menu buttons are built dynamically from `enterprise_routes`, plus catalog/manuals/address buttons with customizable labels.
+4. For live routes, the service forwards customer messages into the route's Chatwoot conversation.
+5. For operator replies, Chatwoot hits the route-specific webhook URL.
+6. The enterprise service delivers the accepted notice and operator payload back to Telegram, or queues it if the user left the live session.
+7. Dynamic routes are fully configurable per instance via `enterprise_routes` metadata.
 
 ## Feature Flags and Safety Gates
 

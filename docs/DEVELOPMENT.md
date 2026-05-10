@@ -96,7 +96,8 @@ alembic revision --autogenerate -m "describe change"
 3. Send outbound message from Chatwoot to platform.
 4. Send inbound platform message and verify Chatwoot conversation mapping.
 5. Test media sync, reply sync, and status notifications.
-6. For enterprise instances: test GRE flow, manual/catalog menus, live session routing, and SMS sync.
+6. For `bale_enterprise` instances: test GRE flow, manual/catalog menus, live session routing, and SMS sync.
+7. For `telegram_enterprise` instances: test dynamic route menus, manual/catalog menus, live session routing, and customizable button labels.
 7. Review logs for errors/redaction correctness.
 
 ## Troubleshooting
@@ -112,11 +113,15 @@ alembic revision --autogenerate -m "describe change"
   - the stored remote Chatwoot IDs are stale or deleted; the enterprise service will recreate the route session on the next forwardable customer message.
 - Missing platform token errors:
   - ensure correct token key inside `platform_metadata`:
-    - Bale: `bale_token`
-    - Telegram: `telegram_token`
+    - Bale / Bale Enterprise: `bale_token`
+    - Telegram / Telegram Enterprise: `telegram_token`
 - Webhooks not reaching the connector:
   - verify `SERVER_BASE_URL` is publicly reachable from Chatwoot.
   - check that the instance `webhook_url` is configured in the Chatwoot inbox settings.
 - Enterprise SMS sync not fetching messages:
+  - only applicable to `bale_enterprise`.
   - verify `ENTERPRISE_SMS_API_URL`, `ENTERPRISE_SMS_API_TOKEN`, and `ENTERPRISE_SMS_TOKEN_HEADER`.
   - check logs for HTTP timeouts or authentication errors.
+- Telegram Enterprise dynamic routes not appearing:
+  - verify `platform_metadata.enterprise_routes` is a non-empty array with valid `route_key` values.
+  - check that `telegram_token` is set and the bot is reachable.

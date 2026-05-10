@@ -13,6 +13,7 @@ Supported types:
 - `bale`
 - `bale_enterprise`
 - `telegram`
+- `telegram_enterprise`
 
 ### `GET /features`
 
@@ -77,6 +78,20 @@ For `bale_enterprise` instances, `platform_metadata` may also include:
 
 Which trigger route inbox creation and return `enterprise_auto_create_inboxes`.
 
+For `telegram_enterprise` instances, `platform_metadata` includes:
+- `telegram_token` (required)
+- `enterprise_routes` — array of route objects with:
+  - `route_key` (string, required)
+  - `display_name` (string)
+  - `inbox_id` (integer)
+  - `inbox_name` (string)
+  - `auto_create` (boolean)
+  - `waiting_text` (string)
+  - `accepted_text` (string)
+  - `unread_text` (string)
+- `enterprise_welcome_text`, `enterprise_menu_prompt_text`, `enterprise_address_prompt_text`, etc.
+- `enterprise_catalog_button_label`, `enterprise_manuals_button_label`, `enterprise_address_button_label`, `enterprise_back_button_label`
+
 When `chatwoot.reopen_conversation` is `true`, inbound platform messages will reopen the mapped Chatwoot conversation if Chatwoot currently reports it as `resolved`.
 
 ### `GET /instances/{instance_key}`
@@ -105,7 +120,7 @@ Delete an instance and related mappings/runtime state.
 
 ### `POST /instances/{instance_key}/chatwoot/inbox`
 
-Create or discover Chatwoot inbox for that instance, then persist `inbox_id`. Not available for `bale_enterprise` instances (use the enterprise route inbox endpoint instead).
+Create or discover Chatwoot inbox for that instance, then persist `inbox_id`. Not available for enterprise instances (`bale_enterprise`, `telegram_enterprise`); use the enterprise route inbox endpoint instead.
 
 ## Sync Endpoints
 
@@ -115,12 +130,14 @@ Chatwoot outbound webhook ingestion endpoint.
 
 ### `POST /webhooks/chatwoot/{instance_key}/enterprise/{route_key}`
 
-Route-specific Chatwoot webhook endpoint for Bale Enterprise route inboxes.
+Route-specific Chatwoot webhook endpoint for enterprise route inboxes.
 
-Supported `route_key` values:
+For `bale_enterprise`, supported `route_key` values are:
 
 - `customer_service`
 - `sales`
+
+For `telegram_enterprise`, `route_key` values are defined dynamically in `platform_metadata.enterprise_routes`.
 
 ### `POST /simulate/platform/{instance_key}`
 
@@ -242,12 +259,14 @@ Remove a manual from a group.
 
 ### `POST /instances/{instance_key}/enterprise/chatwoot/inboxes/{route_key}`
 
-Create or discover a route-specific Chatwoot API inbox for a Bale Enterprise instance.
+Create or discover a route-specific Chatwoot API inbox for an enterprise instance.
 
-Supported `route_key` values:
+For `bale_enterprise`, supported `route_key` values are:
 
 - `customer_service`
 - `sales`
+
+For `telegram_enterprise`, any `route_key` defined in `platform_metadata.enterprise_routes` is valid.
 
 ### `GET /instances/{instance_key}/enterprise/sessions`
 
@@ -257,7 +276,7 @@ List enterprise live-chat sessions and their current route/contact/conversation 
 
 ### `GET /instances/{instance_key}/enterprise/sms-sync`
 
-Get the instance-level SMS sync configuration used by the Bale Enterprise flow.
+Get the instance-level SMS sync configuration used by the Bale Enterprise flow. Not applicable for `telegram_enterprise`.
 
 ### `PATCH /instances/{instance_key}/enterprise/sms-sync`
 
