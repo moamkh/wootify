@@ -189,13 +189,15 @@ class EnterpriseDocumentService:
             raise FileNotFoundError(f'enterprise asset file missing: {file_path}')
         return row, file_path.read_bytes()
 
+    ENTERPRISE_PLATFORM_KEYS = {'bale_enterprise', 'telegram_enterprise'}
+
     def _require_enterprise_runtime(self, db: Session, instance_key: str):
-        """Require an enterprise Bale runtime."""
+        """Require an enterprise runtime (Bale or Telegram)."""
         runtime = self._instances.get_runtime_instance(db, instance_key)
         if not runtime:
             raise ValueError('instance not found')
-        if str(runtime.platform_type.key or '').strip().lower() != 'bale_enterprise':
-            raise ValueError('instance is not a bale_enterprise instance')
+        if str(runtime.platform_type.key or '').strip().lower() not in self.ENTERPRISE_PLATFORM_KEYS:
+            raise ValueError('instance is not an enterprise instance')
         return runtime
 
     def _write_file(self, instance_key: str, *, folder: str, filename: str, content: bytes) -> Path:

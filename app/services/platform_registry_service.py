@@ -42,6 +42,14 @@ TELEGRAM_CAPABILITIES = {
     'mark_as_read': False,
 }
 
+TELEGRAM_ENTERPRISE_CAPABILITIES = {
+    'send_text': True,
+    'send_media': True,
+    'reply_sync': False,
+    'inbound_polling': True,
+    'mark_as_read': False,
+}
+
 BALE_METADATA_SCHEMA: dict[str, Any] = {
     'type': 'object',
     'required': ['bale_token'],
@@ -122,6 +130,36 @@ TELEGRAM_METADATA_SCHEMA: dict[str, Any] = {
     },
 }
 
+TELEGRAM_ENTERPRISE_METADATA_SCHEMA: dict[str, Any] = {
+    'type': 'object',
+    'required': ['telegram_token'],
+    'properties': {
+        'telegram_token': {'type': 'string'},
+        'telegram_api_base_url': {'type': 'string'},
+        'telegram_file_base_url': {'type': 'string'},
+        'telegram_poll_interval': {'type': 'integer'},
+        'telegram_bot_name': {'type': 'string'},
+        'telegram_bot_id': {'type': 'string'},
+        'telegram_department': {'type': 'string'},
+        'enterprise_welcome_text': {'type': 'string'},
+        'enterprise_menu_prompt_text': {'type': 'string'},
+        'enterprise_address_prompt_text': {'type': 'string'},
+        'enterprise_not_configured_text': {'type': 'string'},
+        'enterprise_live_mode_resume_text': {'type': 'string'},
+        'enterprise_live_session_locked_text': {'type': 'string'},
+        'enterprise_no_manuals_text': {'type': 'string'},
+        'enterprise_no_catalog_text': {'type': 'string'},
+        'enterprise_address_tehran_alborz_text': {'type': 'string'},
+        'enterprise_address_other_provinces_text': {'type': 'string'},
+        'enterprise_user_manual_link_template': {'type': 'string'},
+        'enterprise_catalog_button_label': {'type': 'string'},
+        'enterprise_manuals_button_label': {'type': 'string'},
+        'enterprise_address_button_label': {'type': 'string'},
+        'enterprise_back_button_label': {'type': 'string'},
+        'enterprise_routes': {'type': 'array'},
+    },
+}
+
 DEFAULT_FEATURES = [
     {
         'key': 'reply_sync',
@@ -177,6 +215,13 @@ class PlatformRegistryService:
                 display_name='Telegram',
                 capabilities_json=TELEGRAM_CAPABILITIES,
                 metadata_schema_json=TELEGRAM_METADATA_SCHEMA,
+                is_active=True,
+            )
+            platform_repo.upsert(
+                key='telegram_enterprise',
+                display_name='Telegram Enterprise',
+                capabilities_json=TELEGRAM_ENTERPRISE_CAPABILITIES,
+                metadata_schema_json=TELEGRAM_ENTERPRISE_METADATA_SCHEMA,
                 is_active=True,
             )
 

@@ -46,6 +46,7 @@ const InstanceWorkspacePage = lazy(() => import('./pages/InstanceWorkspacePage.j
 const PLATFORM_BALE = 'bale';
 const PLATFORM_BALE_ENTERPRISE = 'bale_enterprise';
 const PLATFORM_TELEGRAM = 'telegram';
+const PLATFORM_TELEGRAM_ENTERPRISE = 'telegram_enterprise';
 const DEFAULT_PLATFORM = PLATFORM_BALE;
 const ENTERPRISE_DEFAULTS = {
   welcome_text: 'به بازوي دستيار شركت مهندسي پزشكي نوين خوش آمديد.',
@@ -71,6 +72,10 @@ const ENTERPRISE_DEFAULTS = {
     'شما در بخش ارتباط با کارشناسان فروش پیام های خوانده نشده دارید. برای ادامه گفتگو وارد همین بخش شوید.',
   user_manual_link_template:
     'برای دریافت راهنمای کاربری مورد نظر بر روی متن زیر ضربه بزنید:\n[{{user_manual_name}}]({{user_manual_url}})',
+  enterprise_catalog_button_label: 'کاتالوگ محصولات',
+  enterprise_manuals_button_label: 'راهنمای کاربری محصولات',
+  enterprise_address_button_label: 'آدرس مراکز خدمات پس از فروش',
+  enterprise_back_button_label: 'بازگشت به منو',
 };
 
 function toFeatureMap(overrides = []) {
@@ -147,6 +152,11 @@ function defaultForm(features) {
     telegram_share_phone_prompt_enabled: true,
     telegram_share_phone_prompt_only_if_missing_phone: true,
     telegram_share_phone_prompt_text: 'Use the button below to share your phone number.\nCommands: /share_phone, /help',
+    enterprise_routes: [],
+    enterprise_catalog_button_label: ENTERPRISE_DEFAULTS.enterprise_catalog_button_label,
+    enterprise_manuals_button_label: ENTERPRISE_DEFAULTS.enterprise_manuals_button_label,
+    enterprise_address_button_label: ENTERPRISE_DEFAULTS.enterprise_address_button_label,
+    enterprise_back_button_label: ENTERPRISE_DEFAULTS.enterprise_back_button_label,
     proxy_enabled: false,
     proxy_protocol: 'http',
     proxy_host: '',
@@ -174,6 +184,14 @@ function createPayload(form, { patch = false } = {}) {
     platformMetadata.bale_bot_name = form.bale_bot_name?.trim() || undefined;
     platformMetadata.bale_bot_id = form.bale_bot_id?.trim() || undefined;
     platformMetadata.bale_department = form.bale_department?.trim() || undefined;
+  }
+  if (form.platform_type_key === PLATFORM_TELEGRAM || form.platform_type_key === PLATFORM_TELEGRAM_ENTERPRISE) {
+    platformMetadata.telegram_api_base_url = form.telegram_api_base_url?.trim() || undefined;
+    platformMetadata.telegram_file_base_url = form.telegram_file_base_url?.trim() || undefined;
+    platformMetadata.telegram_poll_interval = Number(form.telegram_poll_interval) > 0 ? Number(form.telegram_poll_interval) : undefined;
+    platformMetadata.telegram_bot_name = form.telegram_bot_name?.trim() || undefined;
+    platformMetadata.telegram_bot_id = form.telegram_bot_id?.trim() || undefined;
+    platformMetadata.telegram_department = form.telegram_department?.trim() || undefined;
   }
   if (form.platform_type_key === PLATFORM_BALE) {
     platformMetadata.bale_share_phone_prompt_enabled = Boolean(form.bale_share_phone_prompt_enabled);
@@ -232,18 +250,30 @@ function createPayload(form, { patch = false } = {}) {
         : undefined;
   }
   if (form.platform_type_key === PLATFORM_TELEGRAM) {
-    platformMetadata.telegram_api_base_url = form.telegram_api_base_url?.trim() || undefined;
-    platformMetadata.telegram_file_base_url = form.telegram_file_base_url?.trim() || undefined;
-    platformMetadata.telegram_poll_interval =
-      Number(form.telegram_poll_interval) > 0 ? Number(form.telegram_poll_interval) : undefined;
-    platformMetadata.telegram_bot_name = form.telegram_bot_name?.trim() || undefined;
-    platformMetadata.telegram_bot_id = form.telegram_bot_id?.trim() || undefined;
-    platformMetadata.telegram_department = form.telegram_department?.trim() || undefined;
     platformMetadata.telegram_share_phone_prompt_enabled = Boolean(form.telegram_share_phone_prompt_enabled);
     platformMetadata.telegram_share_phone_prompt_only_if_missing_phone = Boolean(
       form.telegram_share_phone_prompt_only_if_missing_phone,
     );
     platformMetadata.telegram_share_phone_prompt_text = form.telegram_share_phone_prompt_text?.trim() || undefined;
+  }
+  if (form.platform_type_key === PLATFORM_TELEGRAM_ENTERPRISE) {
+    platformMetadata.enterprise_welcome_text = form.enterprise_welcome_text?.trim() || undefined;
+    platformMetadata.enterprise_menu_prompt_text = form.enterprise_menu_prompt_text?.trim() || undefined;
+    platformMetadata.enterprise_address_prompt_text = form.enterprise_address_prompt_text?.trim() || undefined;
+    platformMetadata.enterprise_no_manuals_text = form.enterprise_no_manuals_text?.trim() || undefined;
+    platformMetadata.enterprise_no_catalog_text = form.enterprise_no_catalog_text?.trim() || undefined;
+    platformMetadata.enterprise_not_configured_text = form.enterprise_not_configured_text?.trim() || undefined;
+    platformMetadata.enterprise_live_mode_resume_text = form.enterprise_live_mode_resume_text?.trim() || undefined;
+    platformMetadata.enterprise_address_tehran_alborz_text = form.enterprise_address_tehran_alborz_text?.trim() || undefined;
+    platformMetadata.enterprise_address_other_provinces_text =
+      form.enterprise_address_other_provinces_text?.trim() || undefined;
+    platformMetadata.enterprise_user_manual_link_template =
+      form.enterprise_user_manual_link_template?.trim() || undefined;
+    platformMetadata.enterprise_catalog_button_label = form.enterprise_catalog_button_label?.trim() || undefined;
+    platformMetadata.enterprise_manuals_button_label = form.enterprise_manuals_button_label?.trim() || undefined;
+    platformMetadata.enterprise_address_button_label = form.enterprise_address_button_label?.trim() || undefined;
+    platformMetadata.enterprise_back_button_label = form.enterprise_back_button_label?.trim() || undefined;
+    platformMetadata.enterprise_routes = Array.isArray(form.enterprise_routes) ? form.enterprise_routes : [];
   }
 
   const payload = {
@@ -285,7 +315,11 @@ function createPayload(form, { patch = false } = {}) {
     payload.platform_metadata.enterprise_sms_api_token = enterpriseSmsToken;
   }
   const telegramToken = form.telegram_token?.trim();
-  if (form.platform_type_key === PLATFORM_TELEGRAM && telegramToken && !telegramToken.includes('***')) {
+  if (
+    (form.platform_type_key === PLATFORM_TELEGRAM || form.platform_type_key === PLATFORM_TELEGRAM_ENTERPRISE) &&
+    telegramToken &&
+    !telegramToken.includes('***')
+  ) {
     payload.platform_metadata.telegram_token = telegramToken;
   }
 
@@ -458,7 +492,9 @@ export default function App() {
   const isBalePlatform = form.platform_type_key === PLATFORM_BALE || form.platform_type_key === PLATFORM_BALE_ENTERPRISE;
   const isStandardBalePlatform = form.platform_type_key === PLATFORM_BALE;
   const isEnterpriseBalePlatform = form.platform_type_key === PLATFORM_BALE_ENTERPRISE;
-  const isTelegramPlatform = form.platform_type_key === PLATFORM_TELEGRAM;
+  const isTelegramPlatform = form.platform_type_key === PLATFORM_TELEGRAM || form.platform_type_key === PLATFORM_TELEGRAM_ENTERPRISE;
+  const isEnterpriseTelegramPlatform = form.platform_type_key === PLATFORM_TELEGRAM_ENTERPRISE;
+  const isEnterprisePlatform = isEnterpriseBalePlatform || isEnterpriseTelegramPlatform;
   const enabledFeatureCount = useMemo(
     () => Object.values(form.feature_overrides || {}).filter(Boolean).length,
     [form.feature_overrides],
@@ -504,7 +540,8 @@ export default function App() {
     }
 
     const row = instanceMap[instanceKey];
-    if (row?.platform_type_key !== PLATFORM_BALE_ENTERPRISE) {
+    const isEnterprise = row?.platform_type_key === PLATFORM_BALE_ENTERPRISE || row?.platform_type_key === PLATFORM_TELEGRAM_ENTERPRISE;
+    if (!isEnterprise) {
       setEnterpriseManuals([]);
       setEnterpriseManualGroups([]);
       setManualGroupByAssetId({});
@@ -674,6 +711,11 @@ export default function App() {
       telegram_share_phone_prompt_text:
         row.platform_metadata?.telegram_share_phone_prompt_text ||
         'Use the button below to share your phone number.\nCommands: /share_phone, /help',
+      enterprise_routes: row.platform_metadata?.enterprise_routes || [],
+      enterprise_catalog_button_label: row.platform_metadata?.enterprise_catalog_button_label || ENTERPRISE_DEFAULTS.enterprise_catalog_button_label,
+      enterprise_manuals_button_label: row.platform_metadata?.enterprise_manuals_button_label || ENTERPRISE_DEFAULTS.enterprise_manuals_button_label,
+      enterprise_address_button_label: row.platform_metadata?.enterprise_address_button_label || ENTERPRISE_DEFAULTS.enterprise_address_button_label,
+      enterprise_back_button_label: row.platform_metadata?.enterprise_back_button_label || ENTERPRISE_DEFAULTS.enterprise_back_button_label,
       proxy_enabled: row.proxy?.enabled ?? false,
       proxy_protocol: row.proxy?.protocol || 'http',
       proxy_host: row.proxy?.host || '',
@@ -690,6 +732,16 @@ export default function App() {
       chatwoot_webhook_url: row.chatwoot?.webhook_url || '',
       feature_overrides: featureMap,
     });
+
+    // Map dynamic route webhook URLs for telegram_enterprise
+    const routes = row.platform_metadata?.enterprise_routes || [];
+    for (const route of routes) {
+      const key = route.route_key;
+      if (key) {
+        const webhookUrl = row.chatwoot?.[`enterprise_${key}_webhook_url`] || '';
+        setForm((prev) => ({ ...prev, [`enterprise_${key}_webhook_url`]: webhookUrl }));
+      }
+    }
 
     setSimEvent((prev) => ({ ...prev, instance_key: instanceKey }));
     setManualDisplayName('');
@@ -767,23 +819,33 @@ export default function App() {
         saved = await createInstance(createPayload(form, { patch: false }));
       }
       await refreshInstances();
-      setForm((prev) => ({
-        ...prev,
-        chatwoot_inbox_id: saved?.chatwoot?.inbox_id != null ? String(saved.chatwoot.inbox_id) : prev.chatwoot_inbox_id,
-        chatwoot_webhook_url: saved?.chatwoot?.webhook_url || prev.chatwoot_webhook_url,
-        enterprise_customer_service_webhook_url:
-          saved?.chatwoot?.enterprise_customer_service_webhook_url || prev.enterprise_customer_service_webhook_url,
-        enterprise_sales_webhook_url:
-          saved?.chatwoot?.enterprise_sales_webhook_url || prev.enterprise_sales_webhook_url,
-        enterprise_customer_service_inbox_id:
-          saved?.platform_metadata?.enterprise_customer_service_inbox_id != null
-            ? String(saved.platform_metadata.enterprise_customer_service_inbox_id)
-            : prev.enterprise_customer_service_inbox_id,
-        enterprise_sales_inbox_id:
-          saved?.platform_metadata?.enterprise_sales_inbox_id != null
-            ? String(saved.platform_metadata.enterprise_sales_inbox_id)
-            : prev.enterprise_sales_inbox_id,
-      }));
+      setForm((prev) => {
+        const next = {
+          ...prev,
+          chatwoot_inbox_id: saved?.chatwoot?.inbox_id != null ? String(saved.chatwoot.inbox_id) : prev.chatwoot_inbox_id,
+          chatwoot_webhook_url: saved?.chatwoot?.webhook_url || prev.chatwoot_webhook_url,
+          enterprise_customer_service_webhook_url:
+            saved?.chatwoot?.enterprise_customer_service_webhook_url || prev.enterprise_customer_service_webhook_url,
+          enterprise_sales_webhook_url:
+            saved?.chatwoot?.enterprise_sales_webhook_url || prev.enterprise_sales_webhook_url,
+          enterprise_customer_service_inbox_id:
+            saved?.platform_metadata?.enterprise_customer_service_inbox_id != null
+              ? String(saved.platform_metadata.enterprise_customer_service_inbox_id)
+              : prev.enterprise_customer_service_inbox_id,
+          enterprise_sales_inbox_id:
+            saved?.platform_metadata?.enterprise_sales_inbox_id != null
+              ? String(saved.platform_metadata.enterprise_sales_inbox_id)
+              : prev.enterprise_sales_inbox_id,
+        };
+        const routes = saved?.platform_metadata?.enterprise_routes || [];
+        for (const route of routes) {
+          const key = route.route_key;
+          if (key) {
+            next[`enterprise_${key}_webhook_url`] = saved?.chatwoot?.[`enterprise_${key}_webhook_url`] || prev[`enterprise_${key}_webhook_url`] || '';
+          }
+        }
+        return next;
+      });
       setSelectedKey(key);
       await loadEnterpriseResources(key);
       alert(buildSaveSuccessMessage(saved));
@@ -849,21 +911,33 @@ export default function App() {
       await refreshInstances();
       if (selectedKey === instanceKey) {
         await loadEnterpriseResources(instanceKey);
-        setForm((prev) => ({
-          ...prev,
-          enterprise_customer_service_inbox_id:
-            routeKey === 'customer_service' && response?.inbox_id != null
-              ? String(response.inbox_id)
-              : prev.enterprise_customer_service_inbox_id,
-          enterprise_customer_service_webhook_url:
-            routeKey === 'customer_service' && response?.webhook_url
-              ? response.webhook_url
-              : prev.enterprise_customer_service_webhook_url,
-          enterprise_sales_inbox_id:
-            routeKey === 'sales' && response?.inbox_id != null ? String(response.inbox_id) : prev.enterprise_sales_inbox_id,
-          enterprise_sales_webhook_url:
-            routeKey === 'sales' && response?.webhook_url ? response.webhook_url : prev.enterprise_sales_webhook_url,
-        }));
+        setForm((prev) => {
+          const next = {
+            ...prev,
+            enterprise_customer_service_inbox_id:
+              routeKey === 'customer_service' && response?.inbox_id != null
+                ? String(response.inbox_id)
+                : prev.enterprise_customer_service_inbox_id,
+            enterprise_customer_service_webhook_url:
+              routeKey === 'customer_service' && response?.webhook_url
+                ? response.webhook_url
+                : prev.enterprise_customer_service_webhook_url,
+            enterprise_sales_inbox_id:
+              routeKey === 'sales' && response?.inbox_id != null ? String(response.inbox_id) : prev.enterprise_sales_inbox_id,
+            enterprise_sales_webhook_url:
+              routeKey === 'sales' && response?.webhook_url ? response.webhook_url : prev.enterprise_sales_webhook_url,
+          };
+          // Dynamic route update for telegram_enterprise
+          const routes = prev.enterprise_routes || [];
+          const matched = routes.find((r) => r.route_key === routeKey);
+          if (matched && response?.inbox_id != null) {
+            matched.inbox_id = String(response.inbox_id);
+          }
+          if (matched && response?.webhook_url) {
+            next[`enterprise_${routeKey}_webhook_url`] = response.webhook_url;
+          }
+          return next;
+        });
       }
     } catch (e) {
       alert(e?.message || String(e));
@@ -1188,6 +1262,9 @@ export default function App() {
     isBalePlatform,
     isTelegramPlatform,
     isEnterpriseBalePlatform,
+    isEnterpriseTelegramPlatform,
+    isEnterprisePlatform,
+    enterpriseRoutes: selectedInstance?.platform_metadata?.enterprise_routes || [],
     maskTokenValue,
     onToggleEnabled,
     onCreateInbox,
@@ -1207,6 +1284,8 @@ export default function App() {
     isBalePlatform,
     isStandardBalePlatform,
     isEnterpriseBalePlatform,
+    isEnterpriseTelegramPlatform,
+    isEnterprisePlatform,
     isTelegramPlatform,
     isFeatureSupported,
     onSave,
@@ -1269,6 +1348,7 @@ export default function App() {
 
   const enterpriseOperationsProps = {
     enterpriseSessions,
+    enterpriseRoutes: selectedInstance?.platform_metadata?.enterprise_routes || [],
   };
 
   const simulationProps = {
@@ -1362,6 +1442,7 @@ export default function App() {
             onDelete={onDelete}
             PLATFORM_TELEGRAM={PLATFORM_TELEGRAM}
             PLATFORM_BALE_ENTERPRISE={PLATFORM_BALE_ENTERPRISE}
+            PLATFORM_TELEGRAM_ENTERPRISE={PLATFORM_TELEGRAM_ENTERPRISE}
           />
         )}
       </Suspense>

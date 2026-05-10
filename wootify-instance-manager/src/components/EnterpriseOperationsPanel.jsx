@@ -1,9 +1,9 @@
 import React, { useMemo } from 'react';
 
-const ROUTE_LABELS = {
-  customer_service: 'Customer Service',
-  sales: 'Sales',
-};
+function routeLabel(routeKey, enterpriseRoutes) {
+  const cfg = (enterpriseRoutes || []).find((r) => r.route_key === routeKey);
+  return cfg?.display_name || routeKey;
+}
 
 function summarizeRoute(sessions, routeKey) {
   const rows = sessions.filter((item) => item.route_key === routeKey);
@@ -23,7 +23,7 @@ function sessionHealth(item) {
   return { label: 'Idle', tone: 'neutral' };
 }
 
-export default function EnterpriseOperationsPanel({ enterpriseSessions }) {
+export default function EnterpriseOperationsPanel({ enterpriseSessions, enterpriseRoutes }) {
   const report = useMemo(() => {
     const total = enterpriseSessions.length;
     const open = enterpriseSessions.filter((item) => item.status === 'open').length;
@@ -36,6 +36,9 @@ export default function EnterpriseOperationsPanel({ enterpriseSessions }) {
       return unread > 0 || (item.status === 'resolved' && unread > 0);
     });
 
+    const routeKeys = Array.from(new Set(enterpriseSessions.map((s) => s.route_key).filter(Boolean)));
+    const dynamicRoutes = routeKeys.map((key) => ({ key, ...summarizeRoute(enterpriseSessions, key) }));
+
     return {
       total,
       open,
@@ -44,10 +47,7 @@ export default function EnterpriseOperationsPanel({ enterpriseSessions }) {
       activeUsers,
       unreadTotal,
       atRisk,
-      routes: [
-        { key: 'customer_service', ...summarizeRoute(enterpriseSessions, 'customer_service') },
-        { key: 'sales', ...summarizeRoute(enterpriseSessions, 'sales') },
-      ],
+      routes: dynamicRoutes,
     };
   }, [enterpriseSessions]);
 
@@ -88,7 +88,7 @@ export default function EnterpriseOperationsPanel({ enterpriseSessions }) {
         {report.routes.map((route) => (
           <article key={route.key} className="report-card">
             <div className="report-card__head">
-              <h3>{ROUTE_LABELS[route.key] || route.key}</h3>
+              <h3>{routeLabel(route.key, enterpriseRoutes)}</h3>
               <span className={`status-pill ${route.openCount > 0 ? 'good' : 'neutral'}`}>{route.rows.length} sessions</span>
             </div>
             <div className="instance-meta report-card__meta">
@@ -121,8 +121,8 @@ export default function EnterpriseOperationsPanel({ enterpriseSessions }) {
             {report.atRisk.map((item) => (
               <div key={item.id} className="watchlist__item">
                 <div>
-                  <div className="list-title">{ROUTE_LABELS[item.route_key] || item.route_key} · Chat {item.platform_chat_id}</div>
-                  <div className="list-meta">Conversation {item.chatwoot_conversation_id} · {item.phone_number || 'No phone on record'}</div>
+                  <div className="list-title">{routeLabel(item.route_key, enterpriseRoutes)} · Chat {item.platform_chat_id}</div>
+                  <div className="list-meta">Conversation {item.chatwoot_conversation_id}{item.phone_number ? ` · ${item.phone_number}` : ''}</div>
                 </div>
                 <div className="watchlist__stats">
                   <span className="badge badge--warn">Unread {item.unread_count}</span>
@@ -156,7 +156,7 @@ export default function EnterpriseOperationsPanel({ enterpriseSessions }) {
               const health = sessionHealth(item);
               return (
                 <tr key={item.id}>
-                  <td>{ROUTE_LABELS[item.route_key] || item.route_key}</td>
+                  <td>{routeLabel(item.route_key, enterpriseRoutes)}</td>
                   <td>{item.platform_chat_id}</td>
                   <td>{item.phone_number || '-'}</td>
                   <td>{item.chatwoot_conversation_id}</td>

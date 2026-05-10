@@ -50,6 +50,7 @@ from app.schemas.api_v1 import (
 from app.services.bridge_service import BridgeService
 from app.services.conversation_mapping_service import ConversationMappingService
 from app.services.enterprise_bale_service import EnterpriseBaleService
+from app.services.enterprise_telegram_service import EnterpriseTelegramService
 from app.services.enterprise_document_service import EnterpriseDocumentService
 from app.services.enterprise_manual_group_service import EnterpriseManualGroupService
 from app.services.instance_service import InstanceService
@@ -62,6 +63,7 @@ platform_registry = PlatformRegistryService()
 instances = InstanceService()
 bridge = BridgeService()
 enterprise = EnterpriseBaleService()
+enterprise_telegram = EnterpriseTelegramService()
 enterprise_documents = EnterpriseDocumentService()
 enterprise_manual_groups = EnterpriseManualGroupService()
 conversations = ConversationMappingService()
@@ -157,63 +159,122 @@ async def _maybe_auto_create_enterprise_inboxes(
     instance: Optional[InstanceResponse],
 ) -> Optional[list[EnterpriseAutoCreateInboxResponse]]:
     """Best-effort enterprise route inbox creation during instance save flows."""
-    if instance is None or instance.platform_type_key != 'bale_enterprise':
+    if instance is None:
         return None
 
+    platform_key = instance.platform_type_key
     platform_metadata = instance.platform_metadata if isinstance(instance.platform_metadata, dict) else {}
     results: list[EnterpriseAutoCreateInboxResponse] = []
-    for route_key, auto_key in (
-        ('customer_service', 'enterprise_customer_service_auto_create'),
-        ('sales', 'enterprise_sales_auto_create'),
-    ):
-        if not bool(platform_metadata.get(auto_key)):
-            continue
-        try:
-            data = await enterprise.create_route_inbox(db, instance.instance_key, route_key)
-            results.append(
-                EnterpriseAutoCreateInboxResponse(
-                    route_key=route_key,
-                    attempted=True,
-                    created=bool(data.get('created')),
-                    inbox_id=data.get('inbox_id'),
-                    detail=(
-                        'created'
-                        if data.get('created')
-                        else 'existing_inbox_webhook_updated'
-                        if data.get('webhook_updated')
-                        else 'existing_inbox_reused'
-                    ),
+
+    if platform_key == 'bale_enterprise':
+        for route_key, auto_key in (
+            ('customer_service', 'enterprise_customer_service_auto_create'),
+            ('sales', 'enterprise_sales_auto_create'),
+        ):
+            if not bool(platform_metadata.get(auto_key)):
+                continue
+            try:
+                data = await enterprise.create_route_inbox(db, instance.instance_key, route_key)
+                results.append(
+                    EnterpriseAutoCreateInboxResponse(
+                        route_key=route_key,
+                        attempted=True,
+                        created=bool(data.get('created')),
+                        inbox_id=data.get('inbox_id'),
+                        detail=(
+                            'created'
+                            if data.get('created')
+                            else 'existing_inbox_webhook_updated'
+                            if data.get('webhook_updated')
+                            else 'existing_inbox_reused'
+                        ),
+                    )
                 )
-            )
-        except ValueError as exc:
-            logger.warning(
-                'enterprise auto-create inbox skipped instance_key=%s route=%s error=%s',
-                instance.instance_key,
-                route_key,
-                str(exc),
-            )
-            results.append(
-                EnterpriseAutoCreateInboxResponse(
-                    route_key=route_key,
-                    attempted=True,
-                    created=False,
-                    detail=str(exc),
+            except ValueError as exc:
+                logger.warning(
+                    'enterprise auto-create inbox skipped instance_key=%s route=%s error=%s',
+                    instance.instance_key,
+                    route_key,
+                    str(exc),
                 )
-            )
-        except Exception:
-            logger.exception(
-                'enterprise auto-create inbox failed instance_key=%s route=%s',
-                instance.instance_key,
-                route_key,
-            )
-            results.append(
-                EnterpriseAutoCreateInboxResponse(
-                    route_key=route_key,
-                    attempted=True,
-                    created=False,
-                    detail='auto_create_failed',
+                results.append(
+                    EnterpriseAutoCreateInboxResponse(
+                        route_key=route_key,
+                        attempted=True,
+                        created=False,
+                        detail=str(exc),
+                    )
                 )
-            )
+            except Exception:
+                logger.exception(
+                    'enterprise auto-create inbox failed instance_key=%s route=%s',
+                    instance.instance_key,
+                    route_key,
+                )
+                results.append(
+                    EnterpriseAutoCreateInboxResponse(
+                        route_key=route_key,
+                        attempted=True,
+                        created=False,
+                        detail='auto_create_failed',
+                    )
+                )
+
+    if platform_key == 'telegram_enterprise':
+        routes = platform_metadata.get('enterprise_routes') or []
+        for route in routes:
+            if not isinstance(route, dict):
+                continue
+            route_key = route.get('route_key')
+            if not route_key or not bool(route.get('auto_create')):
+                continue
+            try:
+                data = await enterprise_telegram.create_route_inbox(db, instance.instance_key, route_key)
+                results.append(
+                    EnterpriseAutoCreateInboxResponse(
+                        route_key=route_key,
+                        attempted=True,
+                        created=bool(data.get('created')),
+                        inbox_id=data.get('inbox_id'),
+                        detail=(
+                            'created'
+                            if data.get('created')
+                            else 'existing_inbox_webhook_updated'
+                            if data.get('webhook_updated')
+                            else 'existing_inbox_reused'
+                        ),
+                    )
+                )
+            except ValueError as exc:
+                logger.warning(
+                    'enterprise telegram auto-create inbox skipped instance_key=%s route=%s error=%s',
+                    instance.instance_key,
+                    route_key,
+                    str(exc),
+                )
+                results.append(
+                    EnterpriseAutoCreateInboxResponse(
+                        route_key=route_key,
+                        attempted=True,
+                        created=False,
+                        detail=str(exc),
+                    )
+                )
+            except Exception:
+                logger.exception(
+                    'enterprise telegram auto-create inbox failed instance_key=%s route=%s',
+                    instance.instance_key,
+                    route_key,
+                )
+                results.append(
+                    EnterpriseAutoCreateInboxResponse(
+                        route_key=route_key,
+                        attempted=True,
+                        created=False,
+                        detail='auto_create_failed',
+                    )
+                )
+
     return results or None
 
 
@@ -389,10 +450,10 @@ async def create_chatwoot_inbox(instance_key: str, db: Session = Depends(get_db)
     """Create chatwoot inbox."""
     try:
         runtime = _require_instance_runtime(db, instance_key)
-        if runtime.platform_type.key == 'bale_enterprise':
+        if runtime.platform_type.key in {'bale_enterprise', 'telegram_enterprise'}:
             _raise_http_error(
                 status_code=400,
-                detail='use the enterprise route inbox endpoint for bale_enterprise instances',
+                detail='use the enterprise route inbox endpoint for enterprise instances',
                 endpoint='create_chatwoot_inbox',
                 instance_key=instance_key,
             )
@@ -452,6 +513,8 @@ async def _handle_chatwoot_webhook(
         resolved_instance_key = runtime.instance.instance_key
         if runtime.platform_type.key == 'bale_enterprise':
             result = await enterprise.receive_chatwoot_webhook(db, resolved_instance_key, payload)
+        elif runtime.platform_type.key == 'telegram_enterprise':
+            result = await enterprise_telegram.receive_chatwoot_webhook(db, resolved_instance_key, payload)
         else:
             result = await bridge.receive_chatwoot_webhook(db, resolved_instance_key, payload)
         return GenericMessageResponse(
@@ -637,6 +700,16 @@ def _instance_matches_chatwoot_inbox(
         ),
     ]
 
+    # Add dynamic telegram_enterprise routes
+    routes = platform_metadata.get('enterprise_routes') or []
+    if isinstance(routes, list):
+        for route in routes:
+            if isinstance(route, dict):
+                configured_pairs.append((
+                    _normalize_optional_string(route.get('inbox_id')),
+                    _normalize_optional_string(route.get('inbox_name')),
+                ))
+
     normalized_inbox_name = str(inbox_name or '').strip().casefold() or None
     for configured_id, configured_name in configured_pairs:
         if inbox_id and configured_id and configured_id == inbox_id:
@@ -709,14 +782,16 @@ def _enterprise_asset_to_response(row) -> EnterpriseDocumentAssetResponse:
 def _enterprise_session_to_response(row) -> EnterpriseSessionResponse:
     """Convert an enterprise session row to its response schema."""
     user = row.user
+    gre_status = getattr(user, 'gre_status', None)
+    current_state = getattr(user, 'current_state', None)
     return EnterpriseSessionResponse(
         id=row.id,
         route_key=row.route_key,
         platform_chat_id=user.platform_chat_id,
         display_name=user.display_name,
-        phone_number=user.phone_number,
-        gre_status=user.gre_status.value,
-        current_state=user.current_state.value,
+        phone_number=getattr(user, 'phone_number', None),
+        gre_status=gre_status.value if gre_status is not None else None,
+        current_state=current_state.value if hasattr(current_state, 'value') else str(current_state or 'root'),
         chatwoot_conversation_id=row.chatwoot_conversation_id,
         chatwoot_contact_id=row.chatwoot_contact_id,
         chatwoot_inbox_id=row.chatwoot_inbox_id,
@@ -1047,8 +1122,14 @@ async def create_enterprise_route_inbox(instance_key: str, route_key: str, db: S
 def list_enterprise_sessions(instance_key: str, db: Session = Depends(get_db)):
     """List enterprise live-chat sessions for an instance."""
     try:
-        rows = enterprise.list_sessions(db, instance_key)
+        runtime = _require_instance_runtime(db, instance_key)
+        if runtime.platform_type.key == 'telegram_enterprise':
+            rows = enterprise_telegram.list_sessions(db, instance_key)
+        else:
+            rows = enterprise.list_sessions(db, instance_key)
         return EnterpriseSessionListResponse(items=[_enterprise_session_to_response(item) for item in rows])
+    except HTTPException:
+        raise
     except ValueError as exc:
         _raise_http_error(status_code=400, detail=str(exc), endpoint='list_enterprise_sessions', exc=exc, instance_key=instance_key)
     except Exception as exc:

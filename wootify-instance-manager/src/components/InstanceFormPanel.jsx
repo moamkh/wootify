@@ -1,5 +1,105 @@
 import React from 'react';
 
+function DynamicRoutesEditor({ form, setForm, busy, selectedKey, onCreateEnterpriseInbox, copyTextToClipboard }) {
+  const routes = form.enterprise_routes || [];
+
+  const updateRoute = (index, updates) => {
+    const next = routes.map((r, i) => (i === index ? { ...r, ...updates } : r));
+    setForm((s) => ({ ...s, enterprise_routes: next }));
+  };
+
+  const addRoute = () => {
+    const next = [
+      ...routes,
+      { route_key: '', display_name: '', inbox_id: '', inbox_name: '', auto_create: false, waiting_text: '', accepted_text: '', unread_text: '' },
+    ];
+    setForm((s) => ({ ...s, enterprise_routes: next }));
+  };
+
+  const removeRoute = (index) => {
+    const next = routes.filter((_, i) => i !== index);
+    setForm((s) => ({ ...s, enterprise_routes: next }));
+  };
+
+  return (
+    <div className="dynamic-routes-stack">
+      {routes.map((route, idx) => (
+        <div key={idx} className="form-section-block">
+          <div className="row between">
+            <h4 style={{ margin: 0 }}>Route #{idx + 1}</h4>
+            <button type="button" className="btn secondary" onClick={() => removeRoute(idx)} disabled={busy}>
+              Remove
+            </button>
+          </div>
+          <div className="row">
+            <label>
+              Route Key
+              <input value={route.route_key} onChange={(e) => updateRoute(idx, { route_key: e.target.value })} placeholder="e.g. live_support" />
+            </label>
+            <label>
+              Display Name
+              <input value={route.display_name} onChange={(e) => updateRoute(idx, { display_name: e.target.value })} placeholder="e.g. Live Support" />
+            </label>
+          </div>
+          <div className="row">
+            <label>
+              Inbox ID
+              <input value={route.inbox_id} onChange={(e) => updateRoute(idx, { inbox_id: e.target.value })} />
+            </label>
+            <label>
+              Inbox Name
+              <input value={route.inbox_name} onChange={(e) => updateRoute(idx, { inbox_name: e.target.value })} />
+            </label>
+          </div>
+          <label>
+            {route.display_name || route.route_key || 'Route'} Webhook URL
+            <div className="row">
+              <input value={form[`enterprise_${route.route_key}_webhook_url`]} readOnly placeholder={`Save the instance to generate the webhook URL`} />
+              <button
+                type="button"
+                className="btn secondary"
+                disabled={!form[`enterprise_${route.route_key}_webhook_url`]}
+                onClick={async () => {
+                  try {
+                    await copyTextToClipboard(form[`enterprise_${route.route_key}_webhook_url`]);
+                    alert('Webhook URL copied');
+                  } catch (e) {
+                    alert(e?.message || String(e));
+                  }
+                }}
+              >
+                Copy
+              </button>
+            </div>
+          </label>
+          <label className="checkbox">
+            <input type="checkbox" checked={Boolean(route.auto_create)} onChange={(e) => updateRoute(idx, { auto_create: e.target.checked })} />
+            Auto create inbox
+          </label>
+          <label>
+            Waiting Text
+            <textarea rows={2} value={route.waiting_text} onChange={(e) => updateRoute(idx, { waiting_text: e.target.value })} />
+          </label>
+          <label>
+            Accepted Text
+            <textarea rows={2} value={route.accepted_text} onChange={(e) => updateRoute(idx, { accepted_text: e.target.value })} />
+          </label>
+          <label>
+            Unread Notification Text
+            <textarea rows={2} value={route.unread_text} onChange={(e) => updateRoute(idx, { unread_text: e.target.value })} />
+          </label>
+          <button type="button" className="btn" disabled={busy || !selectedKey || !route.route_key} onClick={() => onCreateEnterpriseInbox(route.route_key)}>
+            Create or Link {route.display_name || route.route_key || 'Route'} Inbox
+          </button>
+        </div>
+      ))}
+      <button type="button" className="btn secondary" onClick={addRoute} disabled={busy}>
+        + Add Route
+      </button>
+    </div>
+  );
+}
+
 export default function InstanceFormPanel({
   selectedKey,
   platformTypes,
@@ -13,6 +113,8 @@ export default function InstanceFormPanel({
   isStandardBalePlatform,
   isEnterpriseBalePlatform,
   isTelegramPlatform,
+  isEnterpriseTelegramPlatform,
+  isEnterprisePlatform,
   isFeatureSupported,
   onSave,
   onNewInstance,
@@ -165,7 +267,7 @@ export default function InstanceFormPanel({
 
         {isTelegramPlatform ? (
           <>
-            <h3>Telegram metadata</h3>
+            <h3>{isEnterpriseTelegramPlatform ? 'Telegram enterprise metadata' : 'Telegram metadata'}</h3>
             <div className="row">
               <label>
                 Telegram Token
@@ -198,27 +300,72 @@ export default function InstanceFormPanel({
               Department
               <input value={form.telegram_department} onChange={(e) => setForm((s) => ({ ...s, telegram_department: e.target.value }))} />
             </label>
-            <h3>Telegram phone prompt</h3>
-            <label className="checkbox">
-              <input
-                type="checkbox"
-                checked={Boolean(form.telegram_share_phone_prompt_enabled)}
-                onChange={(e) => setForm((s) => ({ ...s, telegram_share_phone_prompt_enabled: e.target.checked }))}
-              />
-              Enable share-phone prompt
-            </label>
-            <label className="checkbox">
-              <input
-                type="checkbox"
-                checked={Boolean(form.telegram_share_phone_prompt_only_if_missing_phone)}
-                onChange={(e) => setForm((s) => ({ ...s, telegram_share_phone_prompt_only_if_missing_phone: e.target.checked }))}
-              />
-              Send prompt only if Chatwoot contact has no phone number
-            </label>
-            <label>
-              Share-Phone Prompt Text
-              <textarea rows={3} value={form.telegram_share_phone_prompt_text} onChange={(e) => setForm((s) => ({ ...s, telegram_share_phone_prompt_text: e.target.value }))} />
-            </label>
+
+            {!isEnterpriseTelegramPlatform ? (
+              <>
+                <h3>Telegram phone prompt</h3>
+                <label className="checkbox">
+                  <input
+                    type="checkbox"
+                    checked={Boolean(form.telegram_share_phone_prompt_enabled)}
+                    onChange={(e) => setForm((s) => ({ ...s, telegram_share_phone_prompt_enabled: e.target.checked }))}
+                  />
+                  Enable share-phone prompt
+                </label>
+                <label className="checkbox">
+                  <input
+                    type="checkbox"
+                    checked={Boolean(form.telegram_share_phone_prompt_only_if_missing_phone)}
+                    onChange={(e) => setForm((s) => ({ ...s, telegram_share_phone_prompt_only_if_missing_phone: e.target.checked }))}
+                  />
+                  Send prompt only if Chatwoot contact has no phone number
+                </label>
+                <label>
+                  Share-Phone Prompt Text
+                  <textarea rows={3} value={form.telegram_share_phone_prompt_text} onChange={(e) => setForm((s) => ({ ...s, telegram_share_phone_prompt_text: e.target.value }))} />
+                </label>
+              </>
+            ) : null}
+
+            {isEnterpriseTelegramPlatform ? (
+              <>
+                <h3>Enterprise messages</h3>
+                {[
+                  ['enterprise_welcome_text', 'Welcome Text'],
+                  ['enterprise_menu_prompt_text', 'Root Menu Prompt'],
+                  ['enterprise_address_prompt_text', 'Address Menu Prompt'],
+                  ['enterprise_no_manuals_text', 'No Manuals Text'],
+                  ['enterprise_no_catalog_text', 'No Catalog Text'],
+                  ['enterprise_not_configured_text', 'Missing Configuration Fallback'],
+                  ['enterprise_live_mode_resume_text', 'Live Session Resume Text'],
+                  ['enterprise_address_tehran_alborz_text', 'Tehran and Alborz Text'],
+                  ['enterprise_address_other_provinces_text', 'Other Provinces Text'],
+                  ['enterprise_user_manual_link_template', 'User Manual Link Template', '{{user_manual_name}} = display name  |  {{user_manual_url}} = link URL'],
+                ].map(([field, label, hint]) => (
+                  <label key={field}>
+                    {label}
+                    {hint && <small style={{ display: 'block', marginBottom: 4, color: 'var(--text-muted, #888)', fontStyle: 'italic' }}>{hint}</small>}
+                    <textarea rows={3} value={form[field]} onChange={(e) => setForm((s) => ({ ...s, [field]: e.target.value }))} />
+                  </label>
+                ))}
+
+                <h3>Enterprise Button Labels</h3>
+                {[
+                  ['enterprise_catalog_button_label', 'Catalog Button'],
+                  ['enterprise_manuals_button_label', 'Manuals Button'],
+                  ['enterprise_address_button_label', 'Address Button'],
+                  ['enterprise_back_button_label', 'Back Button'],
+                ].map(([field, label]) => (
+                  <label key={field}>
+                    {label}
+                    <input value={form[field]} onChange={(e) => setForm((s) => ({ ...s, [field]: e.target.value }))} />
+                  </label>
+                ))}
+
+                <h3>Dynamic Routes</h3>
+                <DynamicRoutesEditor form={form} setForm={setForm} busy={busy} selectedKey={selectedKey} onCreateEnterpriseInbox={onCreateEnterpriseInbox} copyTextToClipboard={copyTextToClipboard} />
+              </>
+            ) : null}
           </>
         ) : null}
 
@@ -295,7 +442,7 @@ export default function InstanceFormPanel({
             </label>
           </>
         ) : null}
-        {!isEnterpriseBalePlatform ? (
+        {!isEnterprisePlatform ? (
           <label>
             Webhook URL
             <div className="row">

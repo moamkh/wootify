@@ -195,6 +195,9 @@ class Instance(Base):
     enterprise_users = relationship(
         "EnterpriseBaleUser", back_populates="instance", cascade="all, delete-orphan"
     )
+    enterprise_telegram_users = relationship(
+        "EnterpriseTelegramUser", back_populates="instance", cascade="all, delete-orphan"
+    )
     enterprise_document_assets = relationship(
         "EnterpriseDocumentAsset",
         back_populates="instance",
@@ -649,3 +652,133 @@ class EnterpriseManualGroupAssignment(Base):
 
     group = relationship("EnterpriseManualGroup", back_populates="assignments")
     asset = relationship("EnterpriseDocumentAsset", back_populates="group_assignments")
+
+
+class EnterpriseTelegramUser(Base):
+    """Represents an enterprise Telegram bot user."""
+
+    __tablename__ = "enterprise_telegram_users"
+    __table_args__ = (
+        UniqueConstraint(
+            "instance_id",
+            "platform_chat_id",
+            name="uq_enterprise_telegram_user_instance_chat",
+        ),
+    )
+
+    id = Column(String(36), primary_key=True, default=_uuid)
+    instance_id = Column(
+        String(36),
+        ForeignKey("instances.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    platform_chat_id = Column(String(255), nullable=False, index=True)
+    display_name = Column(String(255), nullable=True)
+    phone_number = Column(String(64), nullable=True)
+    current_state = Column(String(64), nullable=False, default="root")
+    current_group_id = Column(
+        String(36),
+        ForeignKey("enterprise_manual_groups.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+    created_at = Column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    updated_at = Column(
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=func.now(),
+        onupdate=func.now(),
+    )
+
+    instance = relationship("Instance", back_populates="enterprise_telegram_users")
+    current_group = relationship("EnterpriseManualGroup")
+    sessions = relationship(
+        "EnterpriseTelegramSession", back_populates="user", cascade="all, delete-orphan"
+    )
+
+
+class EnterpriseTelegramSession(Base):
+    """Represents a route-specific enterprise Telegram live-chat session."""
+
+    __tablename__ = "enterprise_telegram_sessions"
+
+    id = Column(String(36), primary_key=True, default=_uuid)
+    user_id = Column(
+        String(36),
+        ForeignKey("enterprise_telegram_users.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    route_key = Column(String(64), nullable=False, index=True)
+    chatwoot_conversation_id = Column(String(255), nullable=False, index=True)
+    chatwoot_contact_id = Column(String(255), nullable=True, index=True)
+    chatwoot_inbox_id = Column(String(255), nullable=True)
+    status = Column(
+        Enum(EnterpriseSessionStatus, native_enum=False, length=24),
+        nullable=False,
+        default=EnterpriseSessionStatus.open,
+    )
+    user_present = Column(Boolean, nullable=False, default=False)
+    accepted_notice_sent = Column(Boolean, nullable=False, default=False)
+    unread_notice_sent = Column(Boolean, nullable=False, default=False)
+    unread_count = Column(Integer, nullable=False, default=0)
+    created_at = Column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    updated_at = Column(
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=func.now(),
+        onupdate=func.now(),
+    )
+
+    user = relationship("EnterpriseTelegramUser", back_populates="sessions")
+    pending_messages = relationship(
+        "EnterpriseTelegramPendingMessage",
+        back_populates="session",
+        cascade="all, delete-orphan",
+    )
+
+
+class EnterpriseTelegramPendingMessage(Base):
+    """Represents an operator message queued for later Telegram delivery."""
+
+    __tablename__ = "enterprise_telegram_pending_messages"
+    __table_args__ = (
+        UniqueConstraint(
+            "session_id",
+            "chatwoot_message_id",
+            name="uq_enterprise_telegram_pending_message_session_chatwoot",
+        ),
+    )
+
+    id = Column(String(36), primary_key=True, default=_uuid)
+    session_id = Column(
+        String(36),
+        ForeignKey("enterprise_telegram_sessions.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    chatwoot_message_id = Column(String(255), nullable=True, index=True)
+    text_payload = Column(Text, nullable=True)
+    attachment_payload_json = Column(JSON, nullable=True)
+    status = Column(
+        Enum(EnterprisePendingMessageStatus, native_enum=False, length=16),
+        nullable=False,
+        default=EnterprisePendingMessageStatus.pending,
+    )
+    delivery_error = Column(Text, nullable=True)
+    created_at = Column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    updated_at = Column(
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=func.now(),
+        onupdate=func.now(),
+    )
+
+    session = relationship("EnterpriseTelegramSession", back_populates="pending_messages")

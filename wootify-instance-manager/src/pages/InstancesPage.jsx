@@ -13,6 +13,7 @@ export default function InstancesPage({
   onDelete,
   PLATFORM_TELEGRAM,
   PLATFORM_BALE_ENTERPRISE,
+  PLATFORM_TELEGRAM_ENTERPRISE,
 }) {
   return (
     <section className="card instance-browser section-stack">
@@ -33,7 +34,8 @@ export default function InstancesPage({
           {filteredInstances.map((item) => {
             const isSelected = selectedKey === item.instance_key;
             const statusLabel = item.is_enabled ? 'Enabled' : 'Disabled';
-            const isTelegram = item.platform_type_key === PLATFORM_TELEGRAM;
+            const isTelegram = item.platform_type_key === PLATFORM_TELEGRAM || item.platform_type_key === PLATFORM_TELEGRAM_ENTERPRISE;
+            const isEnterprise = item.platform_type_key === PLATFORM_BALE_ENTERPRISE || item.platform_type_key === PLATFORM_TELEGRAM_ENTERPRISE;
             const botName = isTelegram
               ? item.platform_metadata?.telegram_bot_name || '-'
               : item.platform_metadata?.bale_bot_name || '-';
@@ -46,6 +48,7 @@ export default function InstancesPage({
             const maskedToken = maskTokenValue(
               isTelegram ? item.platform_metadata?.telegram_token : item.platform_metadata?.bale_token,
             );
+            const enterpriseRoutes = item.platform_metadata?.enterprise_routes || [];
 
             return (
               <article
@@ -108,32 +111,59 @@ export default function InstancesPage({
                   >
                     {item.is_enabled ? 'Disable' : 'Enable'}
                   </button>
-                  <button
-                    className="btn"
-                    disabled={busy}
-                    onClick={(e) => {
-                      e.stopPropagation();
-                      if (item.platform_type_key === PLATFORM_BALE_ENTERPRISE) {
-                        onCreateEnterpriseInbox('customer_service', item.instance_key);
-                      } else {
-                        onCreateInbox(item.instance_key);
-                      }
-                    }}
-                  >
-                    {item.platform_type_key === PLATFORM_BALE_ENTERPRISE ? 'Service Inbox' : 'Create Inbox'}
-                  </button>
-                  {item.platform_type_key === PLATFORM_BALE_ENTERPRISE ? (
+                  {isEnterprise ? (
+                    <>
+                      {item.platform_type_key === PLATFORM_BALE_ENTERPRISE ? (
+                        <>
+                          <button
+                            className="btn"
+                            disabled={busy}
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              onCreateEnterpriseInbox('customer_service', item.instance_key);
+                            }}
+                          >
+                            Service Inbox
+                          </button>
+                          <button
+                            className="btn"
+                            disabled={busy}
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              onCreateEnterpriseInbox('sales', item.instance_key);
+                            }}
+                          >
+                            Sales Inbox
+                          </button>
+                        </>
+                      ) : (
+                        enterpriseRoutes.map((route) => (
+                          <button
+                            key={route.route_key}
+                            className="btn"
+                            disabled={busy}
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              onCreateEnterpriseInbox(route.route_key, item.instance_key);
+                            }}
+                          >
+                            {route.display_name || route.route_key} Inbox
+                          </button>
+                        ))
+                      )}
+                    </>
+                  ) : (
                     <button
                       className="btn"
                       disabled={busy}
                       onClick={(e) => {
                         e.stopPropagation();
-                        onCreateEnterpriseInbox('sales', item.instance_key);
+                        onCreateInbox(item.instance_key);
                       }}
                     >
-                      Sales Inbox
+                      Create Inbox
                     </button>
-                  ) : null}
+                  )}
                   <button
                     className="btn danger"
                     disabled={busy}

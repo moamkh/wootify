@@ -17,6 +17,7 @@ CONNECTOR_SOURCE_PREFIX = {
     'bale': 'BALE',
     'bale_enterprise': 'BALE_ENTERPRISE',
     'telegram': 'TELEGRAM',
+    'telegram_enterprise': 'TELEGRAM_ENTERPRISE',
 }
 
 
@@ -28,6 +29,7 @@ class ConnectorRegistry:
             'bale': bale,
             'bale_enterprise': bale,
             'telegram': telegram,
+            'telegram_enterprise': telegram,
         }
 
     def get(self, platform_key: str) -> PlatformConnector:

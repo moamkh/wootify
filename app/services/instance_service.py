@@ -35,6 +35,7 @@ PLATFORM_REQUIRED_TOKEN_KEY = {
     'bale': 'bale_token',
     'bale_enterprise': 'bale_token',
     'telegram': 'telegram_token',
+    'telegram_enterprise': 'telegram_token',
 }
 
 logger = logging.getLogger('app.services.instance')
@@ -469,6 +470,52 @@ class InstanceService:
                 ).strip(),
             }
 
+        if key == 'telegram_enterprise':
+            routes = data.get('enterprise_routes')
+            if isinstance(routes, list):
+                normalized_routes = []
+                for route in routes:
+                    if not isinstance(route, dict):
+                        continue
+                    normalized_routes.append({
+                        'route_key': str(route.get('route_key') or '').strip(),
+                        'display_name': str(route.get('display_name') or '').strip() or None,
+                        'inbox_id': self._coerce_int(route.get('inbox_id')),
+                        'inbox_name': str(route.get('inbox_name') or '').strip() or None,
+                        'auto_create': self._coerce_bool(route.get('auto_create'), default=False),
+                        'waiting_text': str(route.get('waiting_text') or '').strip() or None,
+                        'accepted_text': str(route.get('accepted_text') or '').strip() or None,
+                        'unread_text': str(route.get('unread_text') or '').strip() or None,
+                    })
+                routes = normalized_routes
+            else:
+                routes = []
+            return {
+                'telegram_token': str(data.get('telegram_token') or '').strip(),
+                'telegram_api_base_url': str(data.get('telegram_api_base_url') or settings.TELEGRAM_API_BASE_URL).strip(),
+                'telegram_file_base_url': str(data.get('telegram_file_base_url') or settings.TELEGRAM_FILE_BASE_URL).strip(),
+                'telegram_poll_interval': int(data.get('telegram_poll_interval') or settings.TELEGRAM_POLL_INTERVAL_SECONDS),
+                'telegram_bot_name': str(data.get('telegram_bot_name') or '').strip() or None,
+                'telegram_bot_id': str(data.get('telegram_bot_id') or '').strip() or None,
+                'telegram_department': str(data.get('telegram_department') or '').strip() or None,
+                'enterprise_welcome_text': str(data.get('enterprise_welcome_text') or '').strip() or None,
+                'enterprise_menu_prompt_text': str(data.get('enterprise_menu_prompt_text') or '').strip() or None,
+                'enterprise_address_prompt_text': str(data.get('enterprise_address_prompt_text') or '').strip() or None,
+                'enterprise_not_configured_text': str(data.get('enterprise_not_configured_text') or '').strip() or None,
+                'enterprise_live_mode_resume_text': str(data.get('enterprise_live_mode_resume_text') or '').strip() or None,
+                'enterprise_live_session_locked_text': str(data.get('enterprise_live_session_locked_text') or '').strip() or None,
+                'enterprise_no_manuals_text': str(data.get('enterprise_no_manuals_text') or '').strip() or None,
+                'enterprise_no_catalog_text': str(data.get('enterprise_no_catalog_text') or '').strip() or None,
+                'enterprise_address_tehran_alborz_text': str(data.get('enterprise_address_tehran_alborz_text') or '').strip() or None,
+                'enterprise_address_other_provinces_text': str(data.get('enterprise_address_other_provinces_text') or '').strip() or None,
+                'enterprise_user_manual_link_template': str(data.get('enterprise_user_manual_link_template') or '').strip() or None,
+                'enterprise_catalog_button_label': str(data.get('enterprise_catalog_button_label') or '').strip() or None,
+                'enterprise_manuals_button_label': str(data.get('enterprise_manuals_button_label') or '').strip() or None,
+                'enterprise_address_button_label': str(data.get('enterprise_address_button_label') or '').strip() or None,
+                'enterprise_back_button_label': str(data.get('enterprise_back_button_label') or '').strip() or None,
+                'enterprise_routes': routes,
+            }
+
         if key == 'bale_enterprise':
             return {
                 'bale_token': str(data.get('bale_token') or '').strip(),
@@ -714,7 +761,8 @@ class InstanceService:
         """Internal helper to to response."""
         chatwoot_response = self._mask_json(chatwoot)
         chatwoot_response['webhook_url'] = self._build_chatwoot_webhook_url(row.instance_key)
-        if str(platform.key or '').strip().lower() == 'bale_enterprise':
+        platform_key = str(platform.key or '').strip().lower()
+        if platform_key == 'bale_enterprise':
             chatwoot_response['enterprise_customer_service_webhook_url'] = self._build_enterprise_chatwoot_webhook_url(
                 row.instance_key,
                 'customer_service',
@@ -723,6 +771,15 @@ class InstanceService:
                 row.instance_key,
                 'sales',
             )
+        if platform_key == 'telegram_enterprise':
+            routes = platform_metadata.get('enterprise_routes') or []
+            for route in routes:
+                route_key = route.get('route_key')
+                if route_key:
+                    chatwoot_response[f'enterprise_{route_key}_webhook_url'] = self._build_enterprise_chatwoot_webhook_url(
+                        row.instance_key,
+                        route_key,
+                    )
 
         return InstanceResponse(
             id=row.id,

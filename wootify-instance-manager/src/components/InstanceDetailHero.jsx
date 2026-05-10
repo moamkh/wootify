@@ -11,6 +11,9 @@ export default function InstanceDetailHero({
   isBalePlatform,
   isTelegramPlatform,
   isEnterpriseBalePlatform,
+  isEnterpriseTelegramPlatform,
+  isEnterprisePlatform,
+  enterpriseRoutes,
   maskTokenValue,
   onToggleEnabled,
   onCreateInbox,
@@ -97,14 +100,24 @@ export default function InstanceDetailHero({
           >
             {selectedInstance.is_enabled ? 'Disable' : 'Enable'}
           </button>
-          {isEnterpriseBalePlatform ? (
+          {isEnterprisePlatform ? (
             <>
-              <button className="btn" disabled={busy} onClick={() => onCreateEnterpriseInbox('customer_service')}>
-                Service Inbox
-              </button>
-              <button className="btn" disabled={busy} onClick={() => onCreateEnterpriseInbox('sales')}>
-                Sales Inbox
-              </button>
+              {isEnterpriseBalePlatform ? (
+                <>
+                  <button className="btn" disabled={busy} onClick={() => onCreateEnterpriseInbox('customer_service')}>
+                    Service Inbox
+                  </button>
+                  <button className="btn" disabled={busy} onClick={() => onCreateEnterpriseInbox('sales')}>
+                    Sales Inbox
+                  </button>
+                </>
+              ) : (
+                (enterpriseRoutes || []).map((route) => (
+                  <button key={route.route_key} className="btn" disabled={busy} onClick={() => onCreateEnterpriseInbox(route.route_key)}>
+                    {route.display_name || route.route_key} Inbox
+                  </button>
+                ))
+              )}
             </>
           ) : (
             <button className="btn" disabled={busy} onClick={() => onCreateInbox(selectedInstance.instance_key)}>

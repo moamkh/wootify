@@ -239,7 +239,7 @@ class EnterpriseSessionResponse(BaseModel):
     platform_chat_id: str
     display_name: Optional[str] = None
     phone_number: Optional[str] = None
-    gre_status: str
+    gre_status: Optional[str] = None
     current_state: str
     chatwoot_conversation_id: str
     chatwoot_contact_id: Optional[str] = None

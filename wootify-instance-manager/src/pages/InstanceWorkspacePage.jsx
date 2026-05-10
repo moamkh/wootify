@@ -11,7 +11,7 @@ const SimulationPanel = lazy(() => import('../components/SimulationPanel.jsx'));
 export default function InstanceWorkspacePage({
   activeTab,
   setActiveTab,
-  isEnterpriseBalePlatform,
+  isEnterprisePlatform,
   heroProps,
   formProps,
   mappingProps,
@@ -22,9 +22,9 @@ export default function InstanceWorkspacePage({
   enterpriseSessionsCount,
   enterpriseManualsCount,
 }) {
-  const tabs = isEnterpriseBalePlatform
+  const tabs = isEnterprisePlatform
     ? [
-        { id: 'config', label: 'Configuration', helper: 'Instance, routing, and SMS sync settings' },
+        { id: 'config', label: 'Configuration', helper: 'Instance, routing, and content settings' },
         { id: 'assets', label: 'Assets', helper: `${enterpriseManualsCount} manuals and catalog content` },
         { id: 'operations', label: 'Operations', helper: `${enterpriseSessionsCount} enterprise sessions tracked` },
       ]

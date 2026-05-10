@@ -22,6 +22,7 @@ from app.connectors.registry import connector_registry
 from app.db import SessionLocal
 from app.services.bridge_service import BridgeService
 from app.services.enterprise_bale_service import EnterpriseBaleService
+from app.services.enterprise_telegram_service import EnterpriseTelegramService
 from app.services.instance_service import InstanceService
 
 
@@ -45,6 +46,7 @@ class BalePollingService:
         self._instances = InstanceService()
         self._bridge = BridgeService()
         self._enterprise = EnterpriseBaleService()
+        self._enterprise_telegram = EnterpriseTelegramService()
 
     async def start(self) -> None:
         """Start."""
@@ -166,6 +168,19 @@ class BalePollingService:
                         except Exception as exc:
                             self._logger.error(
                                 'enterprise_update_error instance=%s update_id=%s error_type=%s error=%s',
+                                instance_key,
+                                processed_update_id,
+                                type(exc).__name__,
+                                str(exc),
+                                exc_info=True,
+                            )
+                    elif platform_key == 'telegram_enterprise':
+                        try:
+                            with SessionLocal() as db:
+                                await self._enterprise_telegram.handle_platform_update(db, instance_key, update)
+                        except Exception as exc:
+                            self._logger.error(
+                                'enterprise_telegram_update_error instance=%s update_id=%s error_type=%s error=%s',
                                 instance_key,
                                 processed_update_id,
                                 type(exc).__name__,
