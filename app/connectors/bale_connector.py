@@ -428,6 +428,7 @@ class BaleBotConnector(BaleConnector):
                 "raw": message or result.get("result"),
             }
         except Exception as exc:
+            error_msg = str(exc) or f"{type(exc).__name__}: connector send_text failed"
             self._logger.error(
                 "send_text failed instance=%s chat_id=%s text_len=%s text_is_empty=%s error_type=%s error=%s",
                 instance,
@@ -435,10 +436,10 @@ class BaleBotConnector(BaleConnector):
                 len(text or ""),
                 not str(text or "").strip(),
                 type(exc).__name__,
-                str(exc),
+                error_msg,
                 exc_info=True,
             )
-            raise RuntimeError(str(exc)) from exc
+            raise RuntimeError(error_msg) from exc
 
     async def _resolve_media(
         self, runtime: BaleInstanceRuntime, media_url_or_bytes: Any
@@ -544,15 +545,17 @@ class BaleBotConnector(BaleConnector):
                 "content_type": content_type,
             }
         except Exception as exc:
+            error_msg = str(exc) or f"{type(exc).__name__}: connector send_media failed"
             self._logger.error(
-                "send_media failed instance=%s chat_id=%s filename=%s error=%s",
+                "send_media failed instance=%s chat_id=%s filename=%s error_type=%s error=%s",
                 instance,
                 chat_id,
                 filename,
-                str(exc),
+                type(exc).__name__,
+                error_msg,
                 exc_info=True,
             )
-            raise RuntimeError(str(exc)) from exc
+            raise RuntimeError(error_msg) from exc
 
     async def get_updates(
         self, instance: str, offset: Optional[int] = None, timeout: Optional[int] = None

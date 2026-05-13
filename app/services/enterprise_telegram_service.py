@@ -735,18 +735,30 @@ class EnterpriseTelegramService:
                     reply_markup=self._live_menu_markup(runtime.platform_metadata),
                 )
             for row in pending_rows:
-                await self._deliver_operator_payload(
-                    runtime.instance.instance_key,
-                    runtime=runtime,
-                    chat_id=chat_id,
-                    text=str(row.text_payload or ""),
-                    attachments=row.attachment_payload_json
-                    if isinstance(row.attachment_payload_json, list)
-                    else [],
-                    reply_markup=False,
-                )
-                row.status = EnterprisePendingMessageStatus.delivered
-                row.delivery_error = None
+                try:
+                    await self._deliver_operator_payload(
+                        runtime.instance.instance_key,
+                        runtime=runtime,
+                        chat_id=chat_id,
+                        text=str(row.text_payload or ""),
+                        attachments=row.attachment_payload_json
+                        if isinstance(row.attachment_payload_json, list)
+                        else [],
+                        reply_markup=False,
+                    )
+                    row.status = EnterprisePendingMessageStatus.delivered
+                    row.delivery_error = None
+                except Exception as exc:
+                    logger.warning(
+                        "enterprise_telegram._enter_live_route pending_delivery_failed instance=%s session_id=%s pending_id=%s error_type=%s error=%s",
+                        runtime.instance.instance_key,
+                        session.id,
+                        row.id,
+                        type(exc).__name__,
+                        str(exc),
+                    )
+                    row.status = EnterprisePendingMessageStatus.failed
+                    row.delivery_error = str(exc) or type(exc).__name__
                 self._pending(db).save(row)
             session.unread_notice_sent = False
             session.unread_count = 0
@@ -900,16 +912,26 @@ class EnterpriseTelegramService:
         """Send the accepted message once per session before operator content."""
         if session.accepted_notice_sent:
             return
-        accepted_text = self._route_text(
-            runtime.platform_metadata, route_key, "accepted"
-        ) or self._not_configured_text(runtime.platform_metadata)
-        await self._send_text(
-            instance_key,
-            chat_id,
-            accepted_text,
-            reply_markup=self._live_menu_markup(runtime.platform_metadata),
-        )
-        session.accepted_notice_sent = True
+        try:
+            accepted_text = self._route_text(
+                runtime.platform_metadata, route_key, "accepted"
+            ) or self._not_configured_text(runtime.platform_metadata)
+            await self._send_text(
+                instance_key,
+                chat_id,
+                accepted_text,
+                reply_markup=self._live_menu_markup(runtime.platform_metadata),
+            )
+            session.accepted_notice_sent = True
+        except Exception as exc:
+            logger.warning(
+                "enterprise_telegram._ensure_accepted_notice failed instance=%s session_id=%s route=%s error_type=%s error=%s",
+                instance_key,
+                session.id,
+                route_key,
+                type(exc).__name__,
+                str(exc),
+            )
 
     async def _deliver_operator_payload(
         self,
@@ -922,39 +944,48 @@ class EnterpriseTelegramService:
         reply_markup: Any = False,
     ) -> None:
         """Deliver a Chatwoot operator payload to Telegram."""
-        has_attachments = isinstance(attachments, list) and any(
-            isinstance(item, dict) for item in attachments
-        )
-        if has_attachments:
-            first = True
-            for attachment in attachments:
-                if not isinstance(attachment, dict):
-                    continue
-                media = attachment.get("data_url") or attachment.get("content")
-                if isinstance(media, str) and media.startswith("/"):
-                    media = f"{str(runtime.chatwoot.get('base_url') or '').rstrip('/')}{media}"
-                filename = str(attachment.get("filename") or "file").strip() or "file"
-                caption = str(text or "") if first and text else None
-                await self._send_media(
-                    instance_key,
-                    chat_id,
-                    media,
-                    filename,
-                    caption=caption,
-                    reply_markup=reply_markup if first else False,
-                )
-                first = False
-            if not text:
+        try:
+            has_attachments = isinstance(attachments, list) and any(
+                isinstance(item, dict) for item in attachments
+            )
+            if has_attachments:
+                first = True
+                for attachment in attachments:
+                    if not isinstance(attachment, dict):
+                        continue
+                    media = attachment.get("data_url") or attachment.get("content")
+                    if isinstance(media, str) and media.startswith("/"):
+                        media = f"{str(runtime.chatwoot.get('base_url') or '').rstrip('/')}{media}"
+                    filename = str(attachment.get("filename") or "file").strip() or "file"
+                    caption = str(text or "") if first and text else None
+                    await self._send_media(
+                        instance_key,
+                        chat_id,
+                        media,
+                        filename,
+                        caption=caption,
+                        reply_markup=reply_markup if first else False,
+                    )
+                    first = False
+                if not text:
+                    return
+                if first:
+                    await self._send_text(
+                        instance_key, chat_id, text, reply_markup=reply_markup
+                    )
                 return
-            if first:
+
+            if text:
                 await self._send_text(
                     instance_key, chat_id, text, reply_markup=reply_markup
                 )
-            return
-
-        if text:
-            await self._send_text(
-                instance_key, chat_id, text, reply_markup=reply_markup
+        except Exception as exc:
+            logger.warning(
+                "enterprise_telegram._deliver_operator_payload failed instance=%s chat_id=%s error_type=%s error=%s",
+                instance_key,
+                chat_id,
+                type(exc).__name__,
+                str(exc),
             )
 
     async def _get_or_open_route_session(
@@ -1599,8 +1630,18 @@ class EnterpriseTelegramService:
         self, instance_key: str, chat_id: str, text: str, *, reply_markup: Any = False
     ) -> None:
         """Send text via the Telegram connector."""
-        connector = connector_registry.get("telegram_enterprise")
-        await connector.send_text(instance_key, chat_id, text, reply_markup=reply_markup)
+        try:
+            connector = connector_registry.get("telegram_enterprise")
+            await connector.send_text(instance_key, chat_id, text, reply_markup=reply_markup)
+        except Exception as exc:
+            logger.warning(
+                "enterprise_telegram._send_text failed instance=%s chat_id=%s text_len=%s error_type=%s error=%s",
+                instance_key,
+                chat_id,
+                len(text or ""),
+                type(exc).__name__,
+                str(exc),
+            )
 
     async def _send_media(
         self,
@@ -1613,15 +1654,25 @@ class EnterpriseTelegramService:
         reply_markup: Any = False,
     ) -> None:
         """Send media via the Telegram connector."""
-        connector = connector_registry.get("telegram_enterprise")
-        await connector.send_media(
-            instance_key,
-            chat_id,
-            media,
-            filename,
-            caption=caption,
-            reply_markup=reply_markup,
-        )
+        try:
+            connector = connector_registry.get("telegram_enterprise")
+            await connector.send_media(
+                instance_key,
+                chat_id,
+                media,
+                filename,
+                caption=caption,
+                reply_markup=reply_markup,
+            )
+        except Exception as exc:
+            logger.warning(
+                "enterprise_telegram._send_media failed instance=%s chat_id=%s filename=%s error_type=%s error=%s",
+                instance_key,
+                chat_id,
+                filename,
+                type(exc).__name__,
+                str(exc),
+            )
 
     async def _extract_attachments(
         self, instance_key: str, message: dict[str, Any]

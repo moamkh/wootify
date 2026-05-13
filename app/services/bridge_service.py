@@ -421,7 +421,13 @@ class BridgeService:
                 chatwoot_payload_json=self._payload_or_none(runtime, payload),
             )
             db.commit()
-            raise
+            return {
+                'message': 'delivery_failed',
+                'status': 'failed',
+                'detail': str(exc) or type(exc).__name__,
+                'chatwoot_message_id': str(chatwoot_message_id) if chatwoot_message_id else None,
+                'source_id': source_id,
+            }
 
     async def ingest_platform_event(self, db: Session, instance_key: str, event: dict[str, Any]) -> dict[str, Any]:
         """Ingest platform event."""

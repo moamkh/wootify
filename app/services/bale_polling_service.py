@@ -442,7 +442,17 @@ class BalePollingService:
 
         connector = connector_registry.get(platform_key)
         if command == '/start':
-            await connector.send_text(instance_key, str(chat_id), self._start_message_text(platform_key))
+            try:
+                await connector.send_text(instance_key, str(chat_id), self._start_message_text(platform_key))
+            except Exception as exc:
+                self._logger.warning(
+                    'local_command send_text failed instance=%s chat_id=%s command=%s error_type=%s error=%s',
+                    instance_key,
+                    chat_id,
+                    command,
+                    type(exc).__name__,
+                    str(exc),
+                )
             await self._send_share_phone_prompt_if_needed(
                 instance_key,
                 platform_key=platform_key,

@@ -532,6 +532,18 @@ async def _handle_chatwoot_webhook(
             exc=exc,
             instance_key=instance_key,
         )
+    except RuntimeError as exc:
+        logger.warning(
+            'endpoint=webhook_chatwoot status=200 detail=delivery_failed instance_key=%s route_key=%s error=%s',
+            instance_key,
+            route_key,
+            str(exc),
+        )
+        return GenericMessageResponse(
+            message='delivery_failed',
+            detail=str(exc),
+            status='failed',
+        )
     except Exception as exc:
         _raise_http_error(
             status_code=500,
