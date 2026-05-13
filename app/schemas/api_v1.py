@@ -321,3 +321,20 @@ class EnterpriseManualGroupUpdateRequest(BaseModel):
 class EnterpriseManualGroupManualsResponse(BaseModel):
     """Response schema for manuals in an enterprise manual group."""
     items: list[EnterpriseDocumentAssetResponse]
+
+
+class EnterpriseManualGroupWithManualsResponse(BaseModel):
+    """Response schema for an enterprise manual group including its manuals."""
+    id: str
+    name: str
+    sort_order: int
+    is_active: bool
+    created_at: datetime
+    updated_at: datetime
+    manuals: list[EnterpriseDocumentAssetResponse]
+
+
+class EnterpriseManualGroupsWithManualsResponse(BaseModel):
+    """Response schema for all enterprise manual groups with their manuals."""
+    groups: list[EnterpriseManualGroupWithManualsResponse]
+    manual_group_map: dict[str, str]

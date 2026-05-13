@@ -30,6 +30,8 @@ from app.schemas.api_v1 import (
     EnterpriseManualGroupManualsResponse,
     EnterpriseManualGroupResponse,
     EnterpriseManualGroupUpdateRequest,
+    EnterpriseManualGroupsWithManualsResponse,
+    EnterpriseManualGroupWithManualsResponse,
     EnterpriseRouteInboxResponse,
     EnterpriseSessionListResponse,
     EnterpriseSessionResponse,
@@ -1072,6 +1074,32 @@ def list_enterprise_manual_group_manuals(instance_key: str, group_id: str, db: S
         _raise_http_error(status_code=400, detail=str(exc), endpoint='list_enterprise_manual_group_manuals', exc=exc, instance_key=instance_key, group_id=group_id)
     except Exception as exc:
         _raise_http_error(status_code=500, detail='internal server error', endpoint='list_enterprise_manual_group_manuals', exc=exc, instance_key=instance_key, group_id=group_id)
+
+
+@router.get('/instances/{instance_key}/enterprise/manual-groups-with-manuals', response_model=EnterpriseManualGroupsWithManualsResponse)
+def list_enterprise_manual_groups_with_manuals(instance_key: str, db: Session = Depends(get_db)):
+    """List all manual groups for an instance with their manuals in a single batch."""
+    try:
+        payload = enterprise_manual_groups.list_groups_with_manuals(db, instance_key)
+        groups = []
+        for group in payload['groups']:
+            groups.append(EnterpriseManualGroupWithManualsResponse(
+                id=group['id'],
+                name=group['name'],
+                sort_order=group['sort_order'],
+                is_active=group['is_active'],
+                created_at=group['created_at'],
+                updated_at=group['updated_at'],
+                manuals=[_enterprise_asset_to_response(m) for m in group['manuals']],
+            ))
+        return EnterpriseManualGroupsWithManualsResponse(
+            groups=groups,
+            manual_group_map=payload['manual_group_map'],
+        )
+    except ValueError as exc:
+        _raise_http_error(status_code=400, detail=str(exc), endpoint='list_enterprise_manual_groups_with_manuals', exc=exc, instance_key=instance_key)
+    except Exception as exc:
+        _raise_http_error(status_code=500, detail='internal server error', endpoint='list_enterprise_manual_groups_with_manuals', exc=exc, instance_key=instance_key)
 
 
 @router.post('/instances/{instance_key}/enterprise/manual-groups/{group_id}/manuals/{asset_id}', response_model=GenericMessageResponse, status_code=status.HTTP_201_CREATED)

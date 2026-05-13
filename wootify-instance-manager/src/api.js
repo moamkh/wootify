@@ -190,6 +190,10 @@ export async function listEnterpriseManualGroupManuals(instanceKey, groupId) {
   return data?.items || [];
 }
 
+export async function listEnterpriseManualGroupsWithManuals(instanceKey) {
+  return fetchJSON(`/api/v1/instances/${encodeURIComponent(instanceKey)}/enterprise/manual-groups-with-manuals`);
+}
+
 export function addManualToEnterpriseGroup(instanceKey, groupId, assetId) {
   return fetchJSON(`/api/v1/instances/${encodeURIComponent(instanceKey)}/enterprise/manual-groups/${encodeURIComponent(groupId)}/manuals/${encodeURIComponent(assetId)}`, {
     method: 'POST',

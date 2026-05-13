@@ -7,10 +7,10 @@ Documentation Standard: module/class/public-method docstrings.
 
 from __future__ import annotations
 
-from typing import Optional
+from typing import Any, Optional
 from uuid import uuid4
 
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, selectinload
 
 from app.models import EnterpriseDocumentAsset, EnterpriseManualGroup, EnterpriseManualGroupAssignment
 from app.repositories.enterprise_document_asset_repository import EnterpriseDocumentAssetRepository
@@ -124,6 +124,58 @@ class EnterpriseManualGroupService:
 
         asset_repo = EnterpriseDocumentAssetRepository(db)
         return asset_repo.list_by_group(group_id, active_only=True)
+
+    def list_groups_with_manuals(
+        self,
+        db: Session,
+        instance_key: str,
+    ) -> dict[str, Any]:
+        """List all manual groups for an instance with their manuals in a single query batch.
+
+        Returns a dict with:
+        - groups: list of groups, each with 'manuals' list
+        - manual_group_map: dict mapping manual asset id -> group id
+        """
+        instance = self._get_instance(db, instance_key)
+
+        groups = (
+            db.query(EnterpriseManualGroup)
+            .filter(
+                EnterpriseManualGroup.instance_id == instance.id,
+                EnterpriseManualGroup.is_active.is_(True),
+            )
+            .order_by(EnterpriseManualGroup.sort_order)
+            .options(
+                selectinload(EnterpriseManualGroup.assignments)
+                .selectinload(EnterpriseManualGroupAssignment.asset)
+            )
+            .all()
+        )
+
+        result_groups = []
+        manual_group_map: dict[str, str] = {}
+
+        for group in groups:
+            manuals = []
+            for assignment in group.assignments:
+                asset = assignment.asset
+                if asset and asset.is_active:
+                    manuals.append(asset)
+                    manual_group_map[asset.id] = group.id
+            result_groups.append({
+                'id': group.id,
+                'name': group.name,
+                'sort_order': group.sort_order,
+                'is_active': group.is_active,
+                'created_at': group.created_at,
+                'updated_at': group.updated_at,
+                'manuals': manuals,
+            })
+
+        return {
+            'groups': result_groups,
+            'manual_group_map': manual_group_map,
+        }
 
     def add_manual_to_group(
         self,

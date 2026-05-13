@@ -22,7 +22,7 @@ import {
   listConversations,
   listEnterpriseManuals,
   listEnterpriseManualGroups,
-  listEnterpriseManualGroupManuals,
+  listEnterpriseManualGroupsWithManuals,
   listEnterpriseSessions,
   listFeatures,
   listInstances,
@@ -550,29 +550,15 @@ export default function App() {
       return;
     }
 
-    const [manuals, groups, catalog, sessions] = await Promise.all([
+    const [manuals, groupsPayload, catalog, sessions] = await Promise.all([
       listEnterpriseManuals(instanceKey),
-      listEnterpriseManualGroups(instanceKey),
+      listEnterpriseManualGroupsWithManuals(instanceKey),
       getEnterpriseCatalog(instanceKey),
       listEnterpriseSessions(instanceKey),
     ]);
-    const groupManualLists = await Promise.all(
-      (groups || []).map(async (group) => ({
-        groupId: group.id,
-        manuals: await listEnterpriseManualGroupManuals(instanceKey, group.id),
-      })),
-    );
-    const groupMap = {};
-    for (const entry of groupManualLists) {
-      for (const manual of entry.manuals || []) {
-        if (manual?.id) {
-          groupMap[manual.id] = entry.groupId;
-        }
-      }
-    }
     setEnterpriseManuals(manuals || []);
-    setEnterpriseManualGroups(groups || []);
-    setManualGroupByAssetId(groupMap);
+    setEnterpriseManualGroups(groupsPayload?.groups || []);
+    setManualGroupByAssetId(groupsPayload?.manual_group_map || {});
     setEnterpriseCatalog(catalog || null);
     setEnterpriseSessions(sessions || []);
   }
