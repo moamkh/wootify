@@ -228,3 +228,7 @@ export function runEnterpriseSmsSyncNow(instanceKey) {
     method: 'POST',
   });
 }
+
+export function getVersion() {
+  return fetchJSON('/api/v1/version');
+}

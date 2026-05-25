@@ -37,6 +37,7 @@ import {
   renameEnterpriseManualGroup,
   addManualToEnterpriseGroup,
   removeManualFromEnterpriseGroup,
+  getVersion,
 } from './api.js';
 import PageLoader from './components/PageLoader.jsx';
 
@@ -450,6 +451,7 @@ export default function App() {
   const [catalogDisplayName, setCatalogDisplayName] = useState('');
   const [catalogLinkUrl, setCatalogLinkUrl] = useState('');
   const [catalogFile, setCatalogFile] = useState(null);
+  const [version, setVersion] = useState('');
 
   const selectedPlatform = useMemo(
     () => platformTypes.find((item) => item.key === form.platform_type_key) || null,
@@ -565,6 +567,12 @@ export default function App() {
 
   useEffect(() => {
     refreshBootstrap();
+  }, []);
+
+  useEffect(() => {
+    getVersion()
+      .then((data) => setVersion(data?.version || ''))
+      .catch(() => setVersion(''));
   }, []);
 
   async function loadConversations(instanceKey, q = '') {
@@ -1349,7 +1357,10 @@ export default function App() {
       <header className="header app-header">
         <div>
           <p className="section-eyebrow">Wootify control plane</p>
-          <h1>{isDetailView ? 'Instance Workspace' : 'Wootify Admin Console'}</h1>
+          <h1>
+            {isDetailView ? 'Instance Workspace' : 'Wootify Admin Console'}
+            {version ? <span className="version-badge">v{version}</span> : null}
+          </h1>
           <p className="muted">
             {isDetailView
               ? 'A structured operational workspace for configuration, observability, and enterprise workflows.'
@@ -1403,7 +1414,7 @@ export default function App() {
           <InstanceWorkspacePage
             activeTab={activeTab}
             setActiveTab={setActiveTab}
-            isEnterpriseBalePlatform={isEnterpriseBalePlatform}
+            isEnterprisePlatform={isEnterprisePlatform}
             heroProps={heroProps}
             formProps={formProps}
             mappingProps={mappingProps}

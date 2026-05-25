@@ -9,6 +9,7 @@ from __future__ import annotations
 import base64
 import binascii
 import logging
+from pathlib import Path
 from typing import Any, Optional
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile, status
@@ -1280,4 +1281,12 @@ def list_conversation_messages(instance_key: str, conversation_id: str, db: Sess
             instance_key=instance_key,
             conversation_id=conversation_id,
         )
+
+
+@router.get('/version')
+async def get_version() -> dict[str, str]:
+    """Return the current application version from the VERSION file."""
+    version_file = Path(__file__).resolve().parents[2] / 'VERSION'
+    version = version_file.read_text(encoding='utf-8').strip() if version_file.exists() else 'unknown'
+    return {'version': version}
 
