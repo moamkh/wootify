@@ -28,6 +28,7 @@ import {
   listInstances,
   listPlatformTypes,
   replaceEnterpriseCatalog,
+  patchEnterpriseCatalog,
   runEnterpriseSmsSyncNow,
   simulatePlatformEvent,
   uploadEnterpriseManual,
@@ -451,6 +452,9 @@ export default function App() {
   const [catalogDisplayName, setCatalogDisplayName] = useState('');
   const [catalogLinkUrl, setCatalogLinkUrl] = useState('');
   const [catalogFile, setCatalogFile] = useState(null);
+  const [editingCatalog, setEditingCatalog] = useState(false);
+  const [editingCatalogDisplayName, setEditingCatalogDisplayName] = useState('');
+  const [editingCatalogLinkUrl, setEditingCatalogLinkUrl] = useState('');
   const [version, setVersion] = useState('');
 
   const selectedPlatform = useMemo(
@@ -1090,16 +1094,12 @@ export default function App() {
       alert('Save the instance first');
       return;
     }
-    if (!catalogFile) {
-      alert('Catalog PDF file is required');
+    if (!catalogLinkUrl.trim()) {
+      alert('Catalog link URL is required');
       return;
     }
     setBusy(true);
     try {
-      if (!catalogLinkUrl.trim()) {
-        alert('Catalog link URL is required');
-        return;
-      }
       await replaceEnterpriseCatalog(selectedKey, {
         displayName: catalogDisplayName.trim(),
         linkUrl: catalogLinkUrl.trim(),
@@ -1108,6 +1108,44 @@ export default function App() {
       setCatalogDisplayName('');
       setCatalogLinkUrl('');
       setCatalogFile(null);
+      await loadEnterpriseResources(selectedKey);
+    } catch (e) {
+      alert(e?.message || String(e));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  function onStartEditCatalog() {
+    if (!enterpriseCatalog) return;
+    setEditingCatalog(true);
+    setEditingCatalogDisplayName(enterpriseCatalog.display_name || enterpriseCatalog.original_filename || '');
+    setEditingCatalogLinkUrl(enterpriseCatalog.link_url || '');
+  }
+
+  function onCancelEditCatalog() {
+    setEditingCatalog(false);
+    setEditingCatalogDisplayName('');
+    setEditingCatalogLinkUrl('');
+  }
+
+  async function onSaveEditCatalog() {
+    if (!selectedKey || !enterpriseCatalog) return;
+    const nextName = editingCatalogDisplayName.trim();
+    const nextLink = editingCatalogLinkUrl.trim();
+    if (!nextName) {
+      alert('Display name is required');
+      return;
+    }
+    setBusy(true);
+    try {
+      await patchEnterpriseCatalog(selectedKey, {
+        display_name: nextName,
+        link_url: nextLink,
+      });
+      setEditingCatalog(false);
+      setEditingCatalogDisplayName('');
+      setEditingCatalogLinkUrl('');
       await loadEnterpriseResources(selectedKey);
     } catch (e) {
       alert(e?.message || String(e));
@@ -1338,6 +1376,15 @@ export default function App() {
     onDeleteGroupFromManualEdit,
     onReplaceCatalog,
     onDeleteCatalog,
+    editingCatalog,
+    setEditingCatalog,
+    editingCatalogDisplayName,
+    setEditingCatalogDisplayName,
+    editingCatalogLinkUrl,
+    setEditingCatalogLinkUrl,
+    onStartEditCatalog,
+    onSaveEditCatalog,
+    onCancelEditCatalog,
   };
 
   const enterpriseOperationsProps = {

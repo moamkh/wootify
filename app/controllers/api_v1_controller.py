@@ -972,7 +972,7 @@ async def replace_enterprise_catalog(
     instance_key: str,
     display_name: Optional[str] = Form(None),
     link_url: str = Form(...),
-    file: UploadFile = File(...),
+    file: Optional[UploadFile] = File(None),
     db: Session = Depends(get_db),
 ):
     """Replace the enterprise catalog asset."""
@@ -989,6 +989,29 @@ async def replace_enterprise_catalog(
         _raise_http_error(status_code=400, detail=str(exc), endpoint='replace_enterprise_catalog', exc=exc, instance_key=instance_key)
     except Exception as exc:
         _raise_http_error(status_code=500, detail='internal server error', endpoint='replace_enterprise_catalog', exc=exc, instance_key=instance_key)
+
+
+@router.patch('/instances/{instance_key}/enterprise/catalog', response_model=EnterpriseDocumentAssetResponse)
+def patch_enterprise_catalog(
+    instance_key: str,
+    body: EnterpriseDocumentAssetPatchRequest,
+    db: Session = Depends(get_db),
+):
+    """Update catalog display name and/or link URL without changing file content."""
+    try:
+        row = enterprise_documents.update_catalog_metadata(
+            db,
+            instance_key,
+            display_name=body.display_name,
+            link_url=body.link_url,
+        )
+        if not row:
+            _raise_http_error(status_code=404, detail='catalog not found', endpoint='patch_enterprise_catalog', instance_key=instance_key)
+        return _enterprise_asset_to_response(row)
+    except ValueError as exc:
+        _raise_http_error(status_code=400, detail=str(exc), endpoint='patch_enterprise_catalog', exc=exc, instance_key=instance_key)
+    except Exception as exc:
+        _raise_http_error(status_code=500, detail='internal server error', endpoint='patch_enterprise_catalog', exc=exc, instance_key=instance_key)
 
 
 @router.delete('/instances/{instance_key}/enterprise/catalog', response_model=GenericMessageResponse)

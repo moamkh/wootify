@@ -147,10 +147,20 @@ export function replaceEnterpriseCatalog(instanceKey, { displayName, linkUrl, fi
     body.append('display_name', displayName);
   }
   body.append('link_url', linkUrl);
-  body.append('file', file);
+  if (file) {
+    body.append('file', file);
+  }
   return fetchFormJSON(`/api/v1/instances/${encodeURIComponent(instanceKey)}/enterprise/catalog`, {
     method: 'PUT',
     body,
+  });
+}
+
+export function patchEnterpriseCatalog(instanceKey, body) {
+  return fetchJSON(`/api/v1/instances/${encodeURIComponent(instanceKey)}/enterprise/catalog`, {
+    method: 'PATCH',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
   });
 }
 

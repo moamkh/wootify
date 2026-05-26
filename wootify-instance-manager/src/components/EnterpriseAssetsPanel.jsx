@@ -24,6 +24,11 @@ export default function EnterpriseAssetsPanel({
   catalogLinkUrl,
   setCatalogLinkUrl,
   setCatalogFile,
+  editingCatalog,
+  editingCatalogDisplayName,
+  setEditingCatalogDisplayName,
+  editingCatalogLinkUrl,
+  setEditingCatalogLinkUrl,
   onUploadManual,
   onDeleteManual,
   onStartEditManual,
@@ -34,6 +39,9 @@ export default function EnterpriseAssetsPanel({
   onDeleteGroupFromManualEdit,
   onReplaceCatalog,
   onDeleteCatalog,
+  onStartEditCatalog,
+  onSaveEditCatalog,
+  onCancelEditCatalog,
 }) {
   return (
     <section className="card section-stack">
@@ -193,7 +201,7 @@ export default function EnterpriseAssetsPanel({
             />
           </label>
           <label>
-            PDF File
+            PDF File (optional)
             <input type="file" accept="application/pdf,.pdf" onChange={(e) => setCatalogFile(e.target.files?.[0] || null)} />
           </label>
         </div>
@@ -201,27 +209,62 @@ export default function EnterpriseAssetsPanel({
           <button className="btn" type="button" disabled={busy || !selectedKey} onClick={onReplaceCatalog}>
             Upload or Replace Catalog
           </button>
-          <button className="btn danger" type="button" disabled={busy || !enterpriseCatalog} onClick={onDeleteCatalog}>
-            Delete Catalog
-          </button>
         </div>
         {enterpriseCatalog ? (
           <div className="list-item">
             <div className="list-main">
-              <div className="list-title">{enterpriseCatalog.display_name || enterpriseCatalog.original_filename}</div>
-              <div className="list-meta">
-                {enterpriseCatalog.original_filename} · {(enterpriseCatalog.size_bytes / 1024).toFixed(1)} KB
-              </div>
-              <div className="list-meta">
-                Link:{' '}
-                {enterpriseCatalog.link_url ? (
-                  <a href={enterpriseCatalog.link_url} target="_blank" rel="noreferrer">
-                    {enterpriseCatalog.link_url}
-                  </a>
-                ) : (
-                  '-'
-                )}
-              </div>
+              {editingCatalog ? (
+                <div className="form">
+                  <div className="row">
+                    <label>
+                      Display Name
+                      <input value={editingCatalogDisplayName} onChange={(e) => setEditingCatalogDisplayName(e.target.value)} />
+                    </label>
+                    <label>
+                      Link URL
+                      <input type="url" value={editingCatalogLinkUrl} onChange={(e) => setEditingCatalogLinkUrl(e.target.value)} />
+                    </label>
+                  </div>
+                </div>
+              ) : (
+                <>
+                  <div className="list-title">{enterpriseCatalog.display_name || enterpriseCatalog.original_filename}</div>
+                  {enterpriseCatalog.original_filename ? (
+                    <div className="list-meta">
+                      {enterpriseCatalog.original_filename} · {(enterpriseCatalog.size_bytes / 1024).toFixed(1)} KB
+                    </div>
+                  ) : null}
+                  <div className="list-meta">
+                    Link:{' '}
+                    {enterpriseCatalog.link_url ? (
+                      <a href={enterpriseCatalog.link_url} target="_blank" rel="noreferrer">
+                        {enterpriseCatalog.link_url}
+                      </a>
+                    ) : (
+                      '-'
+                    )}
+                  </div>
+                </>
+              )}
+            </div>
+            <div className="list-actions">
+              {editingCatalog ? (
+                <>
+                  <button className="btn" type="button" disabled={busy} onClick={onSaveEditCatalog}>
+                    Save
+                  </button>
+                  <button className="btn ghost" type="button" disabled={busy} onClick={onCancelEditCatalog}>
+                    Cancel
+                  </button>
+                </>
+              ) : (
+                <button className="btn" type="button" disabled={busy} onClick={onStartEditCatalog}>
+                  Edit
+                </button>
+              )}
+              <button className="btn danger" type="button" disabled={busy} onClick={onDeleteCatalog}>
+                Delete
+              </button>
             </div>
           </div>
         ) : (

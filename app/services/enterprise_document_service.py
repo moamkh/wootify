@@ -90,45 +90,70 @@ class EnterpriseDocumentService:
         *,
         display_name: Optional[str],
         link_url: str,
-        upload: UploadFile,
+        upload: Optional[UploadFile],
     ) -> EnterpriseDocumentAsset:
         """Replace the active enterprise catalog."""
         runtime = self._require_enterprise_runtime(db, instance_key)
         normalized_link_url = self._normalize_required_link_url(link_url)
-        filename = self._safe_filename(upload.filename)
-        if not filename:
-            raise ValueError('catalog file is required')
-        content, resolved_content_type = await self._read_and_validate_pdf(upload, filename)
 
         repo = self._repo_cls(db)
         existing = repo.get_active_catalog(runtime.instance.id)
-        relative_path = self._write_file(
-            instance_key,
-            folder='catalog',
-            filename=filename,
-            content=content,
-        )
 
-        repo.deactivate_catalogs(runtime.instance.id)
-        row = EnterpriseDocumentAsset(
-            instance_id=runtime.instance.id,
-            asset_type=EnterpriseDocumentAssetType.catalog,
-            display_name=str(display_name or '').strip() or Path(filename).stem,
-            link_url=normalized_link_url,
-            storage_path=relative_path.as_posix(),
-            original_filename=filename,
-            content_type=resolved_content_type,
-            size_bytes=len(content),
-            sort_order=1,
-            is_active=True,
-        )
-        repo.save(row)
+        if upload is not None:
+            filename = self._safe_filename(upload.filename)
+            if not filename:
+                raise ValueError('catalog file is required')
+            content, resolved_content_type = await self._read_and_validate_pdf(upload, filename)
+            relative_path = self._write_file(
+                instance_key,
+                folder='catalog',
+                filename=filename,
+                content=content,
+            )
+
+            repo.deactivate_catalogs(runtime.instance.id)
+            row = EnterpriseDocumentAsset(
+                instance_id=runtime.instance.id,
+                asset_type=EnterpriseDocumentAssetType.catalog,
+                display_name=str(display_name or '').strip() or Path(filename).stem,
+                link_url=normalized_link_url,
+                storage_path=relative_path.as_posix(),
+                original_filename=filename,
+                content_type=resolved_content_type,
+                size_bytes=len(content),
+                sort_order=1,
+                is_active=True,
+            )
+            repo.save(row)
+            db.commit()
+            db.refresh(row)
+
+            if existing:
+                self._delete_file_quietly(existing.storage_path)
+            return row
+
+        # No upload: update metadata of existing catalog
+        if not existing:
+            raise ValueError('catalog file is required for initial upload')
+
+        changed = False
+        if display_name is not None:
+            normalized_name = str(display_name).strip()
+            if not normalized_name:
+                raise ValueError('display_name cannot be empty')
+            existing.display_name = normalized_name
+            changed = True
+
+        existing.link_url = normalized_link_url
+        changed = True
+
+        if not changed:
+            raise ValueError('nothing to update')
+
+        repo.save(existing)
         db.commit()
-        db.refresh(row)
-
-        if existing:
-            self._delete_file_quietly(existing.storage_path)
-        return row
+        db.refresh(existing)
+        return existing
 
     def delete_asset(self, db: Session, instance_key: str, asset_id: str) -> bool:
         """Delete a manual or catalog asset."""
@@ -158,6 +183,42 @@ class EnterpriseDocumentService:
             return None
         if row.asset_type != EnterpriseDocumentAssetType.manual:
             raise ValueError('asset is not a manual')
+
+        changed = False
+        if display_name is not None:
+            normalized_name = str(display_name).strip()
+            if not normalized_name:
+                raise ValueError('display_name cannot be empty')
+            row.display_name = normalized_name
+            changed = True
+
+        if link_url is not None:
+            row.link_url = self._normalize_optional_link_url(link_url)
+            changed = True
+
+        if not changed:
+            raise ValueError('nothing to update')
+
+        self._repo_cls(db).save(row)
+        db.commit()
+        db.refresh(row)
+        return row
+
+    def update_catalog_metadata(
+        self,
+        db: Session,
+        instance_key: str,
+        *,
+        display_name: Optional[str] = None,
+        link_url: Optional[str] = None,
+    ) -> Optional[EnterpriseDocumentAsset]:
+        """Update catalog display name and/or link URL without changing file content."""
+        runtime = self._require_enterprise_runtime(db, instance_key)
+        row = self._repo_cls(db).get_active_catalog(runtime.instance.id)
+        if not row or row.instance_id != runtime.instance.id:
+            return None
+        if row.asset_type != EnterpriseDocumentAssetType.catalog:
+            raise ValueError('asset is not a catalog')
 
         changed = False
         if display_name is not None:
