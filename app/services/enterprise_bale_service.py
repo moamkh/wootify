@@ -1415,7 +1415,6 @@ class EnterpriseBaleService:
             user,
             chat_id,
             platform_metadata=runtime.platform_metadata,
-            send_prompt_text=False,
         )
 
     async def _enter_live_route(
@@ -2295,6 +2294,7 @@ class EnterpriseBaleService:
         send_prompt_text: bool = True,
     ) -> None:
         """Render the correct GRE-root menu."""
+        user.current_group_id = None
         markup = self._root_menu_markup(user.gre_status)
         prompt_text = (
             self._message_text(
