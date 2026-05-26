@@ -62,6 +62,10 @@ USER_MANUAL_LINK_TEMPLATE = (
     "برای دریافت راهنمای کاربری مورد نظر بر روی متن زیر ضربه بزنید:\n"
     "[{{user_manual_name}}]({{user_manual_url}})"
 )
+CATALOG_LINK_TEMPLATE = (
+    "برای دریافت کاتالوگ محصولات بر روی متن زیر ضربه بزنید:\n"
+    "[{{catalog_name}}]({{catalog_url}})"
+)
 
 # Hardcoded Persian button defaults
 BACK_LABEL = "بازگشت به منو"
@@ -1357,15 +1361,40 @@ class EnterpriseTelegramService:
                 reply_markup=self._root_menu_markup(cfg),
             )
             return
-        asset_row, content = self._documents.read_asset_bytes(db, catalog.id)
-        await self._send_media(
-            runtime.instance.instance_key,
-            chat_id,
-            content,
-            asset_row.original_filename,
-            caption=asset_row.display_name or None,
-            reply_markup=self._remove_keyboard_markup(),
-        )
+        resolved_link = str(catalog.link_url or "").strip()
+        if resolved_link:
+            safe_url = resolved_link.replace(" ", "%20")
+            display_name = (
+                str(catalog.display_name or "").strip()
+                or str(catalog.original_filename or "").strip()
+                or safe_url
+            )
+            template = self._message_text(
+                cfg,
+                "enterprise_catalog_link_template",
+                CATALOG_LINK_TEMPLATE,
+            )
+            message = (
+                template
+                .replace("{{catalog_name}}", display_name)
+                .replace("{{catalog_url}}", safe_url)
+            )
+            await self._send_text(
+                runtime.instance.instance_key,
+                chat_id,
+                message,
+                reply_markup=self._remove_keyboard_markup(),
+            )
+        else:
+            asset_row, content = self._documents.read_asset_bytes(db, catalog.id)
+            await self._send_media(
+                runtime.instance.instance_key,
+                chat_id,
+                content,
+                asset_row.original_filename,
+                caption=asset_row.display_name or None,
+                reply_markup=self._remove_keyboard_markup(),
+            )
         await self._show_root_menu(
             runtime.instance.instance_key, user, chat_id, platform_metadata=cfg
         )
