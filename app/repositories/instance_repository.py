@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from typing import Optional
 
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, selectinload
 
 from app.models import Instance
 
@@ -20,8 +20,17 @@ class InstanceRepository:
         self.db = db
 
     def list_all(self) -> list[Instance]:
-        """List all."""
-        return self.db.query(Instance).order_by(Instance.instance_key.asc()).all()
+        """List all with eagerly loaded relationships."""
+        return (
+            self.db.query(Instance)
+            .options(
+                selectinload(Instance.platform_type),
+                selectinload(Instance.runtime_state),
+                selectinload(Instance.feature_overrides),
+            )
+            .order_by(Instance.instance_key.asc())
+            .all()
+        )
 
     def get_by_key(self, instance_key: str) -> Optional[Instance]:
         """Get by key."""

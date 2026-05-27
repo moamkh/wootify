@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from typing import Optional
 
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, selectinload
 
 from app.models import Conversation
 
@@ -20,10 +20,14 @@ class ConversationRepository:
         self.db = db
 
     def list_by_instance(self, instance_id: str) -> list[Conversation]:
-        """List by instance."""
+        """List by instance with eagerly loaded relationships."""
         return (
             self.db.query(Conversation)
             .filter(Conversation.instance_id == str(instance_id))
+            .options(
+                selectinload(Conversation.message_mappings),
+                selectinload(Conversation.runtime_state),
+            )
             .order_by(Conversation.is_active.desc(), Conversation.updated_at.desc())
             .all()
         )

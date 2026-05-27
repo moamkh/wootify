@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from typing import Optional
 
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, selectinload
 
 from app.models import EnterpriseTelegramSession, EnterpriseTelegramUser, EnterpriseSessionStatus
 
@@ -67,11 +67,15 @@ class EnterpriseTelegramSessionRepository:
         )
 
     def list_by_instance(self, instance_id: str) -> list[EnterpriseTelegramSession]:
-        """List sessions for an instance."""
+        """List sessions for an instance with eagerly loaded user and pending messages."""
         return (
             self.db.query(EnterpriseTelegramSession)
             .join(EnterpriseTelegramSession.user)
             .filter(EnterpriseTelegramUser.instance_id == str(instance_id))
+            .options(
+                selectinload(EnterpriseTelegramSession.user),
+                selectinload(EnterpriseTelegramSession.pending_messages),
+            )
             .order_by(EnterpriseTelegramSession.updated_at.desc(), EnterpriseTelegramSession.created_at.desc())
             .all()
         )

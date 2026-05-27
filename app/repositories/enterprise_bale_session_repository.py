@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from typing import Optional
 
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, selectinload
 
 from app.models import EnterpriseBaleSession, EnterpriseBaleUser, EnterpriseSessionStatus
 
@@ -67,11 +67,15 @@ class EnterpriseBaleSessionRepository:
         )
 
     def list_by_instance(self, instance_id: str) -> list[EnterpriseBaleSession]:
-        """List sessions for an instance."""
+        """List sessions for an instance with eagerly loaded user and pending messages."""
         return (
             self.db.query(EnterpriseBaleSession)
             .join(EnterpriseBaleSession.user)
             .filter(EnterpriseBaleUser.instance_id == str(instance_id))
+            .options(
+                selectinload(EnterpriseBaleSession.user),
+                selectinload(EnterpriseBaleSession.pending_messages),
+            )
             .order_by(EnterpriseBaleSession.updated_at.desc(), EnterpriseBaleSession.created_at.desc())
             .all()
         )

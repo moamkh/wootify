@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from typing import Optional
 
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, selectinload
 
 from app.models import EnterpriseDocumentAsset, EnterpriseDocumentAssetType, EnterpriseManualGroupAssignment
 
@@ -93,7 +93,11 @@ class EnterpriseDocumentAssetRepository:
         )
         if active_only:
             query = query.filter(EnterpriseDocumentAsset.is_active.is_(True))
-        return query.order_by(EnterpriseManualGroupAssignment.sort_order).all()
+        return (
+            query.options(selectinload(EnterpriseDocumentAsset.group_assignments))
+            .order_by(EnterpriseManualGroupAssignment.sort_order)
+            .all()
+        )
 
     def list_unassigned_for_instance(
         self,

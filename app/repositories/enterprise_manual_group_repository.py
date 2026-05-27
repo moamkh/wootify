@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from typing import Optional
 
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, selectinload
 
 from app.models import EnterpriseManualGroup
 
@@ -37,7 +37,11 @@ class EnterpriseManualGroupRepository:
         )
         if active_only:
             query = query.filter(EnterpriseManualGroup.is_active.is_(True))
-        return query.order_by(EnterpriseManualGroup.sort_order).all()
+        return (
+            query.options(selectinload(EnterpriseManualGroup.assignments))
+            .order_by(EnterpriseManualGroup.sort_order)
+            .all()
+        )
 
     def get_by_name(self, instance_id: str, name: str) -> Optional[EnterpriseManualGroup]:
         """Get a manual group by instance and name."""

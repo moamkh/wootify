@@ -281,6 +281,18 @@ class Conversation(Base):
             "chatwoot_conversation_id",
             name="uq_instance_chatwoot_conversation",
         ),
+        Index(
+            "ix_conversations_instance_platform_active",
+            "instance_id",
+            "platform_conversation_id",
+            "is_active",
+        ),
+        Index(
+            "ix_conversations_instance_chatwoot_active",
+            "instance_id",
+            "chatwoot_conversation_id",
+            "is_active",
+        ),
     )
 
     id = Column(String(36), primary_key=True, default=_uuid)
@@ -412,6 +424,11 @@ class EnterpriseBaleUser(Base):
             "platform_chat_id",
             name="uq_enterprise_bale_user_instance_chat",
         ),
+        Index(
+            "ix_enterprise_bale_users_instance_state",
+            "instance_id",
+            "current_state",
+        ),
     )
 
     id = Column(String(36), primary_key=True, default=_uuid)
@@ -461,6 +478,14 @@ class EnterpriseBaleSession(Base):
     """Represents a route-specific enterprise live-chat session."""
 
     __tablename__ = "enterprise_bale_sessions"
+    __table_args__ = (
+        Index(
+            "ix_enterprise_bale_sessions_user_route_status",
+            "user_id",
+            "route_key",
+            "status",
+        ),
+    )
 
     id = Column(String(36), primary_key=True, default=_uuid)
     user_id = Column(
@@ -545,6 +570,15 @@ class EnterpriseDocumentAsset(Base):
     """Represents a stored enterprise manual or catalog asset."""
 
     __tablename__ = "enterprise_document_assets"
+    __table_args__ = (
+        Index(
+            "ix_enterprise_document_assets_instance_type_active_sort",
+            "instance_id",
+            "asset_type",
+            "is_active",
+            "sort_order",
+        ),
+    )
 
     id = Column(String(36), primary_key=True, default=_uuid)
     instance_id = Column(
@@ -664,6 +698,11 @@ class EnterpriseTelegramUser(Base):
             "platform_chat_id",
             name="uq_enterprise_telegram_user_instance_chat",
         ),
+        Index(
+            "ix_enterprise_telegram_users_instance_state",
+            "instance_id",
+            "current_state",
+        ),
     )
 
     id = Column(String(36), primary_key=True, default=_uuid)
@@ -704,6 +743,14 @@ class EnterpriseTelegramSession(Base):
     """Represents a route-specific enterprise Telegram live-chat session."""
 
     __tablename__ = "enterprise_telegram_sessions"
+    __table_args__ = (
+        Index(
+            "ix_enterprise_telegram_sessions_user_route_status",
+            "user_id",
+            "route_key",
+            "status",
+        ),
+    )
 
     id = Column(String(36), primary_key=True, default=_uuid)
     user_id = Column(
