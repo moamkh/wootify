@@ -93,7 +93,8 @@ class EnterpriseTelegramService:
         self._sessions = EnterpriseTelegramSessionRepository
         self._pending = EnterpriseTelegramPendingMessageRepository
         self._documents = EnterpriseDocumentService()
-        self._clients: dict[str, ChatwootClient] = {}
+        self._clients: TTLCache[str, ChatwootClient] = TTLCache(maxsize=50, ttl=3600)
+        self._menu_label_cache: TTLCache[str, set[str]] = TTLCache(maxsize=50, ttl=60)
 
     # ------------------------------------------------------------------
     # Public API
@@ -126,6 +127,7 @@ class EnterpriseTelegramService:
         command = self._normalize_command(text)
         live_session = self._active_live_session(db, user)
         if live_session:
+            self._mark_user_present(db, live_session)
             handled = await self._handle_live_session_menu_input(
                 db,
                 runtime=runtime,
@@ -1318,10 +1320,13 @@ class EnterpriseTelegramService:
         session = self._sessions(db).get_unresolved_for_user_route(
             user.id, user.current_state
         )
-        if session:
+        return session
+
+    def _mark_user_present(self, db: Session, session: EnterpriseTelegramSession) -> None:
+        """Mark the user as present in a live session."""
+        if not session.user_present:
             session.user_present = True
             self._sessions(db).save(session)
-        return session
 
     async def _show_root_menu(
         self,
@@ -1521,6 +1526,11 @@ class EnterpriseTelegramService:
         platform_metadata: Optional[dict[str, Any]],
     ) -> set[str]:
         """Collect visible enterprise keyboard labels that should never hit Chatwoot."""
+        cache_key = str(instance_id)
+        cached = self._menu_label_cache.get(cache_key)
+        if cached is not None:
+            return cached
+
         cfg = platform_metadata if isinstance(platform_metadata, dict) else {}
         labels: set[str] = set()
         for markup in (
@@ -1548,6 +1558,7 @@ class EnterpriseTelegramService:
         )
         for m in manuals:
             labels.add(str(m.display_name or m.original_filename or "").strip())
+        self._menu_label_cache[cache_key] = labels
         return labels
 
     def _get_or_create_user(
@@ -1587,7 +1598,7 @@ class EnterpriseTelegramService:
         client = self._clients.get(key)
         if client is None:
             client = ChatwootClient(base_url=base_url, token=token)
-            self._clients.set(key, client)
+            self._clients[key] = client
         return client
 
     def _require_runtime_instance(self, db: Session, instance_key: str):

@@ -157,6 +157,7 @@ class EnterpriseBaleService:
         self._gre = EnterpriseGreValidator()
         self._novin_sms = NovinSmsClient()
         self._clients: TTLCache[ChatwootClient] = TTLCache(maxsize=50, ttl=3600)
+        self._menu_label_cache: TTLCache[str, set[str]] = TTLCache(maxsize=50, ttl=60)
 
     def get_sms_sync_config(
         self,
@@ -621,6 +622,7 @@ class EnterpriseBaleService:
         command = self._normalize_command(text)
         live_session = self._active_live_session_for_state(db, user)
         if live_session:
+            self._mark_user_present(db, live_session)
             handled = await self._handle_live_session_menu_input(
                 db,
                 runtime=runtime,
@@ -1609,6 +1611,11 @@ class EnterpriseBaleService:
         instance_id: str,
     ) -> set[str]:
         """Collect visible enterprise keyboard labels that should never hit Chatwoot."""
+        cache_key = str(instance_id)
+        cached = self._menu_label_cache.get(cache_key)
+        if cached is not None:
+            return cached
+
         labels: set[str] = set()
         for markup in (
             self._eligible_root_markup(),
@@ -1628,6 +1635,7 @@ class EnterpriseBaleService:
         for row in self._keyboard_items(self._manual_group_menu_markup(groups)):
             labels.update(item for item in row if item)
 
+        self._menu_label_cache[cache_key] = labels
         return labels
 
     async def _forward_customer_message_to_chatwoot(
@@ -2298,10 +2306,13 @@ class EnterpriseBaleService:
         if not route_key:
             return None
         session = self._sessions(db).get_unresolved_for_user_route(user.id, route_key)
-        if session:
+        return session
+
+    def _mark_user_present(self, db: Session, session: EnterpriseBaleSession) -> None:
+        """Mark the user as present in a live session."""
+        if not session.user_present:
             session.user_present = True
             self._sessions(db).save(session)
-        return session
 
     async def _show_root_menu(
         self,
