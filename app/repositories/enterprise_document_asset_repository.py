@@ -54,24 +54,24 @@ class EnterpriseDocumentAssetRepository:
 
     def deactivate_catalogs(self, instance_id: str) -> None:
         """Mark all catalogs for an instance inactive."""
-        rows = (
-            self.db.query(EnterpriseDocumentAsset)
-            .filter(
-                EnterpriseDocumentAsset.instance_id == str(instance_id),
-                EnterpriseDocumentAsset.asset_type == EnterpriseDocumentAssetType.catalog,
-                EnterpriseDocumentAsset.is_active.is_(True),
-            )
-            .all()
-        )
-        for row in rows:
-            row.is_active = False
+        self.db.query(EnterpriseDocumentAsset).filter(
+            EnterpriseDocumentAsset.instance_id == str(instance_id),
+            EnterpriseDocumentAsset.asset_type == EnterpriseDocumentAssetType.catalog,
+            EnterpriseDocumentAsset.is_active.is_(True),
+        ).update({EnterpriseDocumentAsset.is_active: False}, synchronize_session=False)
 
     def next_sort_order(self, instance_id: str, asset_type: EnterpriseDocumentAssetType) -> int:
         """Compute the next sort order for an instance asset type."""
-        rows = self.list_for_instance(instance_id, asset_type=asset_type, active_only=False)
-        if not rows:
-            return 1
-        return max(int(row.sort_order or 0) for row in rows) + 1
+        from sqlalchemy import func
+        result = (
+            self.db.query(func.max(EnterpriseDocumentAsset.sort_order))
+            .filter(
+                EnterpriseDocumentAsset.instance_id == str(instance_id),
+                EnterpriseDocumentAsset.asset_type == asset_type,
+            )
+            .scalar()
+        )
+        return (int(result or 0) + 1) if result else 1
 
     def save(self, row: EnterpriseDocumentAsset) -> EnterpriseDocumentAsset:
         """Persist an asset row."""

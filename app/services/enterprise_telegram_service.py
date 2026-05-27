@@ -43,6 +43,7 @@ from app.repositories.enterprise_telegram_user_repository import (
 )
 from app.services.enterprise_document_service import EnterpriseDocumentService
 from app.services.instance_service import InstanceService
+from app.utils.cache_utils import TTLCache
 from app.utils.crypto_utils import encryptor
 
 logger = logging.getLogger("app.services.enterprise_telegram")
@@ -575,7 +576,7 @@ class EnterpriseTelegramService:
                 reply_markup=self._remove_keyboard_markup(),
             )
         else:
-            asset_row, content = self._documents.read_asset_bytes(db, selected.id)
+            asset_row, content = await self._documents.read_asset_bytes(db, selected.id)
             await self._send_media(
                 runtime.instance.instance_key,
                 chat_id,
@@ -1386,7 +1387,7 @@ class EnterpriseTelegramService:
                 reply_markup=self._remove_keyboard_markup(),
             )
         else:
-            asset_row, content = self._documents.read_asset_bytes(db, catalog.id)
+            asset_row, content = await self._documents.read_asset_bytes(db, catalog.id)
             await self._send_media(
                 runtime.instance.instance_key,
                 chat_id,
@@ -1583,9 +1584,11 @@ class EnterpriseTelegramService:
         base_url = str(chatwoot.get("base_url") or "").strip()
         token = str(chatwoot.get("api_access_token") or "").strip()
         key = f"{base_url}|{token}"
-        if key not in self._clients:
-            self._clients[key] = ChatwootClient(base_url=base_url, token=token)
-        return self._clients[key]
+        client = self._clients.get(key)
+        if client is None:
+            client = ChatwootClient(base_url=base_url, token=token)
+            self._clients.set(key, client)
+        return client
 
     def _require_runtime_instance(self, db: Session, instance_key: str):
         """Require a Telegram Enterprise runtime instance."""
@@ -1658,19 +1661,9 @@ class EnterpriseTelegramService:
     async def _send_text(
         self, instance_key: str, chat_id: str, text: str, *, reply_markup: Any = False
     ) -> None:
-        """Send text via the Telegram connector."""
-        try:
-            connector = connector_registry.get("telegram_enterprise")
-            await connector.send_text(instance_key, chat_id, text, reply_markup=reply_markup)
-        except Exception as exc:
-            logger.warning(
-                "enterprise_telegram._send_text failed instance=%s chat_id=%s text_len=%s error_type=%s error=%s",
-                instance_key,
-                chat_id,
-                len(text or ""),
-                type(exc).__name__,
-                str(exc),
-            )
+        """Send text via the Telegram connector. Raises on failure so callers know."""
+        connector = connector_registry.get("telegram_enterprise")
+        await connector.send_text(instance_key, chat_id, text, reply_markup=reply_markup)
 
     async def _send_media(
         self,
@@ -1682,26 +1675,16 @@ class EnterpriseTelegramService:
         caption: Optional[str] = None,
         reply_markup: Any = False,
     ) -> None:
-        """Send media via the Telegram connector."""
-        try:
-            connector = connector_registry.get("telegram_enterprise")
-            await connector.send_media(
-                instance_key,
-                chat_id,
-                media,
-                filename,
-                caption=caption,
-                reply_markup=reply_markup,
-            )
-        except Exception as exc:
-            logger.warning(
-                "enterprise_telegram._send_media failed instance=%s chat_id=%s filename=%s error_type=%s error=%s",
-                instance_key,
-                chat_id,
-                filename,
-                type(exc).__name__,
-                str(exc),
-            )
+        """Send media via the Telegram connector. Raises on failure so callers know."""
+        connector = connector_registry.get("telegram_enterprise")
+        await connector.send_media(
+            instance_key,
+            chat_id,
+            media,
+            filename,
+            caption=caption,
+            reply_markup=reply_markup,
+        )
 
     async def _extract_attachments(
         self, instance_key: str, message: dict[str, Any]

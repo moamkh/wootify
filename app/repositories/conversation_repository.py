@@ -86,8 +86,7 @@ class ConversationRepository:
         )
         if exclude_conversation_id:
             query = query.filter(Conversation.id != str(exclude_conversation_id))
-        for row in query.all():
-            row.is_active = False
+        query.update({Conversation.is_active: False}, synchronize_session=False)
 
     def save(self, row: Conversation) -> Conversation:
         """Save."""

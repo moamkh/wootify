@@ -23,6 +23,7 @@ from app.repositories.conversation_runtime_state_repository import ConversationR
 from app.services.conversation_mapping_service import ConversationMappingService
 from app.services.instance_service import InstanceService
 from app.services.message_mapping_service import MessageMappingService
+from app.utils.cache_utils import TTLCache
 from app.utils.crypto_utils import encryptor
 from app.utils.payload_utils import sanitize_payload
 
@@ -33,12 +34,12 @@ class BridgeService:
     """Service for bridge domain workflows."""
     def __init__(self) -> None:
         """Initialize the instance."""
-        self._clients: dict[str, ChatwootClient] = {}
+        self._clients: TTLCache[ChatwootClient] = TTLCache(maxsize=50, ttl=3600)
         self._instances = InstanceService()
         self._conversations = ConversationMappingService()
         self._conversation_runtime_repo = ConversationRuntimeStateRepository
         self._messages = MessageMappingService()
-        self._status_notify_recent: dict[tuple[str, str, str], float] = {}
+        self._status_notify_recent: TTLCache[bool] = TTLCache(maxsize=5000, ttl=300)
 
     async def create_chatwoot_inbox(self, db: Session, instance_key: str) -> dict[str, Any]:
         """Create chatwoot inbox."""
@@ -1370,9 +1371,11 @@ class BridgeService:
         base_url = str(chatwoot_cfg.get('base_url') or settings.CHATWOOT_BASE_URL).rstrip('/')
         token = str(chatwoot_cfg.get('api_access_token') or settings.CHATWOOT_API_TOKEN).strip()
         key = f'{base_url}::{token}'
-        if key not in self._clients:
-            self._clients[key] = ChatwootClient(base_url=base_url, token=token)
-        return self._clients[key]
+        client = self._clients.get(key)
+        if client is None:
+            client = ChatwootClient(base_url=base_url, token=token)
+            self._clients.set(key, client)
+        return client
 
     async def _handle_chatwoot_status_event(
         self,
@@ -1735,7 +1738,7 @@ class BridgeService:
         ttl_seconds = 8.0
         self._prune_status_notification_cache(now, ttl_seconds)
 
-        key = (str(instance_key), str(conversation_id), str(status_name))
+        key = '|'.join([str(instance_key), str(conversation_id), str(status_name)])
         previous = self._status_notify_recent.get(key)
         return previous is not None and (now - previous) <= ttl_seconds
 
@@ -1745,14 +1748,13 @@ class BridgeService:
         ttl_seconds = 8.0
         self._prune_status_notification_cache(now, ttl_seconds)
 
-        key = (str(instance_key), str(conversation_id), str(status_name))
-        self._status_notify_recent[key] = now
+        key = '|'.join([str(instance_key), str(conversation_id), str(status_name)])
+        self._status_notify_recent.set(key, now)
 
     def _prune_status_notification_cache(self, now: float, ttl_seconds: float) -> None:
         """Internal helper to prune status notification cache."""
-        stale_keys = [k for k, seen_at in self._status_notify_recent.items() if now - seen_at > ttl_seconds]
-        for stale in stale_keys:
-            self._status_notify_recent.pop(stale, None)
+        # TTLCache auto-expires entries on access; manual prune is a no-op here.
+        pass
 
     def _extract_chatwoot_operator_name(self, payload: dict[str, Any]) -> Optional[str]:
         """Internal helper to extract chatwoot operator name."""

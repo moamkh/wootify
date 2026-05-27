@@ -22,6 +22,7 @@ from app.repositories.instance_repository import InstanceRepository
 from app.repositories.platform_repository import PlatformRepository
 from app.repositories.runtime_state_repository import RuntimeStateRepository
 from app.schemas.api_v1 import FeatureOverrideResponse, InstanceCreateRequest, InstancePatchRequest, InstanceResponse
+from app.utils.cache_utils import TTLCache
 from app.utils.crypto_utils import encryptor
 from app.utils.payload_utils import mask_secret
 
@@ -52,6 +53,20 @@ class RuntimeInstance:
     feature_flags: dict[str, bool]
     feature_overrides: list[FeatureOverrideResponse]
     runtime_state_last_update_id: Optional[str] = None
+
+
+# Module-level caches to avoid repeated decryption and feature override computation.
+_runtime_instance_cache: TTLCache[RuntimeInstance] = TTLCache(maxsize=200, ttl=60)
+_feature_defs_cache: list[Any] | None = None
+
+
+def _invalidate_instance_cache(instance_key: str) -> None:
+    _runtime_instance_cache.pop(instance_key)
+
+
+def _invalidate_feature_defs_cache() -> None:
+    global _feature_defs_cache
+    _feature_defs_cache = None
 
 
 class InstanceService:
@@ -98,6 +113,8 @@ class InstanceService:
 
             db.commit()
             db.refresh(row)
+            _invalidate_instance_cache(payload.instance_key)
+            _invalidate_feature_defs_cache()
             return self._to_response(row, platform, platform_metadata, chatwoot, proxy, feature_rows)
         except ValueError:
             raise
@@ -209,6 +226,8 @@ class InstanceService:
             self._runtime_repo(db).get_or_create(row.id)
             db.commit()
             db.refresh(row)
+            _invalidate_instance_cache(instance_key)
+            _invalidate_feature_defs_cache()
 
             platform = row.platform_type
             return self._to_response(row, platform, platform_metadata, chatwoot, proxy, feature_rows)
@@ -227,6 +246,7 @@ class InstanceService:
             asset_dir = repo_root / 'data' / 'enterprise_assets' / str(row.instance_key).strip()
             self._instance_repo(db).delete(row)
             db.commit()
+            _invalidate_instance_cache(instance_key)
             if asset_dir.exists():
                 shutil.rmtree(asset_dir, ignore_errors=True)
             return True
@@ -236,11 +256,16 @@ class InstanceService:
 
     def get_runtime_instance(self, db: Session, instance_key: str) -> Optional[RuntimeInstance]:
         """Get runtime instance."""
+        cached = _runtime_instance_cache.get(instance_key)
+        if cached is not None:
+            return cached
         try:
             row = self._instance_repo(db).get_by_key(instance_key)
             if not row:
                 return None
-            return self._to_runtime(db, row)
+            runtime = self._to_runtime(db, row)
+            _runtime_instance_cache.set(instance_key, runtime)
+            return runtime
         except Exception:
             logger.exception('get_runtime_instance failed instance_key=%s', instance_key)
             raise
@@ -343,6 +368,15 @@ class InstanceService:
             raise ValueError(f"Platform '{platform_type_key}' is not active")
         return row
 
+    def _get_feature_definitions(self, db: Session):
+        """Return cached feature definitions (seed data that rarely changes)."""
+        global _feature_defs_cache
+        if _feature_defs_cache is not None:
+            return _feature_defs_cache
+        feature_defs = self._feature_repo(db).list_all()
+        _feature_defs_cache = feature_defs
+        return feature_defs
+
     def _upsert_feature_overrides(
         self,
         db: Session,
@@ -351,8 +385,7 @@ class InstanceService:
         requested_overrides: Optional[dict[str, bool]],
     ) -> list[FeatureOverrideResponse]:
         """Internal helper to upsert feature overrides."""
-        feature_repo = self._feature_repo(db)
-        feature_defs = feature_repo.list_all()
+        feature_defs = self._get_feature_definitions(db)
         valid_keys = {item.key for item in feature_defs}
 
         if requested_overrides is not None:

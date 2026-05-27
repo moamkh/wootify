@@ -151,18 +151,43 @@ class TelegramBotConnector:
 
     async def _create_runtime(self, cfg: TelegramInstanceConfig) -> TelegramInstanceRuntime:
         """Internal helper to create runtime."""
-        request = HTTPXRequest(proxy=cfg.proxy_url) if cfg.proxy_url else HTTPXRequest()
+        proxy = cfg.proxy_url
+        # Regular requests: standard timeouts
+        request = HTTPXRequest(
+            proxy=proxy,
+            read_timeout=30.0,
+            write_timeout=10.0,
+            connect_timeout=5.0,
+            pool_timeout=1.0,
+        )
+        # getUpdates long-polling needs a read timeout longer than the poll timeout
+        get_updates_request = HTTPXRequest(
+            proxy=proxy,
+            read_timeout=35.0,
+            write_timeout=10.0,
+            connect_timeout=5.0,
+            pool_timeout=1.0,
+        )
         bot = Bot(
             token=cfg.token,
             base_url=cfg.api_base_url,
             base_file_url=cfg.file_base_url,
             request=request,
-            get_updates_request=request,
+            get_updates_request=get_updates_request,
         )
-        await bot.initialize()
-        await bot.get_me()
-        await self._register_commands(bot)
-        file_client = httpx.AsyncClient(timeout=30, proxy=cfg.proxy_url)
+        file_client = httpx.AsyncClient(
+            timeout=httpx.Timeout(connect=5.0, read=30.0, write=10.0, pool=1.0),
+            proxy=proxy,
+        )
+        try:
+            await bot.initialize()
+            await bot.get_me()
+            await self._register_commands(bot)
+        except Exception:
+            await self._shutdown_runtime(
+                TelegramInstanceRuntime(cfg=cfg, bot=bot, file_client=file_client)
+            )
+            raise
         return TelegramInstanceRuntime(cfg=cfg, bot=bot, file_client=file_client)
 
     async def _shutdown_runtime(self, runtime: TelegramInstanceRuntime) -> None:

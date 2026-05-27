@@ -23,9 +23,7 @@ class EnterpriseManualGroupRepository:
 
     def get_by_id(self, group_id: str) -> Optional[EnterpriseManualGroup]:
         """Get a manual group by ID."""
-        return self.db.query(EnterpriseManualGroup).filter(
-            EnterpriseManualGroup.id == group_id
-        ).first()
+        return self.db.get(EnterpriseManualGroup, str(group_id))
 
     def list_by_instance(
         self,

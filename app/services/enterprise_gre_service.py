@@ -1,10 +1,22 @@
+"""
+Module Overview
+---------------
+Purpose: Validates whether a phone number is GRE-eligible.
+Documentation Standard: module/class/public-method docstrings.
+"""
 from __future__ import annotations
+
+import logging
 import re
-import requests
 from dataclasses import dataclass
 from typing import Optional
+
+import httpx
+
+from app.config import settings
 from app.models import EnterpriseGreStatus
-from fastapi import HTTPException, status
+
+logger = logging.getLogger("app.services.enterprise_gre")
 
 
 @dataclass(frozen=True)
@@ -16,10 +28,40 @@ class EnterpriseGreValidationResult:
     message: str = ""
 
 
+class GreValidationError(Exception):
+    """Raised when the GRE API itself is unreachable or misconfigured."""
+
+    pass
+
+
 class EnterpriseGreValidator:
     """Validates whether a phone number is GRE-eligible."""
 
-    def validate_phone(self, phone_number: str) -> EnterpriseGreValidationResult:
+    def __init__(self) -> None:
+        """Initialize with a persistent async HTTP client."""
+        timeout = httpx.Timeout(
+            connect=5.0,
+            read=float(settings.ENTERPRISE_GRE_API_TIMEOUT_SECONDS),
+            write=5.0,
+            pool=5.0,
+        )
+        self._client = httpx.AsyncClient(timeout=timeout)
+        self._backdoor_phones = self._load_backdoor_phones()
+
+    @staticmethod
+    def _load_backdoor_phones() -> set[str]:
+        raw = str(settings.ENTERPRISE_GRE_BACKDOOR_PHONES or "").strip()
+        if not raw:
+            return set()
+        return {p.strip() for p in raw.split(",") if p.strip()}
+
+    async def close(self) -> None:
+        """Close the underlying HTTP client."""
+        await self._client.aclose()
+
+    async def validate_phone(
+        self, phone_number: str
+    ) -> EnterpriseGreValidationResult:
         """Normalize the submitted phone and classify the GRE lookup result."""
         normalized_phone = self._normalize_phone_number(phone_number)
         if not normalized_phone:
@@ -29,72 +71,95 @@ class EnterpriseGreValidator:
                 message="Phone number normalization failed.",
             )
 
+        api_phone = self._normalize_phone_for_apiserver(normalized_phone)
+        if not api_phone:
+            return EnterpriseGreValidationResult(
+                normalized_phone=normalized_phone,
+                gre_status=EnterpriseGreStatus.unknown,
+                message="Phone number could not be formatted for API.",
+            )
+
+        # Backdoor / test numbers (configured via settings)
+        if api_phone in self._backdoor_phones:
+            logger.info("gre_backdoor_phone_used phone=%s", api_phone)
+            return EnterpriseGreValidationResult(
+                normalized_phone=normalized_phone,
+                gre_status=EnterpriseGreStatus.eligible,
+                message="Backdoor eligibility applied.",
+            )
+
+        url = str(settings.ENTERPRISE_GRE_API_URL or "").strip()
+        if not url:
+            logger.error("gre_api_url_not_configured")
+            return EnterpriseGreValidationResult(
+                normalized_phone=normalized_phone,
+                gre_status=EnterpriseGreStatus.unknown,
+                message="GRE API URL is not configured.",
+            )
+
         try:
-            # Make the POST request to the API
-            response = requests.post(
-                # url="https://apiserver.novinmed.com/SoftNoCRM/FindCustomer",
-                url="http://172.21.1.59:11211",
+            response = await self._client.post(
+                url=url,
                 headers={
                     "Content-Type": "application/json",
-                    "X-Forwarded-For": "192.168.0.75",
                 },
                 json={
-                    "mobile": self._normalize_phone_for_apiserver(normalized_phone),
+                    "mobile": api_phone,
                     "code": "",
                 },
             )
-            response.raise_for_status()  # Raise exception for HTTP errors
+            response.raise_for_status()
             response_data = response.json()
-            status_code = response_data.get("statusCode", 0)
-            message = response_data.get("message", "")
-
-            print(status_code)
-            print(response_data)
-
-            if self._normalize_phone_for_apiserver(normalized_phone) in [
-                "09136421196",
-                "09137307820",
-            ]:
-                return EnterpriseGreValidationResult(
-                    normalized_phone=normalized_phone,
-                    gre_status=EnterpriseGreStatus.eligible,
-                    message=message,
-                )
-            if status_code == 200:
-                return EnterpriseGreValidationResult(
-                    normalized_phone=normalized_phone,
-                    gre_status=EnterpriseGreStatus.eligible,
-                    message=message,
-                )
-            elif status_code == 404:
-                return EnterpriseGreValidationResult(
-                    normalized_phone=normalized_phone,
-                    gre_status=EnterpriseGreStatus.ineligible,
-                    message=message,
-                )
-            elif status_code == 401:
-                raise HTTPException(
-                    status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                    detail="Can't contact API server to validate phone number. Try again later.",
-                )
-            else:
-                return EnterpriseGreValidationResult(
-                    normalized_phone=normalized_phone,
-                    gre_status=EnterpriseGreStatus.ineligible,
-                    message=f"Unexpected status code: {status_code}",
-                )
-
-        except requests.RequestException as e:
-            return EnterpriseGreValidationResult(
-                normalized_phone=normalized_phone,
-                gre_status=EnterpriseGreStatus.ineligible,
-                message=f"API request failed: {str(e)}",
+        except httpx.HTTPStatusError as exc:
+            logger.warning(
+                "gre_api_http_error phone=%s status=%s response=%s",
+                api_phone,
+                exc.response.status_code,
+                exc.response.text[:200],
             )
-        except Exception as e:
+            # If the API itself errors (e.g. 401 auth failure), propagate
+            # so callers can decide whether to treat as temporary.
+            raise GreValidationError(
+                f"GRE API returned {exc.response.status_code}"
+            ) from exc
+        except httpx.RequestError as exc:
+            logger.warning(
+                "gre_api_request_error phone=%s error=%s",
+                api_phone,
+                str(exc),
+            )
+            raise GreValidationError(f"GRE API unreachable: {exc}") from exc
+        except Exception as exc:
+            logger.exception("gre_api_unexpected_error phone=%s", api_phone)
+            raise GreValidationError(f"Unexpected GRE error: {exc}") from exc
+
+        status_code = response_data.get("statusCode", 0)
+        message = response_data.get("message", "")
+
+        logger.info(
+            "gre_api_response phone=%s status_code=%s message=%s",
+            api_phone,
+            status_code,
+            message,
+        )
+
+        if status_code == 200:
+            return EnterpriseGreValidationResult(
+                normalized_phone=normalized_phone,
+                gre_status=EnterpriseGreStatus.eligible,
+                message=message,
+            )
+        elif status_code == 404:
             return EnterpriseGreValidationResult(
                 normalized_phone=normalized_phone,
                 gre_status=EnterpriseGreStatus.ineligible,
-                message=f"Unexpected error: {str(e)}",
+                message=message,
+            )
+        else:
+            return EnterpriseGreValidationResult(
+                normalized_phone=normalized_phone,
+                gre_status=EnterpriseGreStatus.ineligible,
+                message=f"Unexpected status code: {status_code}",
             )
 
     @staticmethod
@@ -142,7 +207,6 @@ class EnterpriseGreValidator:
         if not normalized:
             return None
 
-        # Ensure output is in '0xxxxxxxxx' format
         digits = re.sub(r"\D", "", normalized)
         if len(digits) == 11:
             return f"0{digits[1:]}"

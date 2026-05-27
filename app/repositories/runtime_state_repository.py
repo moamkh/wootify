@@ -30,6 +30,7 @@ class RuntimeStateRepository:
             return row
         row = InstanceRuntimeState(instance_id=str(instance_id))
         self.db.add(row)
+        self.db.flush()
         return row
 
     def save(self, row: InstanceRuntimeState) -> InstanceRuntimeState:

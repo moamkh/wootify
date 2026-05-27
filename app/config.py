@@ -62,6 +62,10 @@ class Settings(BaseSettings):
     ENTERPRISE_SMS_HTTP_TIMEOUT_SECONDS: int = 30
     ENTERPRISE_SMS_FILE_LOG_ENABLED: bool = False
 
+    ENTERPRISE_GRE_API_URL: str = 'https://apiserver.novinmed.com/SoftNoCRM/FindCustomer'
+    ENTERPRISE_GRE_API_TIMEOUT_SECONDS: int = 10
+    ENTERPRISE_GRE_BACKDOOR_PHONES: str = ''
+
     TELEGRAM_API_BASE_URL: str = 'https://api.telegram.org/bot'
     TELEGRAM_FILE_BASE_URL: str = 'https://api.telegram.org/file/bot'
     TELEGRAM_POLL_INTERVAL_SECONDS: int = 5

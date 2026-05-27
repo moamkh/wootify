@@ -46,8 +46,9 @@ from app.repositories.enterprise_pending_message_repository import (
     EnterprisePendingMessageRepository,
 )
 from app.services.enterprise_document_service import EnterpriseDocumentService
-from app.services.enterprise_gre_service import EnterpriseGreValidator
+from app.services.enterprise_gre_service import EnterpriseGreValidator, GreValidationError
 from app.services.instance_service import InstanceService
+from app.utils.cache_utils import TTLCache
 from app.utils.crypto_utils import encryptor
 from app.utils.logging_utils import log_sms_to_file
 
@@ -155,7 +156,7 @@ class EnterpriseBaleService:
         self._documents = EnterpriseDocumentService()
         self._gre = EnterpriseGreValidator()
         self._novin_sms = NovinSmsClient()
-        self._clients: dict[str, ChatwootClient] = {}
+        self._clients: TTLCache[ChatwootClient] = TTLCache(maxsize=50, ttl=3600)
 
     def get_sms_sync_config(
         self,
@@ -375,23 +376,10 @@ class EnterpriseBaleService:
         rows = response.get("data") if isinstance(response, dict) else []
         items = [item for item in rows if isinstance(item, dict)] if isinstance(rows, list) else []
 
-        max_seen_id = self._max_sms_id(items, last_id)
-        if max_seen_id != last_id:
-            cfg["enterprise_sms_last_id"] = int(max_seen_id)
-            runtime.instance.platform_metadata_encrypted = encryptor.encrypt_json(cfg)
-            db.add(runtime.instance)
-            db.commit()
-            sms_logger.info(
-                "sync.last_id_updated instance=%s previous_last_id=%s new_last_id=%s fetched=%s",
-                instance_key,
-                last_id,
-                max_seen_id,
-                len(items),
-            )
-
         delivered = 0
         dropped = 0
         failed = 0
+        max_delivered_id = last_id
 
         for item in items:
             item_id = self._coerce_sms_id(item)
@@ -508,6 +496,8 @@ class EnterpriseBaleService:
                         normalized_phone,
                     )
                     delivered += 1
+                    if item_id is not None:
+                        max_delivered_id = max(max_delivered_id, item_id)
                     # Optional file logging
                     if settings.ENTERPRISE_SMS_FILE_LOG_ENABLED:
                         log_sms_to_file(
@@ -552,8 +542,22 @@ class EnterpriseBaleService:
             delivered,
             dropped,
             failed,
-            int(max_seen_id),
+            int(max_delivered_id),
         )
+
+        # Commit last_id only after delivery attempts so failures can be retried.
+        if max_delivered_id != last_id:
+            cfg["enterprise_sms_last_id"] = int(max_delivered_id)
+            runtime.instance.platform_metadata_encrypted = encryptor.encrypt_json(cfg)
+            db.add(runtime.instance)
+            db.commit()
+            sms_logger.info(
+                "sync.last_id_updated instance=%s previous_last_id=%s new_last_id=%s fetched=%s",
+                instance_key,
+                last_id,
+                max_delivered_id,
+                len(items),
+            )
 
         return {
             "message": "synced",
@@ -561,7 +565,7 @@ class EnterpriseBaleService:
             "delivered": delivered,
             "dropped": dropped,
             "failed": failed,
-            "last_id": int(max_seen_id),
+            "last_id": int(max_delivered_id),
         }
 
     @staticmethod
@@ -909,7 +913,15 @@ class EnterpriseBaleService:
         phone_number: str,
     ) -> None:
         """Persist a phone number, validate GRE, and show the correct root menu."""
-        result = self._gre.validate_phone(phone_number)
+        try:
+            result = await self._gre.validate_phone(phone_number)
+        except GreValidationError as exc:
+            logger.warning("gre_validation_error instance=%s error=%s", runtime.instance.instance_key, exc)
+            result = EnterpriseGreValidationResult(
+                normalized_phone=self._gre._normalize_phone_number(phone_number),
+                gre_status=EnterpriseGreStatus.unknown,
+                message=str(exc),
+            )
 
         # Phone format is invalid — ask again.
         if not result.normalized_phone:
@@ -968,7 +980,15 @@ class EnterpriseBaleService:
         chat_id: str,
     ) -> None:
         """Re-run GRE validation using the stored phone number and show the root menu."""
-        result = self._gre.validate_phone(str(user.phone_number or ""))
+        try:
+            result = await self._gre.validate_phone(str(user.phone_number or ""))
+        except GreValidationError as exc:
+            logger.warning("gre_validation_error instance=%s error=%s", runtime.instance.instance_key, exc)
+            result = EnterpriseGreValidationResult(
+                normalized_phone=user.phone_number,
+                gre_status=EnterpriseGreStatus.unknown,
+                message=str(exc),
+            )
         user.phone_number = result.normalized_phone
         user.gre_status = result.gre_status
         self._users(db).save(user)
@@ -1265,7 +1285,7 @@ class EnterpriseBaleService:
                 reply_markup=self._remove_keyboard_markup(),
             )
         else:
-            asset_row, content = self._documents.read_asset_bytes(db, selected.id)
+            asset_row, content = await self._documents.read_asset_bytes(db, selected.id)
             await self._send_media(
                 runtime.instance.instance_key,
                 chat_id,
@@ -1401,7 +1421,7 @@ class EnterpriseBaleService:
                 reply_markup=self._remove_keyboard_markup(),
             )
         else:
-            asset_row, content = self._documents.read_asset_bytes(db, catalog.id)
+            asset_row, content = await self._documents.read_asset_bytes(db, catalog.id)
             await self._send_media(
                 instance_key,
                 chat_id,
@@ -2392,9 +2412,11 @@ class EnterpriseBaleService:
         base_url = str(chatwoot.get("base_url") or "").strip()
         token = str(chatwoot.get("api_access_token") or "").strip()
         key = f"{base_url}|{token}"
-        if key not in self._clients:
-            self._clients[key] = ChatwootClient(base_url=base_url, token=token)
-        return self._clients[key]
+        client = self._clients.get(key)
+        if client is None:
+            client = ChatwootClient(base_url=base_url, token=token)
+            self._clients.set(key, client)
+        return client
 
     def _require_runtime_instance(self, db: Session, instance_key: str):
         """Require a Bale Enterprise runtime instance."""
@@ -2737,22 +2759,11 @@ class EnterpriseBaleService:
     async def _send_text(
         self, instance_key: str, chat_id: str, text: str, *, reply_markup: Any = False
     ) -> dict[str, Any]:
-        """Send a Bale Enterprise text message."""
-        try:
-            connector = connector_registry.get("bale_enterprise")
-            return await connector.send_text(
-                instance_key, chat_id, text, reply_markup=reply_markup
-            )
-        except Exception as exc:
-            logger.warning(
-                "enterprise._send_text failed instance=%s chat_id=%s text_len=%s error_type=%s error=%s",
-                instance_key,
-                chat_id,
-                len(text or ""),
-                type(exc).__name__,
-                str(exc),
-            )
-            return {"id": None, "raw": None}
+        """Send a Bale Enterprise text message. Raises on failure so callers know."""
+        connector = connector_registry.get("bale_enterprise")
+        return await connector.send_text(
+            instance_key, chat_id, text, reply_markup=reply_markup
+        )
 
     async def _send_media(
         self,
@@ -2764,27 +2775,16 @@ class EnterpriseBaleService:
         caption: Optional[str] = None,
         reply_markup: Any = False,
     ) -> dict[str, Any]:
-        """Send a Bale Enterprise media message."""
-        try:
-            connector = connector_registry.get("bale_enterprise")
-            return await connector.send_media(
-                instance_key,
-                chat_id,
-                media,
-                filename,
-                caption=caption,
-                reply_markup=reply_markup,
-            )
-        except Exception as exc:
-            logger.warning(
-                "enterprise._send_media failed instance=%s chat_id=%s filename=%s error_type=%s error=%s",
-                instance_key,
-                chat_id,
-                filename,
-                type(exc).__name__,
-                str(exc),
-            )
-            return {"id": None, "raw": None, "content_type": None}
+        """Send a Bale Enterprise media message. Raises on failure so callers know."""
+        connector = connector_registry.get("bale_enterprise")
+        return await connector.send_media(
+            instance_key,
+            chat_id,
+            media,
+            filename,
+            caption=caption,
+            reply_markup=reply_markup,
+        )
 
     async def _extract_attachments(
         self, instance_key: str, message: dict[str, Any]

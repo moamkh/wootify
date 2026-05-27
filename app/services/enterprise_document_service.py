@@ -6,6 +6,7 @@ Documentation Standard: module/class/public-method docstrings.
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 import re
 import uuid
@@ -22,6 +23,9 @@ from app.repositories.enterprise_document_asset_repository import EnterpriseDocu
 from app.services.instance_service import InstanceService
 
 logger = logging.getLogger('app.services.enterprise_documents')
+
+# 10 MB default max upload size
+MAX_UPLOAD_BYTES = 10 * 1024 * 1024
 
 
 class EnterpriseDocumentService:
@@ -60,7 +64,7 @@ class EnterpriseDocumentService:
             raise ValueError('manual file is required')
         content, resolved_content_type = await self._read_and_validate_pdf(upload, filename)
 
-        relative_path = self._write_file(
+        relative_path = await self._write_file(
             instance_key,
             folder='manuals',
             filename=filename,
@@ -104,7 +108,7 @@ class EnterpriseDocumentService:
             if not filename:
                 raise ValueError('catalog file is required')
             content, resolved_content_type = await self._read_and_validate_pdf(upload, filename)
-            relative_path = self._write_file(
+            relative_path = await self._write_file(
                 instance_key,
                 folder='catalog',
                 filename=filename,
@@ -162,9 +166,10 @@ class EnterpriseDocumentService:
         if not row or row.instance_id != runtime.instance.id:
             return False
         storage_path = row.storage_path
+        # Delete file before DB commit so a file deletion failure doesn't orphan the row.
+        self._delete_file_quietly(storage_path)
         db.delete(row)
         db.commit()
-        self._delete_file_quietly(storage_path)
         return True
 
     def update_manual_metadata(
@@ -240,7 +245,7 @@ class EnterpriseDocumentService:
         db.refresh(row)
         return row
 
-    def read_asset_bytes(self, db: Session, asset_id: str) -> tuple[EnterpriseDocumentAsset, bytes]:
+    async def read_asset_bytes(self, db: Session, asset_id: str) -> tuple[EnterpriseDocumentAsset, bytes]:
         """Load an asset payload from storage."""
         row = self._repo_cls(db).get_by_id(asset_id)
         if not row:
@@ -248,7 +253,8 @@ class EnterpriseDocumentService:
         file_path = self._storage_root / Path(str(row.storage_path or '').replace('\\', '/'))
         if not file_path.exists():
             raise FileNotFoundError(f'enterprise asset file missing: {file_path}')
-        return row, file_path.read_bytes()
+        content = await asyncio.to_thread(file_path.read_bytes)
+        return row, content
 
     ENTERPRISE_PLATFORM_KEYS = {'bale_enterprise', 'telegram_enterprise'}
 
@@ -261,13 +267,13 @@ class EnterpriseDocumentService:
             raise ValueError('instance is not an enterprise instance')
         return runtime
 
-    def _write_file(self, instance_key: str, *, folder: str, filename: str, content: bytes) -> Path:
+    async def _write_file(self, instance_key: str, *, folder: str, filename: str, content: bytes) -> Path:
         """Persist an uploaded enterprise asset to local storage."""
         target_dir = self._storage_root / str(instance_key).strip() / str(folder).strip()
-        target_dir.mkdir(parents=True, exist_ok=True)
+        await asyncio.to_thread(target_dir.mkdir, parents=True, exist_ok=True)
         unique_name = f'{uuid.uuid4().hex}_{filename}'
         target_path = target_dir / unique_name
-        target_path.write_bytes(content)
+        await asyncio.to_thread(target_path.write_bytes, content)
         logger.info(
             'enterprise asset stored instance_key=%s folder=%s filename=%s bytes=%s path=%s',
             instance_key,
@@ -293,6 +299,8 @@ class EnterpriseDocumentService:
             logger.debug('failed to seek upload stream before reading filename=%s', filename, exc_info=True)
 
         content = await upload.read()
+        if len(content) > MAX_UPLOAD_BYTES:
+            raise ValueError(f'file exceeds maximum size of {MAX_UPLOAD_BYTES // (1024 * 1024)} MB')
         resolved_content_type = self._validate_pdf(
             content,
             filename,

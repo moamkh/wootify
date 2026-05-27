@@ -161,10 +161,12 @@ class BalePollingService:
                         max_update = max(max_update or normalized_update_id, normalized_update_id)
                         processed_update_id = str(normalized_update_id)
 
+                    update_processed = False
                     if platform_key == 'bale_enterprise':
                         try:
                             with SessionLocal() as db:
                                 await self._enterprise.handle_platform_update(db, instance_key, update)
+                            update_processed = True
                         except Exception as exc:
                             self._logger.error(
                                 'enterprise_update_error instance=%s update_id=%s error_type=%s error=%s',
@@ -174,10 +176,12 @@ class BalePollingService:
                                 str(exc),
                                 exc_info=True,
                             )
+                            # Do NOT mark as processed on failure to avoid message loss.
                     elif platform_key == 'telegram_enterprise':
                         try:
                             with SessionLocal() as db:
                                 await self._enterprise_telegram.handle_platform_update(db, instance_key, update)
+                            update_processed = True
                         except Exception as exc:
                             self._logger.error(
                                 'enterprise_telegram_update_error instance=%s update_id=%s error_type=%s error=%s',
@@ -187,6 +191,7 @@ class BalePollingService:
                                 str(exc),
                                 exc_info=True,
                             )
+                            # Do NOT mark as processed on failure to avoid message loss.
                     else:
                         handled = await self._maybe_handle_local_command(
                             instance_key,
@@ -195,32 +200,28 @@ class BalePollingService:
                             prompt_cfg=prompt_cfg,
                         )
                         if handled:
-                            if processed_update_id:
-                                self._remember_last_update_id(instance_key, processed_update_id)
-                                await self._update_runtime_state_with_retry(
-                                    runtime_instance_id,
-                                    last_platform_update_id=processed_update_id,
-                                    last_error=None,
-                                    touch_sync=True,
-                                )
-                            continue
+                            update_processed = True
+                        else:
+                            event = await self._platform_update_to_event(instance_key, platform_key, update, connector=connector)
+                            if not event:
+                                update_processed = True
+                            else:
+                                try:
+                                    with SessionLocal() as db:
+                                        await self._bridge.ingest_platform_event(db, instance_key, event)
+                                except Exception as exc:
+                                    self._logger.error(
+                                        'bridge_ingest_error instance=%s update_id=%s error_type=%s error=%s',
+                                        instance_key,
+                                        processed_update_id,
+                                        type(exc).__name__,
+                                        str(exc),
+                                        exc_info=True,
+                                    )
+                                # Mark as processed even on bridge failure to avoid infinite replay.
+                                update_processed = True
 
-                        event = await self._platform_update_to_event(instance_key, platform_key, update, connector=connector)
-                        if not event:
-                            if processed_update_id:
-                                self._remember_last_update_id(instance_key, processed_update_id)
-                                await self._update_runtime_state_with_retry(
-                                    runtime_instance_id,
-                                    last_platform_update_id=processed_update_id,
-                                    last_error=None,
-                                    touch_sync=True,
-                                )
-                            continue
-
-                        with SessionLocal() as db:
-                            await self._bridge.ingest_platform_event(db, instance_key, event)
-
-                    if processed_update_id:
+                    if processed_update_id and update_processed:
                         self._remember_last_update_id(instance_key, processed_update_id)
                         await self._update_runtime_state_with_retry(
                             runtime_instance_id,
