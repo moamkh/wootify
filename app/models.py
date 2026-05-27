@@ -260,6 +260,7 @@ class InstanceRuntimeState(Base):
     )
     last_platform_update_id = Column(String(255), nullable=True)
     last_sync_at = Column(DateTime(timezone=True), nullable=True)
+    last_enterprise_sms_sync_at = Column(DateTime(timezone=True), nullable=True)
     last_error = Column(Text, nullable=True)
     updated_at = Column(
         DateTime(timezone=True),

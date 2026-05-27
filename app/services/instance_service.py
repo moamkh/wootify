@@ -53,6 +53,7 @@ class RuntimeInstance:
     feature_flags: dict[str, bool]
     feature_overrides: list[FeatureOverrideResponse]
     runtime_state_last_update_id: Optional[str] = None
+    runtime_state_last_sms_sync_at: Optional[_dt.datetime] = None
 
 
 # Module-level caches to avoid repeated decryption and feature override computation.
@@ -295,6 +296,7 @@ class InstanceService:
         last_platform_update_id: Optional[str] = None,
         last_error: Optional[str] = None,
         touch_sync: bool = True,
+        last_enterprise_sms_sync_at: Optional[_dt.datetime] = None,
     ) -> None:
         """Update runtime state."""
         import datetime as _dt
@@ -307,6 +309,8 @@ class InstanceService:
                 row.last_error = last_error
             if touch_sync:
                 row.last_sync_at = _dt.datetime.utcnow()
+            if last_enterprise_sms_sync_at is not None:
+                row.last_enterprise_sms_sync_at = last_enterprise_sms_sync_at
             self._runtime_repo(db).save(row)
             db.commit()
         except OperationalError as exc:
@@ -353,6 +357,7 @@ class InstanceService:
                 feature_flags=feature_flags,
                 feature_overrides=feature_rows,
                 runtime_state_last_update_id=runtime_state.last_platform_update_id if runtime_state else None,
+                runtime_state_last_sms_sync_at=runtime_state.last_enterprise_sms_sync_at if runtime_state else None,
             )
         except Exception:
             logger.exception('instance runtime resolution failed instance_id=%s', getattr(row, 'id', None))

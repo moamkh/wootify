@@ -38,6 +38,7 @@ class BalePollingService:
         self._last_update_ids: dict[str, str] = {}
         self._enterprise_sms_last_run: dict[str, float] = {}
         self._enterprise_sms_enabled_state: dict[str, bool] = {}
+        self._enterprise_sms_sync_tasks: dict[str, asyncio.Task] = {}
         self._share_phone_prompted: set[tuple[str, str]] = set()
         # Temporary debug dump for periodic enterprise SMS sync results.
         self._temp_sms_dump_path = (
@@ -65,6 +66,10 @@ class BalePollingService:
         self._last_update_ids.clear()
         self._enterprise_sms_last_run.clear()
         self._enterprise_sms_enabled_state.clear()
+        for task in self._enterprise_sms_sync_tasks.values():
+            if not task.done():
+                task.cancel()
+        self._enterprise_sms_sync_tasks.clear()
         self._share_phone_prompted.clear()
         if self._manager_task:
             self._manager_task.cancel()
@@ -86,6 +91,11 @@ class BalePollingService:
                     task = self._poll_tasks.pop(key)
                     task.cancel()
                     self._last_update_ids.pop(key, None)
+                    self._enterprise_sms_last_run.pop(key, None)
+                    self._enterprise_sms_enabled_state.pop(key, None)
+                    sms_task = self._enterprise_sms_sync_tasks.pop(key, None)
+                    if sms_task and not sms_task.done():
+                        sms_task.cancel()
                     self._logger.info('stopped polling instance=%s', key)
 
                 for key in enabled - existing:
@@ -118,6 +128,9 @@ class BalePollingService:
                     continue
 
                 runtime_instance_id = runtime.instance.id
+                # Seed in-memory SMS sync timestamp from DB so restarts respect the interval.
+                if runtime.runtime_state_last_sms_sync_at and instance_key not in self._enterprise_sms_last_run:
+                    self._enterprise_sms_last_run[instance_key] = runtime.runtime_state_last_sms_sync_at.timestamp()
                 platform_key = str(runtime.platform_type.key or '').strip().lower() or 'bale'
                 connector = connector_registry.get(platform_key)
                 cfg = runtime.platform_metadata
@@ -129,6 +142,7 @@ class BalePollingService:
                     instance_key,
                     platform_key=platform_key,
                     platform_metadata=cfg,
+                    runtime_instance_id=runtime_instance_id,
                 )
 
                 await connector.connect(instance_key, cfg, runtime.proxy)
@@ -285,8 +299,13 @@ class BalePollingService:
         *,
         platform_key: str,
         platform_metadata: dict[str, Any],
+        runtime_instance_id: Optional[str] = None,
     ) -> None:
-        """Trigger enterprise SMS sync when the configured interval has elapsed."""
+        """Trigger enterprise SMS sync when the configured interval has elapsed.
+
+        Runs the actual sync in a background task so that message polling
+        is not blocked by slow SMS API calls.
+        """
         if str(platform_key or '').strip().lower() != 'bale_enterprise':
             return
 
@@ -306,25 +325,71 @@ class BalePollingService:
         if last_run and (now - last_run) < float(interval_seconds):
             return
 
+        # If a sync is already running for this instance, skip.
+        existing_task = self._enterprise_sms_sync_tasks.get(instance_key)
+        if existing_task and not existing_task.done():
+            return
+
         self._enterprise_sms_last_run[instance_key] = now
-        with SessionLocal() as db:
-            result = await self._enterprise.sync_external_sms_messages(db, instance_key)
-        self._sms_logger.info(
-            'sync.result instance=%s fetched=%s delivered=%s dropped=%s failed=%s last_id=%s',
-            instance_key,
-            result.get('fetched'),
-            result.get('delivered'),
-            result.get('dropped'),
-            result.get('failed'),
-            result.get('last_id'),
-        )
-        self._write_temp_sms_result_dump(
-            instance_key=instance_key,
-            interval_seconds=interval_seconds,
-            result=result,
+        self._enterprise_sms_sync_tasks[instance_key] = asyncio.create_task(
+            self._run_enterprise_sms_sync(
+                instance_key=instance_key,
+                interval_seconds=interval_seconds,
+                runtime_instance_id=runtime_instance_id,
+            )
         )
 
-    def _write_temp_sms_result_dump(
+    async def _run_enterprise_sms_sync(
+        self,
+        instance_key: str,
+        *,
+        interval_seconds: int,
+        runtime_instance_id: Optional[str] = None,
+    ) -> None:
+        """Execute SMS sync and persist timestamp."""
+        try:
+            with SessionLocal() as db:
+                result = await self._enterprise.sync_external_sms_messages(db, instance_key)
+            self._sms_logger.info(
+                'sync.result instance=%s fetched=%s delivered=%s dropped=%s failed=%s last_id=%s',
+                instance_key,
+                result.get('fetched'),
+                result.get('delivered'),
+                result.get('dropped'),
+                result.get('failed'),
+                result.get('last_id'),
+            )
+            await self._write_temp_sms_result_dump(
+                instance_key=instance_key,
+                interval_seconds=interval_seconds,
+                result=result,
+            )
+        except Exception as exc:
+            self._sms_logger.error(
+                'sync.failed instance=%s error_type=%s error=%s',
+                instance_key,
+                type(exc).__name__,
+                str(exc),
+                exc_info=True,
+            )
+        finally:
+            # Persist timestamp to DB so restarts don't re-sync immediately.
+            if runtime_instance_id:
+                try:
+                    from datetime import datetime, timezone
+                    await self._update_runtime_state_with_retry(
+                        runtime_instance_id,
+                        last_enterprise_sms_sync_at=datetime.now(timezone.utc),
+                        touch_sync=False,
+                    )
+                except Exception as exc:
+                    self._sms_logger.warning(
+                        'sync.timestamp_persist_failed instance=%s error=%s',
+                        instance_key,
+                        str(exc),
+                    )
+
+    async def _write_temp_sms_result_dump(
         self,
         *,
         instance_key: str,
@@ -332,7 +397,7 @@ class BalePollingService:
         result: dict[str, Any],
     ) -> None:
         """Write a temporary JSONL dump entry for periodic enterprise SMS sync runs."""
-        try:
+        def _write() -> None:
             self._temp_sms_dump_path.parent.mkdir(parents=True, exist_ok=True)
             payload = {
                 'ts_utc': datetime.now(timezone.utc).isoformat(),
@@ -342,6 +407,9 @@ class BalePollingService:
             }
             with self._temp_sms_dump_path.open('a', encoding='utf-8') as handle:
                 handle.write(json.dumps(payload, ensure_ascii=True) + '\n')
+
+        try:
+            await asyncio.to_thread(_write)
         except Exception as exc:
             self._sms_logger.warning('sync.result_dump_failed instance=%s error=%s', instance_key, str(exc))
 
@@ -352,6 +420,7 @@ class BalePollingService:
         last_platform_update_id: Optional[str] = None,
         last_error: Optional[str] = None,
         touch_sync: bool = True,
+        last_enterprise_sms_sync_at: Optional[datetime] = None,
     ) -> bool:
         """Internal helper to update runtime state with retry."""
         max_attempts = 5
@@ -364,6 +433,7 @@ class BalePollingService:
                         last_platform_update_id=last_platform_update_id,
                         last_error=last_error,
                         touch_sync=touch_sync,
+                        last_enterprise_sms_sync_at=last_enterprise_sms_sync_at,
                     )
                 return True
             except OperationalError as exc:
