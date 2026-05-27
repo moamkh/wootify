@@ -67,6 +67,15 @@ class TTLCache(Generic[T]):
         with self._lock:
             self._data.clear()
 
+    def __setitem__(self, key: str, value: T) -> None:
+        self.set(key, value)
+
+    def __getitem__(self, key: str) -> T:
+        result = self.get(key)
+        if result is None and key not in self:
+            raise KeyError(key)
+        return result
+
     def __contains__(self, key: str) -> bool:
         return self.get(key) is not None
 
