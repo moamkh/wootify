@@ -256,17 +256,18 @@ class InstanceService:
             raise
 
     def get_runtime_instance(self, db: Session, instance_key: str) -> Optional[RuntimeInstance]:
-        """Get runtime instance."""
-        cached = _runtime_instance_cache.get(instance_key)
-        if cached is not None:
-            return cached
+        """Get runtime instance.
+
+        NOTE: We intentionally do NOT cache the result here. Caching
+        RuntimeInstance objects causes DetachedInstanceError because they
+        contain live SQLAlchemy ORM instances that cannot safely be shared
+        across sessions or async tasks.
+        """
         try:
             row = self._instance_repo(db).get_by_key(instance_key)
             if not row:
                 return None
-            runtime = self._to_runtime(db, row)
-            _runtime_instance_cache.set(instance_key, runtime)
-            return runtime
+            return self._to_runtime(db, row)
         except Exception:
             logger.exception('get_runtime_instance failed instance_key=%s', instance_key)
             raise
