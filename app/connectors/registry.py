@@ -9,6 +9,7 @@ from __future__ import annotations
 from typing import Any
 
 from app.connectors.bale_connector import bale
+from app.connectors.bale_pv_connector import bale_pv
 from app.connectors.base_connector import PlatformConnector
 from app.connectors.telegram_connector import telegram
 
@@ -16,6 +17,7 @@ from app.connectors.telegram_connector import telegram
 CONNECTOR_SOURCE_PREFIX = {
     'bale': 'BALE',
     'bale_enterprise': 'BALE_ENTERPRISE',
+    'bale_pv_enterprise': 'BALE_PV',
     'telegram': 'TELEGRAM',
     'telegram_enterprise': 'TELEGRAM_ENTERPRISE',
 }
@@ -28,6 +30,7 @@ class ConnectorRegistry:
         self._connectors: dict[str, PlatformConnector] = {
             'bale': bale,
             'bale_enterprise': bale,
+            'bale_pv_enterprise': bale_pv,
             'telegram': telegram,
             'telegram_enterprise': telegram,
         }

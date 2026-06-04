@@ -242,3 +242,19 @@ export function runEnterpriseSmsSyncNow(instanceKey) {
 export function getVersion() {
   return fetchJSON('/api/v1/version');
 }
+
+export function balePvSendCode(instanceKey) {
+  return fetchJSON(`/api/v1/instances/${encodeURIComponent(instanceKey)}/bale-pv/auth/send-code`, { method: 'POST' });
+}
+
+export function balePvValidateCode(instanceKey, code) {
+  return fetchJSON(`/api/v1/instances/${encodeURIComponent(instanceKey)}/bale-pv/auth/validate-code`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ code }),
+  });
+}
+
+export function balePvAuthStatus(instanceKey) {
+  return fetchJSON(`/api/v1/instances/${encodeURIComponent(instanceKey)}/bale-pv/auth/status`);
+}

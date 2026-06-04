@@ -13,3 +13,7 @@ aiofiles
 cryptography
 python-bale-bot
 python-telegram-bot>=22,<23
+# Balethon from GitHub (userbot support — unreleased)
+git+https://github.com/Balethon/Balethon.git@main
+websockets>=15.0
+protobuf>=4.0

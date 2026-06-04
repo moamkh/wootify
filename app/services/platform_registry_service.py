@@ -34,6 +34,14 @@ BALE_ENTERPRISE_CAPABILITIES = {
     'mark_as_read': False,
 }
 
+BALE_PV_ENTERPRISE_CAPABILITIES = {
+    'send_text': True,
+    'send_media': True,
+    'reply_sync': True,
+    'inbound_polling': True,
+    'mark_as_read': False,
+}
+
 TELEGRAM_CAPABILITIES = {
     'send_text': True,
     'send_media': True,
@@ -64,6 +72,21 @@ BALE_METADATA_SCHEMA: dict[str, Any] = {
         'bale_share_phone_prompt_enabled': {'type': 'boolean'},
         'bale_share_phone_prompt_only_if_missing_phone': {'type': 'boolean'},
         'bale_share_phone_prompt_text': {'type': 'string'},
+    },
+}
+
+BALE_PV_ENTERPRISE_METADATA_SCHEMA: dict[str, Any] = {
+    'type': 'object',
+    'required': ['bale_pv_phone_number'],
+    'properties': {
+        'bale_pv_phone_number': {'type': 'string'},
+        'bale_pv_session_dir': {'type': 'string'},
+        'bale_pv_poll_interval': {'type': 'integer'},
+        'bale_pv_display_name': {'type': 'string'},
+        'bale_pv_department': {'type': 'string'},
+        'bale_pv_share_phone_prompt_enabled': {'type': 'boolean'},
+        'bale_pv_share_phone_prompt_only_if_missing_phone': {'type': 'boolean'},
+        'bale_pv_share_phone_prompt_text': {'type': 'string'},
     },
 }
 
@@ -208,6 +231,13 @@ class PlatformRegistryService:
                 display_name='Bale Enterprise',
                 capabilities_json=BALE_ENTERPRISE_CAPABILITIES,
                 metadata_schema_json=BALE_ENTERPRISE_METADATA_SCHEMA,
+                is_active=True,
+            )
+            platform_repo.upsert(
+                key='bale_pv_enterprise',
+                display_name='Bale PV (Personal)',
+                capabilities_json=BALE_PV_ENTERPRISE_CAPABILITIES,
+                metadata_schema_json=BALE_PV_ENTERPRISE_METADATA_SCHEMA,
                 is_active=True,
             )
             platform_repo.upsert(

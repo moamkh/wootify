@@ -646,6 +646,9 @@ class BalePollingService:
         if key == 'telegram':
             raw = cfg.get('telegram_poll_interval')
             return int(raw or settings.TELEGRAM_POLL_INTERVAL_SECONDS)
+        if key == 'bale_pv_enterprise':
+            raw = cfg.get('bale_pv_poll_interval')
+            return int(raw or settings.BALE_POLL_INTERVAL_SECONDS)
         raw = cfg.get('bale_poll_interval')
         return int(raw or settings.BALE_POLL_INTERVAL_SECONDS)
 
@@ -680,6 +683,19 @@ class BalePollingService:
                     default=True,
                 ),
                 'text': str(cfg.get('telegram_share_phone_prompt_text') or settings.TELEGRAM_SHARE_PHONE_PROMPT_TEXT).strip(),
+            }
+
+        if key == 'bale_pv_enterprise':
+            return {
+                'enabled': self._coerce_bool(
+                    cfg.get('bale_pv_share_phone_prompt_enabled'),
+                    default=settings.BALE_SHARE_PHONE_BUTTON,
+                ),
+                'only_if_missing_phone': self._coerce_bool(
+                    cfg.get('bale_pv_share_phone_prompt_only_if_missing_phone'),
+                    default=True,
+                ),
+                'text': str(cfg.get('bale_pv_share_phone_prompt_text') or settings.BALE_SHARE_PHONE_PROMPT_TEXT).strip(),
             }
 
         return {

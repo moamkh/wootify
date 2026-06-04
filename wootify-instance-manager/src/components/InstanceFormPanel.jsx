@@ -112,6 +112,7 @@ export default function InstanceFormPanel({
   isBalePlatform,
   isStandardBalePlatform,
   isEnterpriseBalePlatform,
+  isBalePvPlatform,
   isTelegramPlatform,
   isEnterpriseTelegramPlatform,
   isEnterprisePlatform,
@@ -122,6 +123,12 @@ export default function InstanceFormPanel({
   onSaveEnterpriseSmsSync,
   onRunEnterpriseSmsSyncNow,
   copyTextToClipboard,
+  balePvAuthCode,
+  setBalePvAuthCode,
+  balePvAuthLoading,
+  onBalePvSendCode,
+  onBalePvValidateCode,
+  onBalePvAuthStatus,
 }) {
   return (
     <section className="card section-stack">
@@ -170,7 +177,7 @@ export default function InstanceFormPanel({
           Instance enabled
         </label>
 
-        {isBalePlatform ? (
+        {isBalePlatform && !isBalePvPlatform ? (
           <>
             <h3>{isEnterpriseBalePlatform ? 'Bale enterprise metadata' : 'Bale metadata'}</h3>
             <div className="row">
@@ -262,6 +269,113 @@ export default function InstanceFormPanel({
                 ))}
               </>
             ) : null}
+          </>
+        ) : null}
+
+        {isBalePvPlatform ? (
+          <>
+            <h3>Bale PV (Personal Account)</h3>
+            <div className="row">
+              <label>
+                Phone Number
+                <input
+                  value={form.bale_pv_phone_number}
+                  onChange={(e) => setForm((s) => ({ ...s, bale_pv_phone_number: e.target.value }))}
+                  placeholder="e.g. 09123456711"
+                />
+              </label>
+              <label>
+                Poll Interval
+                <input
+                  value={form.bale_pv_poll_interval}
+                  onChange={(e) => setForm((s) => ({ ...s, bale_pv_poll_interval: e.target.value }))}
+                />
+              </label>
+            </div>
+            <div className="row">
+              <label>
+                Display Name
+                <input
+                  value={form.bale_pv_display_name}
+                  onChange={(e) => setForm((s) => ({ ...s, bale_pv_display_name: e.target.value }))}
+                />
+              </label>
+              <label>
+                Department
+                <input
+                  value={form.bale_pv_department}
+                  onChange={(e) => setForm((s) => ({ ...s, bale_pv_department: e.target.value }))}
+                />
+              </label>
+            </div>
+
+            {selectedKey ? (
+              <div className="form-section-block" style={{ marginTop: 12 }}>
+                <h4>Authentication</h4>
+                <div className="row">
+                  <button
+                    type="button"
+                    className="btn"
+                    disabled={busy || balePvAuthLoading}
+                    onClick={() => onBalePvSendCode(selectedKey)}
+                  >
+                    {balePvAuthLoading ? 'Sending...' : 'Send SMS Code'}
+                  </button>
+                  <button
+                    type="button"
+                    className="btn secondary"
+                    disabled={busy || balePvAuthLoading}
+                    onClick={() => onBalePvAuthStatus(selectedKey)}
+                  >
+                    Check Status
+                  </button>
+                </div>
+                <div className="row" style={{ marginTop: 8 }}>
+                  <label style={{ flex: 1 }}>
+                    SMS Code
+                    <input
+                      value={balePvAuthCode}
+                      onChange={(e) => setBalePvAuthCode(e.target.value)}
+                      placeholder="Enter code from SMS"
+                    />
+                  </label>
+                  <button
+                    type="button"
+                    className="btn primary"
+                    disabled={busy || balePvAuthLoading || !balePvAuthCode.trim()}
+                    onClick={() => onBalePvValidateCode(selectedKey, balePvAuthCode.trim())}
+                  >
+                    {balePvAuthLoading ? 'Validating...' : 'Validate Code'}
+                  </button>
+                </div>
+              </div>
+            ) : null}
+
+            <h4>Bale PV phone prompt</h4>
+            <label className="checkbox">
+              <input
+                type="checkbox"
+                checked={Boolean(form.bale_pv_share_phone_prompt_enabled)}
+                onChange={(e) => setForm((s) => ({ ...s, bale_pv_share_phone_prompt_enabled: e.target.checked }))}
+              />
+              Enable share-phone prompt
+            </label>
+            <label className="checkbox">
+              <input
+                type="checkbox"
+                checked={Boolean(form.bale_pv_share_phone_prompt_only_if_missing_phone)}
+                onChange={(e) => setForm((s) => ({ ...s, bale_pv_share_phone_prompt_only_if_missing_phone: e.target.checked }))}
+              />
+              Send prompt only if Chatwoot contact has no phone number
+            </label>
+            <label>
+              Share-Phone Prompt Text
+              <textarea
+                rows={3}
+                value={form.bale_pv_share_phone_prompt_text}
+                onChange={(e) => setForm((s) => ({ ...s, bale_pv_share_phone_prompt_text: e.target.value }))}
+              />
+            </label>
           </>
         ) : null}
 

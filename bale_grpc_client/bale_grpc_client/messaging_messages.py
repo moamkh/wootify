@@ -1,0 +1,368 @@
+"""
+Bale Messaging Protobuf Message Builders
+=========================================
+
+Reverse-engineered from WebSocket frame captures on web.bale.ai.
+
+WebSocket Frame Structure (Client -> Server)
+--------------------------------------------
+Outer wrapper (ClientPack):
+  Field 1 (bytes): Inner wrapper message
+
+Inner wrapper:
+  Field 1 (string): Service name  (e.g. "bale.messaging.v2.Messaging")
+  Field 2 (string): Method name   (e.g. "SendMessage")
+  Field 3 (bytes):  Request payload
+  Field 4 (bytes):  Metadata message
+  Field 5 (varint): Flags / timeout (always 25 in captures)
+
+Metadata message:
+  Field 1 (repeated message): Metadata entries
+    Each entry:
+      Field 1 (string): key
+      Field 2 (message): StringValue wrapper { Field 1: value string }
+
+SendMessage Payload:
+  Field 1 (message): peer { Field 1: type (1=user), Field 2: id }
+  Field 2 (varint):  random_id (client-generated int64)
+  Field 3 (message): message { Field 15: textMessage { Field 1: text, Field 2: mentions } }
+  Field 6 (message): peer (duplicate of Field 1)
+
+UpdateMessage Payload (edit):
+  Inferred: peer, message_id, new message content
+
+MessageRead Payload:
+  Inferred: peer, max_id
+
+StopTyping Payload:
+  peer
+
+File Service (ai.bale.server.Files):
+  GetNasimFileUrl request:
+    Field 1 (message): peer
+    Field 2 (message): file { Field 1: fileId, Field 2: accessHash, Field 3: fileStorageVersion }
+    Field 3 (message): filename (StringValue wrapper)
+  GetNasimFileUrls request:
+    Field 1 (message): peer
+    Field 2 (repeated message): files
+  Response:
+    Field 1 (message): fileUrl { Field 1: fileId, Field 2: url, Field 3: duplicate, Field 4: chunkSize, Field 5: blockSize }
+"""
+
+import random
+import time
+from typing import Dict, List, Optional
+
+from .protobuf_wire import ProtobufMessage
+
+
+class StringValue:
+    """google.protobuf.StringValue wrapper."""
+
+    @staticmethod
+    def serialize(value: str) -> bytes:
+        msg = ProtobufMessage()
+        msg.add_string(1, value)
+        return msg.serialize()
+
+    @staticmethod
+    def parse(data: bytes) -> str:
+        from .protobuf_wire import ProtobufParser
+        fields = ProtobufParser(data).parse()
+        val = fields.get(1, [b""])[0]
+        return val.decode("utf-8") if isinstance(val, bytes) else str(val)
+
+
+class Peer:
+    """Peer identifier (user or group)."""
+
+    PEER_TYPE_USER = 1
+    PEER_TYPE_GROUP = 2
+    PEER_TYPE_CHANNEL = 3
+
+    def __init__(self, peer_id: int, peer_type: int = PEER_TYPE_USER):
+        self.peer_id = peer_id
+        self.peer_type = peer_type
+
+    def serialize(self) -> bytes:
+        msg = ProtobufMessage()
+        msg.add_int32(1, self.peer_type)
+        msg.add_int64(2, self.peer_id)
+        return msg.serialize()
+
+
+class TextMessage:
+    """Text message content."""
+
+    def __init__(self, text: str):
+        self.text = text
+
+    def serialize(self) -> bytes:
+        msg = ProtobufMessage()
+        msg.add_string(1, self.text)
+        # Field 2 is an empty bytes field (mentions/formatting) in captures.
+        # ProtobufMessage.add_bytes skips empty values, so append directly.
+        msg._fields.append((2, 2, b""))
+        return msg.serialize()
+
+
+class MessageContent:
+    """Message content wrapper (selects content type via field number)."""
+
+    def __init__(self, text: Optional[str] = None):
+        self.text = text
+
+    def serialize(self) -> bytes:
+        msg = ProtobufMessage()
+        if self.text is not None:
+            msg.add_message(15, TextMessage(self.text))
+        return msg.serialize()
+
+
+class MetadataEntry:
+    """Single metadata key-value pair."""
+
+    def __init__(self, key: str, value: str):
+        self.key = key
+        self.value = value
+
+    def serialize(self) -> bytes:
+        msg = ProtobufMessage()
+        msg.add_string(1, self.key)
+        # Field 2 is a StringValue wrapper { field 1: value }
+        sv = ProtobufMessage()
+        sv.add_string(1, self.value)
+        msg.add_message(2, sv)
+        return msg.serialize()
+
+
+class Metadata:
+    """Metadata container with repeated entries."""
+
+    def __init__(self, entries: Optional[Dict[str, str]] = None):
+        self.entries = entries or {}
+
+    def serialize(self) -> bytes:
+        msg = ProtobufMessage()
+        for key, value in self.entries.items():
+            msg.add_message(1, MetadataEntry(key, value))
+        return msg.serialize()
+
+
+class WsInnerWrapper:
+    """Inner wrapper for WebSocket gRPC-Web frames."""
+
+    def __init__(
+        self,
+        service: str,
+        method: str,
+        payload: bytes,
+        metadata: Optional[Dict[str, str]] = None,
+        flags: int = 25,
+    ):
+        self.service = service
+        self.method = method
+        self.payload = payload
+        self.metadata = metadata or {}
+        self.flags = flags
+
+    def serialize(self) -> bytes:
+        msg = ProtobufMessage()
+        msg.add_string(1, self.service)
+        msg.add_string(2, self.method)
+        msg.add_bytes(3, self.payload)
+        msg.add_message(4, Metadata(self.metadata))
+        msg.add_int32(5, self.flags)
+        return msg.serialize()
+
+
+class WsClientPack:
+    """Outer wrapper sent over WebSocket."""
+
+    def __init__(self, inner: WsInnerWrapper):
+        self.inner = inner
+
+    def serialize(self) -> bytes:
+        msg = ProtobufMessage()
+        msg.add_bytes(1, self.inner.serialize())
+        return msg.serialize()
+
+
+class SendMessageRequest:
+    """Request payload for bale.messaging.v2.Messaging/SendMessage"""
+
+    def __init__(
+        self,
+        peer_id: int,
+        text: str,
+        random_id: Optional[int] = None,
+        reply_to_message_id: Optional[int] = None,
+    ):
+        self.peer_id = peer_id
+        self.text = text
+        # Use a large random int64 if not provided
+        self.random_id = random_id or random.randint(1, 2**63 - 1)
+        self.reply_to_message_id = reply_to_message_id
+
+    def serialize(self) -> bytes:
+        peer = Peer(self.peer_id)
+        msg = ProtobufMessage()
+        msg.add_message(1, peer)
+        msg.add_int64(2, self.random_id)
+        msg.add_message(3, MessageContent(text=self.text))
+        if self.reply_to_message_id is not None:
+            # Field 4: replyTo peer (same type, different message_id as id)
+            msg.add_message(4, Peer(self.reply_to_message_id))
+        # Field 6 is a duplicate peer in captures
+        msg.add_message(6, peer)
+        return msg.serialize()
+
+
+class UpdateMessageRequest:
+    """Request payload for bale.messaging.v2.Messaging/UpdateMessage (edit)."""
+
+    def __init__(
+        self,
+        peer_id: int,
+        message_id: int,
+        text: str,
+    ):
+        self.peer_id = peer_id
+        self.message_id = message_id
+        self.text = text
+
+    def serialize(self) -> bytes:
+        peer = Peer(self.peer_id)
+        msg = ProtobufMessage()
+        msg.add_message(1, peer)
+        # message_id is typically the message to edit
+        msg.add_int64(2, self.message_id)
+        msg.add_message(3, MessageContent(text=self.text))
+        msg.add_message(6, peer)
+        return msg.serialize()
+
+
+class MessageReadRequest:
+    """Request payload for bale.messaging.v2.Messaging/MessageRead"""
+
+    def __init__(self, peer_id: int, max_id: int):
+        self.peer_id = peer_id
+        self.max_id = max_id
+
+    def serialize(self) -> bytes:
+        peer = Peer(self.peer_id)
+        msg = ProtobufMessage()
+        msg.add_message(1, peer)
+        msg.add_int64(2, self.max_id)
+        msg.add_message(6, peer)
+        return msg.serialize()
+
+
+class StopTypingRequest:
+    """Request payload for bale.messaging.v2.Messaging/StopTyping"""
+
+    def __init__(self, peer_id: int):
+        self.peer_id = peer_id
+
+    def serialize(self) -> bytes:
+        peer = Peer(self.peer_id)
+        msg = ProtobufMessage()
+        msg.add_message(1, peer)
+        msg.add_message(6, peer)
+        return msg.serialize()
+
+
+# ------------------------------------------------------------------
+# File service protobuf builders
+# ------------------------------------------------------------------
+
+class File:
+    """File reference for download/upload.
+
+    Fields:
+      1: fileId (int64)
+      2: accessHash (int64)
+      3: fileStorageVersion (int32)
+    """
+
+    def __init__(self, file_id: int, access_hash: int, file_storage_version: int = 0):
+        self.file_id = file_id
+        self.access_hash = access_hash
+        self.file_storage_version = file_storage_version
+
+    def serialize(self) -> bytes:
+        msg = ProtobufMessage()
+        msg.add_int64(1, self.file_id)
+        msg.add_int64(2, self.access_hash)
+        if self.file_storage_version:
+            msg.add_int32(3, self.file_storage_version)
+        return msg.serialize()
+
+
+class GetNasimFileUrlRequest:
+    """Request for ai.bale.server.Files/GetNasimFileUrl.
+
+    The web client calls this as ``GetNasimFileUrl({file: fileLocation})``
+    where ``fileLocation`` is ``{fileId, accessHash, fileStorageVersion}``.
+
+    Fields:
+      1: file (File) {fileId(1), accessHash(2), fileStorageVersion(3)}
+    """
+
+    def __init__(self, file_id: int, access_hash: int, file_storage_version: int = 0):
+        self.file_id = file_id
+        self.access_hash = access_hash
+        self.file_storage_version = file_storage_version
+
+    def serialize(self) -> bytes:
+        msg = ProtobufMessage()
+        msg.add_message(1, File(self.file_id, self.access_hash, self.file_storage_version))
+        return msg.serialize()
+
+
+class GetNasimFileUrlsRequest:
+    """Request for ai.bale.server.Files/GetNasimFileUrls.
+
+    Fields:
+      1: peer (Peer)
+      2: files (repeated File)
+    """
+
+    def __init__(self, peer_id: int, files: List[Dict[str, int]]):
+        self.peer_id = peer_id
+        self.files = files
+
+    def serialize(self) -> bytes:
+        msg = ProtobufMessage()
+        msg.add_message(1, Peer(self.peer_id))
+        for f in self.files:
+            msg.add_message(2, File(f["file_id"], f["access_hash"], f.get("file_storage_version", 0)))
+        return msg.serialize()
+
+
+class StringValueWrapper:
+    """google.protobuf.StringValue wrapper for field 3."""
+
+    def __init__(self, value: str):
+        self.value = value
+
+    def serialize(self) -> bytes:
+        msg = ProtobufMessage()
+        msg.add_string(1, self.value)
+        return msg.serialize()
+
+
+def build_ws_frame(
+    service: str,
+    method: str,
+    payload: bytes,
+    metadata: Optional[Dict[str, str]] = None,
+) -> bytes:
+    """Build a complete WebSocket frame for sending."""
+    inner = WsInnerWrapper(
+        service=service,
+        method=method,
+        payload=payload,
+        metadata=metadata,
+    )
+    return WsClientPack(inner).serialize()

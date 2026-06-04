@@ -338,3 +338,29 @@ class EnterpriseManualGroupsWithManualsResponse(BaseModel):
     """Response schema for all enterprise manual groups with their manuals."""
     groups: list[EnterpriseManualGroupWithManualsResponse]
     manual_group_map: dict[str, str]
+
+
+class BalePvContact(BaseModel):
+    """A single Bale PV contact."""
+    id: int
+    name: str = ""
+    nick: str = ""
+
+
+class BalePvContactsResponse(BaseModel):
+    """Response schema for Bale PV contacts list."""
+    contacts: list[BalePvContact]
+
+
+class BalePvDialog(BaseModel):
+    """A single Bale PV dialog/conversation."""
+    peer_id: int
+    peer_type: int = 1
+    unread_count: int = 0
+    text: str = ""
+    date: Optional[int] = None
+
+
+class BalePvDialogsResponse(BaseModel):
+    """Response schema for Bale PV dialogs list."""
+    dialogs: list[BalePvDialog]

@@ -39,6 +39,9 @@ import {
   addManualToEnterpriseGroup,
   removeManualFromEnterpriseGroup,
   getVersion,
+  balePvSendCode,
+  balePvValidateCode,
+  balePvAuthStatus,
 } from './api.js';
 import PageLoader from './components/PageLoader.jsx';
 
@@ -47,6 +50,7 @@ const InstanceWorkspacePage = lazy(() => import('./pages/InstanceWorkspacePage.j
 
 const PLATFORM_BALE = 'bale';
 const PLATFORM_BALE_ENTERPRISE = 'bale_enterprise';
+const PLATFORM_BALE_PV_ENTERPRISE = 'bale_pv_enterprise';
 const PLATFORM_TELEGRAM = 'telegram';
 const PLATFORM_TELEGRAM_ENTERPRISE = 'telegram_enterprise';
 const DEFAULT_PLATFORM = PLATFORM_BALE;
@@ -109,6 +113,14 @@ function defaultForm(features) {
     bale_share_phone_prompt_enabled: true,
     bale_share_phone_prompt_only_if_missing_phone: true,
     bale_share_phone_prompt_text: 'Use the button below to share your phone number.\nCommands: /share_phone, /help',
+    bale_pv_phone_number: '',
+    bale_pv_session_dir: '',
+    bale_pv_poll_interval: '5',
+    bale_pv_display_name: '',
+    bale_pv_department: '',
+    bale_pv_share_phone_prompt_enabled: true,
+    bale_pv_share_phone_prompt_only_if_missing_phone: true,
+    bale_pv_share_phone_prompt_text: 'Use the button below to share your phone number.\nCommands: /share_phone, /help',
     enterprise_welcome_text: ENTERPRISE_DEFAULTS.welcome_text,
     enterprise_phone_prompt_text: ENTERPRISE_DEFAULTS.phone_prompt_text,
     enterprise_menu_prompt_text: ENTERPRISE_DEFAULTS.menu_prompt_text,
@@ -186,6 +198,16 @@ function createPayload(form, { patch = false } = {}) {
     platformMetadata.bale_bot_name = form.bale_bot_name?.trim() || undefined;
     platformMetadata.bale_bot_id = form.bale_bot_id?.trim() || undefined;
     platformMetadata.bale_department = form.bale_department?.trim() || undefined;
+  }
+  if (form.platform_type_key === PLATFORM_BALE_PV_ENTERPRISE) {
+    platformMetadata.bale_pv_phone_number = form.bale_pv_phone_number?.trim() || undefined;
+    platformMetadata.bale_pv_session_dir = form.bale_pv_session_dir?.trim() || undefined;
+    platformMetadata.bale_pv_poll_interval = Number(form.bale_pv_poll_interval) > 0 ? Number(form.bale_pv_poll_interval) : undefined;
+    platformMetadata.bale_pv_display_name = form.bale_pv_display_name?.trim() || undefined;
+    platformMetadata.bale_pv_department = form.bale_pv_department?.trim() || undefined;
+    platformMetadata.bale_pv_share_phone_prompt_enabled = Boolean(form.bale_pv_share_phone_prompt_enabled);
+    platformMetadata.bale_pv_share_phone_prompt_only_if_missing_phone = Boolean(form.bale_pv_share_phone_prompt_only_if_missing_phone);
+    platformMetadata.bale_pv_share_phone_prompt_text = form.bale_pv_share_phone_prompt_text?.trim() || undefined;
   }
   if (form.platform_type_key === PLATFORM_TELEGRAM || form.platform_type_key === PLATFORM_TELEGRAM_ENTERPRISE) {
     platformMetadata.telegram_api_base_url = form.telegram_api_base_url?.trim() || undefined;
@@ -325,6 +347,12 @@ function createPayload(form, { patch = false } = {}) {
     payload.platform_metadata.telegram_token = telegramToken;
   }
 
+  if (form.platform_type_key === PLATFORM_BALE_PV_ENTERPRISE) {
+    payload.chatwoot.inbox_id = Number(form.chatwoot_inbox_id) > 0 ? Number(form.chatwoot_inbox_id) : undefined;
+    payload.chatwoot.inbox_name = form.chatwoot_inbox_name?.trim() || undefined;
+    payload.chatwoot.auto_create = Boolean(form.chatwoot_auto_create);
+    payload.chatwoot.reopen_conversation = Boolean(form.chatwoot_reopen_conversation);
+  }
   const chatwootToken = form.chatwoot_api_access_token?.trim();
   if (chatwootToken && !chatwootToken.includes('***')) {
     payload.chatwoot.api_access_token = chatwootToken;
@@ -456,6 +484,8 @@ export default function App() {
   const [editingCatalogDisplayName, setEditingCatalogDisplayName] = useState('');
   const [editingCatalogLinkUrl, setEditingCatalogLinkUrl] = useState('');
   const [version, setVersion] = useState('');
+  const [balePvAuthCode, setBalePvAuthCode] = useState('');
+  const [balePvAuthLoading, setBalePvAuthLoading] = useState(false);
 
   const selectedPlatform = useMemo(
     () => platformTypes.find((item) => item.key === form.platform_type_key) || null,
@@ -482,6 +512,9 @@ export default function App() {
         item.platform_type_key,
         item.platform_metadata?.bale_bot_name,
         item.platform_metadata?.bale_department,
+        item.platform_metadata?.bale_pv_display_name,
+        item.platform_metadata?.bale_pv_department,
+        item.platform_metadata?.bale_pv_phone_number,
         item.platform_metadata?.telegram_bot_name,
         item.platform_metadata?.telegram_department,
         item.chatwoot?.account_id,
@@ -495,9 +528,10 @@ export default function App() {
 
   const selectedInstance = selectedKey ? instanceMap[selectedKey] : null;
   const isDetailView = viewMode === 'detail';
-  const isBalePlatform = form.platform_type_key === PLATFORM_BALE || form.platform_type_key === PLATFORM_BALE_ENTERPRISE;
+  const isBalePlatform = form.platform_type_key === PLATFORM_BALE || form.platform_type_key === PLATFORM_BALE_ENTERPRISE || form.platform_type_key === PLATFORM_BALE_PV_ENTERPRISE;
   const isStandardBalePlatform = form.platform_type_key === PLATFORM_BALE;
   const isEnterpriseBalePlatform = form.platform_type_key === PLATFORM_BALE_ENTERPRISE;
+  const isBalePvPlatform = form.platform_type_key === PLATFORM_BALE_PV_ENTERPRISE;
   const isTelegramPlatform = form.platform_type_key === PLATFORM_TELEGRAM || form.platform_type_key === PLATFORM_TELEGRAM_ENTERPRISE;
   const isEnterpriseTelegramPlatform = form.platform_type_key === PLATFORM_TELEGRAM_ENTERPRISE;
   const isEnterprisePlatform = isEnterpriseBalePlatform || isEnterpriseTelegramPlatform;
@@ -642,6 +676,17 @@ export default function App() {
         row.platform_metadata?.bale_share_phone_prompt_only_if_missing_phone ?? true,
       bale_share_phone_prompt_text:
         row.platform_metadata?.bale_share_phone_prompt_text ||
+        'Use the button below to share your phone number.\nCommands: /share_phone, /help',
+      bale_pv_phone_number: row.platform_metadata?.bale_pv_phone_number || '',
+      bale_pv_session_dir: row.platform_metadata?.bale_pv_session_dir || '',
+      bale_pv_poll_interval: String(row.platform_metadata?.bale_pv_poll_interval ?? '5'),
+      bale_pv_display_name: row.platform_metadata?.bale_pv_display_name || '',
+      bale_pv_department: row.platform_metadata?.bale_pv_department || '',
+      bale_pv_share_phone_prompt_enabled: row.platform_metadata?.bale_pv_share_phone_prompt_enabled ?? true,
+      bale_pv_share_phone_prompt_only_if_missing_phone:
+        row.platform_metadata?.bale_pv_share_phone_prompt_only_if_missing_phone ?? true,
+      bale_pv_share_phone_prompt_text:
+        row.platform_metadata?.bale_pv_share_phone_prompt_text ||
         'Use the button below to share your phone number.\nCommands: /share_phone, /help',
       enterprise_welcome_text: row.platform_metadata?.enterprise_welcome_text || ENTERPRISE_DEFAULTS.welcome_text,
       enterprise_phone_prompt_text:
@@ -1294,6 +1339,7 @@ export default function App() {
     isBalePlatform,
     isTelegramPlatform,
     isEnterpriseBalePlatform,
+    isBalePvPlatform,
     isEnterpriseTelegramPlatform,
     isEnterprisePlatform,
     enterpriseRoutes: selectedInstance?.platform_metadata?.enterprise_routes || [],
@@ -1316,6 +1362,7 @@ export default function App() {
     isBalePlatform,
     isStandardBalePlatform,
     isEnterpriseBalePlatform,
+    isBalePvPlatform,
     isEnterpriseTelegramPlatform,
     isEnterprisePlatform,
     isTelegramPlatform,
@@ -1326,6 +1373,40 @@ export default function App() {
     onSaveEnterpriseSmsSync,
     onRunEnterpriseSmsSyncNow,
     copyTextToClipboard,
+    balePvAuthCode,
+    setBalePvAuthCode,
+    balePvAuthLoading,
+    setBalePvAuthLoading,
+    onBalePvSendCode: async (instanceKey) => {
+      setBalePvAuthLoading(true);
+      try {
+        const res = await balePvSendCode(instanceKey);
+        alert(res?.message || 'Code sent');
+      } catch (e) {
+        alert(e?.message || String(e));
+      } finally {
+        setBalePvAuthLoading(false);
+      }
+    },
+    onBalePvValidateCode: async (instanceKey, code) => {
+      setBalePvAuthLoading(true);
+      try {
+        const res = await balePvValidateCode(instanceKey, code);
+        alert(res?.message || 'Authenticated');
+      } catch (e) {
+        alert(e?.message || String(e));
+      } finally {
+        setBalePvAuthLoading(false);
+      }
+    },
+    onBalePvAuthStatus: async (instanceKey) => {
+      try {
+        const res = await balePvAuthStatus(instanceKey);
+        alert(`${res?.message || 'unknown'} | ${res?.detail || ''}`);
+      } catch (e) {
+        alert(e?.message || String(e));
+      }
+    },
   };
 
   const mappingProps = {
@@ -1486,6 +1567,7 @@ export default function App() {
             onDelete={onDelete}
             PLATFORM_TELEGRAM={PLATFORM_TELEGRAM}
             PLATFORM_BALE_ENTERPRISE={PLATFORM_BALE_ENTERPRISE}
+            PLATFORM_BALE_PV_ENTERPRISE={PLATFORM_BALE_PV_ENTERPRISE}
             PLATFORM_TELEGRAM_ENTERPRISE={PLATFORM_TELEGRAM_ENTERPRISE}
           />
         )}

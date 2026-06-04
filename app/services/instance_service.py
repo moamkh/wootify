@@ -35,6 +35,7 @@ CHATWOOT_CAPABILITIES = {
 PLATFORM_REQUIRED_TOKEN_KEY = {
     'bale': 'bale_token',
     'bale_enterprise': 'bale_token',
+    'bale_pv_enterprise': 'bale_pv_phone_number',
     'telegram': 'telegram_token',
     'telegram_enterprise': 'telegram_token',
 }
@@ -56,9 +57,17 @@ class RuntimeInstance:
     runtime_state_last_sms_sync_at: Optional[_dt.datetime] = None
 
 
+@dataclass(frozen=True)
+class _CachedFeatureDef:
+    key: str
+    default_enabled: bool
+    required_platform_capability: Optional[str]
+    required_chatwoot_capability: Optional[str]
+
+
 # Module-level caches to avoid repeated decryption and feature override computation.
 _runtime_instance_cache: TTLCache[RuntimeInstance] = TTLCache(maxsize=200, ttl=60)
-_feature_defs_cache: list[Any] | None = None
+_feature_defs_cache: list[_CachedFeatureDef] | None = None
 
 
 def _invalidate_instance_cache(instance_key: str) -> None:
@@ -380,8 +389,16 @@ class InstanceService:
         if _feature_defs_cache is not None:
             return _feature_defs_cache
         feature_defs = self._feature_repo(db).list_all()
-        _feature_defs_cache = feature_defs
-        return feature_defs
+        _feature_defs_cache = [
+            _CachedFeatureDef(
+                key=f.key,
+                default_enabled=f.default_enabled,
+                required_platform_capability=f.required_platform_capability,
+                required_chatwoot_capability=f.required_chatwoot_capability,
+            )
+            for f in feature_defs
+        ]
+        return _feature_defs_cache
 
     def _upsert_feature_overrides(
         self,
@@ -553,6 +570,26 @@ class InstanceService:
                 'enterprise_address_button_label': str(data.get('enterprise_address_button_label') or '').strip() or None,
                 'enterprise_back_button_label': str(data.get('enterprise_back_button_label') or '').strip() or None,
                 'enterprise_routes': routes,
+            }
+
+        if key == 'bale_pv_enterprise':
+            return {
+                'bale_pv_phone_number': str(data.get('bale_pv_phone_number') or '').strip(),
+                'bale_pv_session_dir': str(data.get('bale_pv_session_dir') or '').strip() or None,
+                'bale_pv_poll_interval': int(data.get('bale_pv_poll_interval') or settings.BALE_POLL_INTERVAL_SECONDS),
+                'bale_pv_display_name': str(data.get('bale_pv_display_name') or '').strip() or None,
+                'bale_pv_department': str(data.get('bale_pv_department') or '').strip() or None,
+                'bale_pv_share_phone_prompt_enabled': self._coerce_bool(
+                    data.get('bale_pv_share_phone_prompt_enabled'),
+                    default=settings.BALE_SHARE_PHONE_BUTTON,
+                ),
+                'bale_pv_share_phone_prompt_only_if_missing_phone': self._coerce_bool(
+                    data.get('bale_pv_share_phone_prompt_only_if_missing_phone'),
+                    default=True,
+                ),
+                'bale_pv_share_phone_prompt_text': str(
+                    data.get('bale_pv_share_phone_prompt_text') or settings.BALE_SHARE_PHONE_PROMPT_TEXT
+                ).strip(),
             }
 
         if key == 'bale_enterprise':

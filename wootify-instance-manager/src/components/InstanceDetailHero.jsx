@@ -11,6 +11,7 @@ export default function InstanceDetailHero({
   isBalePlatform,
   isTelegramPlatform,
   isEnterpriseBalePlatform,
+  isBalePvPlatform,
   isEnterpriseTelegramPlatform,
   isEnterprisePlatform,
   enterpriseRoutes,
@@ -31,8 +32,11 @@ export default function InstanceDetailHero({
         <span className={`status-pill ${form.is_enabled ? 'good' : 'warn'}`}>{form.is_enabled ? 'Enabled' : 'Disabled'}</span>
       </div>
 
-      {isBalePlatform ? (
+      {isBalePlatform && !isBalePvPlatform ? (
         <div className="instance-token">{maskTokenValue(form.bale_token || selectedInstance?.platform_metadata?.bale_token)}</div>
+      ) : null}
+      {isBalePvPlatform ? (
+        <div className="instance-token">{maskTokenValue(form.bale_pv_phone_number || selectedInstance?.platform_metadata?.bale_pv_phone_number)}</div>
       ) : null}
       {isTelegramPlatform ? (
         <div className="instance-token">
@@ -41,7 +45,7 @@ export default function InstanceDetailHero({
       ) : null}
 
       <div className="instance-meta workspace-hero__metrics">
-        {isBalePlatform ? (
+        {isBalePlatform && !isBalePvPlatform ? (
           <>
             <div>
               <span className="k">Bot name</span>
@@ -54,6 +58,22 @@ export default function InstanceDetailHero({
             <div>
               <span className="k">Department</span>
               <span className="v">{form.bale_department || '-'}</span>
+            </div>
+          </>
+        ) : null}
+        {isBalePvPlatform ? (
+          <>
+            <div>
+              <span className="k">Display name</span>
+              <span className="v">{form.bale_pv_display_name || '-'}</span>
+            </div>
+            <div>
+              <span className="k">Phone</span>
+              <span className="v">{form.bale_pv_phone_number || '-'}</span>
+            </div>
+            <div>
+              <span className="k">Department</span>
+              <span className="v">{form.bale_pv_department || '-'}</span>
             </div>
           </>
         ) : null}
@@ -121,7 +141,7 @@ export default function InstanceDetailHero({
             </>
           ) : (
             <button className="btn" disabled={busy} onClick={() => onCreateInbox(selectedInstance.instance_key)}>
-              Create Inbox
+              {isBalePvPlatform ? 'Link Inbox' : 'Create Inbox'}
             </button>
           )}
           <button className="btn danger" disabled={busy} onClick={() => onDelete(selectedInstance.instance_key)}>

@@ -18,6 +18,8 @@ from sqlalchemy.orm import Session
 from app.db import get_db
 from app.schemas.api_v1 import (
     AutoCreateInboxResponse,
+    BalePvContactsResponse,
+    BalePvDialogsResponse,
     ConversationListResponse,
     ConversationResponse,
     CreateInboxResponse,
@@ -58,6 +60,7 @@ from app.services.enterprise_document_service import EnterpriseDocumentService
 from app.services.enterprise_manual_group_service import EnterpriseManualGroupService
 from app.services.instance_service import InstanceService
 from app.services.message_mapping_service import MessageMappingService
+from app.connectors.bale_pv_connector import bale_pv
 from app.services.platform_registry_service import PlatformRegistryService
 
 router = APIRouter(prefix='/api/v1', tags=['api-v1'])
@@ -501,6 +504,221 @@ async def webhook_chatwoot_enterprise_route(
 ):
     """Route-specific Chatwoot webhook for Bale Enterprise inboxes."""
     return await _handle_chatwoot_webhook(db, instance_key, payload, route_key=route_key)
+
+
+@router.post('/instances/{instance_key}/bale-pv/auth/send-code', response_model=GenericMessageResponse)
+async def bale_pv_send_code(instance_key: str, db: Session = Depends(get_db)):
+    """Send SMS auth code for a Bale PV instance."""
+    try:
+        runtime = _require_instance_runtime(db, instance_key)
+        if runtime.platform_type.key != 'bale_pv_enterprise':
+            _raise_http_error(
+                status_code=400,
+                detail='not a bale_pv_enterprise instance',
+                endpoint='bale_pv_send_code',
+                instance_key=instance_key,
+            )
+        # Ensure connector is initialized (instance may be disabled)
+        await bale_pv.connect(instance_key, runtime.platform_metadata)
+        result = await bale_pv.send_auth_code(instance_key)
+        if not result.get('ok'):
+            _raise_http_error(
+                status_code=400,
+                detail=result.get('description', 'send_code_failed'),
+                endpoint='bale_pv_send_code',
+                instance_key=instance_key,
+            )
+        return GenericMessageResponse(
+            message='code_sent',
+            detail=result.get('transaction_hash'),
+            status='ok',
+        )
+    except HTTPException:
+        raise
+    except Exception as exc:
+        _raise_http_error(
+            status_code=500,
+            detail='internal server error',
+            endpoint='bale_pv_send_code',
+            exc=exc,
+            instance_key=instance_key,
+        )
+
+
+@router.post('/instances/{instance_key}/bale-pv/auth/validate-code', response_model=GenericMessageResponse)
+async def bale_pv_validate_code(instance_key: str, payload: dict[str, Any], db: Session = Depends(get_db)):
+    """Validate SMS auth code for a Bale PV instance."""
+    try:
+        runtime = _require_instance_runtime(db, instance_key)
+        if runtime.platform_type.key != 'bale_pv_enterprise':
+            _raise_http_error(
+                status_code=400,
+                detail='not a bale_pv_enterprise instance',
+                endpoint='bale_pv_validate_code',
+                instance_key=instance_key,
+            )
+        code = str(payload.get('code') or '').strip()
+        if not code:
+            _raise_http_error(
+                status_code=400,
+                detail='code is required',
+                endpoint='bale_pv_validate_code',
+                instance_key=instance_key,
+            )
+        # Ensure connector is initialized (instance may be disabled)
+        await bale_pv.connect(instance_key, runtime.platform_metadata)
+        result = await bale_pv.validate_auth_code(instance_key, code)
+        if not result.get('ok'):
+            _raise_http_error(
+                status_code=400,
+                detail=result.get('description', 'validation_failed'),
+                endpoint='bale_pv_validate_code',
+                instance_key=instance_key,
+            )
+        return GenericMessageResponse(
+            message='authenticated',
+            detail=f"jwt_saved={result.get('jwt_saved')}",
+            status='ok',
+        )
+    except HTTPException:
+        raise
+    except Exception as exc:
+        _raise_http_error(
+            status_code=500,
+            detail='internal server error',
+            endpoint='bale_pv_validate_code',
+            exc=exc,
+            instance_key=instance_key,
+        )
+
+
+@router.get('/instances/{instance_key}/bale-pv/auth/status', response_model=GenericMessageResponse)
+async def bale_pv_auth_status(instance_key: str, db: Session = Depends(get_db)):
+    """Get auth status for a Bale PV instance."""
+    try:
+        runtime = _require_instance_runtime(db, instance_key)
+        if runtime.platform_type.key != 'bale_pv_enterprise':
+            _raise_http_error(
+                status_code=400,
+                detail='not a bale_pv_enterprise instance',
+                endpoint='bale_pv_auth_status',
+                instance_key=instance_key,
+            )
+        # Ensure connector is initialized (instance may be disabled)
+        await bale_pv.connect(instance_key, runtime.platform_metadata)
+        result = bale_pv.get_auth_state(instance_key)
+        if not result.get('ok'):
+            _raise_http_error(
+                status_code=400,
+                detail=result.get('description', 'unknown'),
+                endpoint='bale_pv_auth_status',
+                instance_key=instance_key,
+            )
+        return GenericMessageResponse(
+            message=result.get('state', 'unknown'),
+            detail=f"phone={result.get('phone_number')} session={result.get('has_session_file')}",
+            status='ok',
+        )
+    except HTTPException:
+        raise
+    except Exception as exc:
+        _raise_http_error(
+            status_code=500,
+            detail='internal server error',
+            endpoint='bale_pv_auth_status',
+            exc=exc,
+            instance_key=instance_key,
+        )
+
+
+@router.get('/instances/{instance_key}/bale-pv/contacts', response_model=BalePvContactsResponse)
+async def bale_pv_contacts(instance_key: str, db: Session = Depends(get_db)):
+    """Fetch contacts for a Bale PV instance."""
+    try:
+        runtime = _require_instance_runtime(db, instance_key)
+        if runtime.platform_type.key != 'bale_pv_enterprise':
+            _raise_http_error(
+                status_code=400,
+                detail='not a bale_pv_enterprise instance',
+                endpoint='bale_pv_contacts',
+                instance_key=instance_key,
+            )
+        await bale_pv.connect(instance_key, runtime.platform_metadata)
+        result = await bale_pv.get_contacts(instance_key)
+        if not result.get('ok'):
+            _raise_http_error(
+                status_code=400,
+                detail=result.get('description', 'fetch_failed'),
+                endpoint='bale_pv_contacts',
+                instance_key=instance_key,
+            )
+        contacts = result.get('contacts', [])
+        return BalePvContactsResponse(
+            contacts=[
+                {
+                    'id': c.get('id'),
+                    'name': c.get('name', ''),
+                    'nick': c.get('nick', ''),
+                }
+                for c in contacts
+            ]
+        )
+    except HTTPException:
+        raise
+    except Exception as exc:
+        _raise_http_error(
+            status_code=500,
+            detail='internal server error',
+            endpoint='bale_pv_contacts',
+            exc=exc,
+            instance_key=instance_key,
+        )
+
+
+@router.get('/instances/{instance_key}/bale-pv/dialogs', response_model=BalePvDialogsResponse)
+async def bale_pv_dialogs(instance_key: str, db: Session = Depends(get_db)):
+    """Fetch dialogs for a Bale PV instance."""
+    try:
+        runtime = _require_instance_runtime(db, instance_key)
+        if runtime.platform_type.key != 'bale_pv_enterprise':
+            _raise_http_error(
+                status_code=400,
+                detail='not a bale_pv_enterprise instance',
+                endpoint='bale_pv_dialogs',
+                instance_key=instance_key,
+            )
+        await bale_pv.connect(instance_key, runtime.platform_metadata)
+        result = await bale_pv.get_dialogs(instance_key)
+        if not result.get('ok'):
+            _raise_http_error(
+                status_code=400,
+                detail=result.get('description', 'fetch_failed'),
+                endpoint='bale_pv_dialogs',
+                instance_key=instance_key,
+            )
+        dialogs = result.get('dialogs', [])
+        return BalePvDialogsResponse(
+            dialogs=[
+                {
+                    'peer_id': d.get('peer_id'),
+                    'peer_type': d.get('peer_type', 1),
+                    'unread_count': d.get('unread_count', 0),
+                    'text': d.get('text', ''),
+                    'date': d.get('date'),
+                }
+                for d in dialogs
+            ]
+        )
+    except HTTPException:
+        raise
+    except Exception as exc:
+        _raise_http_error(
+            status_code=500,
+            detail='internal server error',
+            endpoint='bale_pv_dialogs',
+            exc=exc,
+            instance_key=instance_key,
+        )
 
 
 async def _handle_chatwoot_webhook(
