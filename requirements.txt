@@ -7,6 +7,7 @@ pydantic-settings
 SQLAlchemy
 alembic
 psycopg2-binary>=2.9,<3
+asyncpg
 python-multipart
 requests
 aiofiles
