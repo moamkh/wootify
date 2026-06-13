@@ -21,6 +21,8 @@ export default function InstanceWorkspacePage({
   conversationsCount,
   enterpriseSessionsCount,
   enterpriseManualsCount,
+  onBalePvSyncContacts,
+  onBalePvSyncDialogs,
 }) {
   const tabs = isEnterprisePlatform
     ? [
@@ -36,7 +38,7 @@ export default function InstanceWorkspacePage({
 
   return (
     <div className="workspace-layout">
-      <InstanceDetailHero {...heroProps} />
+      <InstanceDetailHero {...heroProps} onBalePvSyncContacts={onBalePvSyncContacts} onBalePvSyncDialogs={onBalePvSyncDialogs} />
 
       <section className="card workspace-switcher">
         <div className="section-heading compact-heading">

@@ -20,6 +20,7 @@ from app.config import settings
 from app.connectors.registry import connector_registry
 from app.models import MessageDirection, MessageKind, MessageStatus
 from app.repositories.conversation_runtime_state_repository import ConversationRuntimeStateRepository
+from app.services.chatwoot_db_service import ChatwootDatabaseService
 from app.services.conversation_mapping_service import ConversationMappingService
 from app.services.instance_service import InstanceService
 from app.services.message_mapping_service import MessageMappingService
@@ -35,6 +36,7 @@ class BridgeService:
     def __init__(self) -> None:
         """Initialize the instance."""
         self._clients: TTLCache[ChatwootClient] = TTLCache(maxsize=50, ttl=3600)
+        self._db_services: dict[str, ChatwootDatabaseService] = {}
         self._instances = InstanceService()
         self._conversations = ConversationMappingService()
         self._conversation_runtime_repo = ConversationRuntimeStateRepository
@@ -176,6 +178,11 @@ class BridgeService:
         if self._is_chatwoot_status_event(payload, event_name):
             return {'message': 'ignored', 'detail': 'status_event_ignored'}
 
+        # Handle Chatwoot message deletion → propagate to Bale
+        if event_name == 'message_updated' and self._is_chatwoot_message_deleted(payload):
+            delete_result = await self._handle_chatwoot_message_delete(db, instance_key, payload, runtime, connector)
+            return delete_result
+
         if payload.get('private'):
             return {'message': 'ignored', 'detail': 'private_message'}
 
@@ -247,6 +254,19 @@ class BridgeService:
             return {'message': 'ignored', 'detail': 'destination_invalid'}
         if not destination_chat_id:
             return {'message': 'ignored', 'detail': 'destination_not_found'}
+
+        # Safety check: never send messages to the self user's own Bale ID.
+        # This prevents webhook replies from being routed back to the agent account.
+        self_user_id = getattr(connector, 'get_self_user_id', lambda _i: None)(instance_key)
+        if self_user_id is not None and str(destination_chat_id) == str(self_user_id):
+            logger.warning(
+                'ignoring outgoing message destined for self user instance=%s chatwoot_conversation_id=%s destination=%s self_uid=%s',
+                instance_key,
+                chatwoot_conversation_id,
+                destination_chat_id,
+                self_user_id,
+            )
+            return {'message': 'ignored', 'detail': 'destination_is_self_user'}
 
         if (
             mapped_destination
@@ -366,11 +386,16 @@ class BridgeService:
                     media = attachment.get('data_url') or attachment.get('content')
                     if isinstance(media, str) and media.startswith('/'):
                         media = f"{runtime.chatwoot.get('base_url', '').rstrip('/')}{media}"
+                    filename = self._normalize_filename_for_platform(
+                        attachment.get('file_name') or attachment.get('filename'),
+                        attachment.get('file_type') or attachment.get('content_type'),
+                        media if isinstance(media, str) else None,
+                    )
                     result = await connector.send_media(
                         instance_key,
                         str(destination_chat_id),
                         media,
-                        attachment.get('filename') or 'file',
+                        filename,
                         caption=content or None,
                         quoted=quoted,
                     )
@@ -451,7 +476,13 @@ class BridgeService:
 
         account_id = int(runtime.chatwoot['account_id'])
         inbox_id = int(runtime.chatwoot['inbox_id'])
-        reopen_conversation = bool(runtime.chatwoot.get('reopen_conversation'))
+        # For Bale PV (personal account), default to reopening conversations
+        # because it's 1:1 messaging — not ticket-based support.
+        raw_reopen = runtime.chatwoot.get('reopen_conversation')
+        if raw_reopen is None and platform_key == 'bale_pv_enterprise':
+            reopen_conversation = True
+        else:
+            reopen_conversation = bool(raw_reopen)
         client = self._get_chatwoot_client(runtime.chatwoot)
         event_contact = event.get('contact') if isinstance(event.get('contact'), dict) else {}
         event_text = str(event.get('text') or '').strip()
@@ -460,6 +491,14 @@ class BridgeService:
             shared_phone_number = self._extract_phone_from_shared_text(event_text)
         shared_first_name = str(event_contact.get('first_name') or '').strip() or None
         shared_last_name = str(event_contact.get('last_name') or '').strip() or None
+
+        # Build additional_attributes for Chatwoot contact details
+        additional_attributes: dict[str, Any] = {}
+        display_first_name = shared_first_name or event.get('from_name') or None
+        if display_first_name:
+            additional_attributes['first_name'] = str(display_first_name).strip()
+        if shared_last_name:
+            additional_attributes['last_name'] = str(shared_last_name).strip()
 
         conversation = self._conversations.get_by_platform_id(db, runtime.instance.id, chat_id)
         if not conversation:
@@ -473,6 +512,7 @@ class BridgeService:
                 phone_number=shared_phone_number,
                 first_name=shared_first_name,
                 last_name=shared_last_name,
+                additional_attributes=additional_attributes if additional_attributes else None,
             )
             remote_contact_conversations = await self._list_contact_conversations(
                 client,
@@ -558,6 +598,7 @@ class BridgeService:
                     phone_number=shared_phone_number,
                     first_name=shared_first_name,
                     last_name=shared_last_name,
+                    additional_attributes=additional_attributes if additional_attributes else None,
                 )
                 existing_contact_id = str(resolved_contact_id)
                 conversation = self._conversations.upsert(
@@ -679,9 +720,34 @@ class BridgeService:
                 )
         conversation_id = conversation.id
 
+        # Handle Bale → Chatwoot delete
+        if event.get('_deleted') and platform_message_id:
+            return await self._handle_platform_message_delete(
+                db=db,
+                instance_key=instance_key,
+                runtime=runtime,
+                conversation=conversation,
+                platform_message_id=platform_message_id,
+            )
+
         if platform_message_id:
             existing = self._messages.get_by_platform_message_id(db, conversation_id, platform_message_id)
             if existing and existing.status == MessageStatus.sent:
+                # Detect Bale message edits: same platform_message_id but different content
+                existing_text = ""
+                if existing.platform_payload_json and isinstance(existing.platform_payload_json, dict):
+                    existing_text = str(existing.platform_payload_json.get('text') or '')
+                incoming_text = str(event.get('text') or '')
+                if existing_text and incoming_text and existing_text != incoming_text:
+                    edit_result = await self._handle_platform_message_edit(
+                        db=db,
+                        instance_key=instance_key,
+                        runtime=runtime,
+                        existing_mapping=existing,
+                        new_text=incoming_text,
+                        event=event,
+                    )
+                    return edit_result
                 return {'message': 'duplicate', 'status': 'sent'}
 
         chatwoot_parent_message_id: Optional[str] = None
@@ -698,9 +764,10 @@ class BridgeService:
 
         # Chatwoot requires non-empty content; use a fallback label for media-only messages
         content = text or ('📎 Attachment' if attachments else '')
+        is_outgoing = bool(event.get('outgoing'))
         data: dict[str, Any] = {
             'content': content,
-            'message_type': 'incoming',
+            'message_type': 'outgoing' if is_outgoing else 'incoming',
             'private': False,
             'source_id': source_id,
         }
@@ -725,6 +792,7 @@ class BridgeService:
             shared_phone_number=shared_phone_number,
             shared_first_name=shared_first_name,
             shared_last_name=shared_last_name,
+            additional_attributes=additional_attributes if additional_attributes else None,
             chatwoot_parent_message_id=chatwoot_parent_message_id,
             data=data,
             attachments=attachments,
@@ -872,6 +940,7 @@ class BridgeService:
         shared_phone_number: Optional[str],
         shared_first_name: Optional[str],
         shared_last_name: Optional[str],
+        additional_attributes: Optional[dict[str, Any]] = None,
         chatwoot_parent_message_id: Optional[str],
         data: dict[str, Any],
         attachments: list[Any],
@@ -906,6 +975,7 @@ class BridgeService:
             shared_phone_number=shared_phone_number,
             shared_first_name=shared_first_name,
             shared_last_name=shared_last_name,
+            additional_attributes=additional_attributes if additional_attributes else None,
         )
         recovered_conversation_id = str(recovered_conversation.chatwoot_conversation_id or '').strip()
         retry_data = dict(data)
@@ -973,6 +1043,7 @@ class BridgeService:
         shared_phone_number: Optional[str],
         shared_first_name: Optional[str],
         shared_last_name: Optional[str],
+        additional_attributes: Optional[dict[str, Any]] = None,
     ):
         """Internal helper to recover when a mapped Chatwoot conversation has been deleted."""
         previous_chatwoot_conversation_id = str(conversation.chatwoot_conversation_id or '').strip()
@@ -1000,6 +1071,7 @@ class BridgeService:
                 phone_number=shared_phone_number,
                 first_name=shared_first_name,
                 last_name=shared_last_name,
+                additional_attributes=additional_attributes,
             )
 
         remote_contact_conversations = await self._list_contact_conversations(
@@ -1055,6 +1127,301 @@ class BridgeService:
         )
         return recovered_conversation
 
+    async def sync_bale_pv_contacts(
+        self,
+        db: Session,
+        instance_key: str,
+        runtime: Any,
+    ) -> dict[str, Any]:
+        """Fetch all Bale PV contacts and ensure each exists in Chatwoot.
+
+        Returns a summary dict with counts of created, updated, and failed contacts.
+        """
+        from app.connectors.bale_pv_connector import bale_pv
+
+        platform_key = self._platform_key(runtime)
+        if platform_key != 'bale_pv_enterprise':
+            return {'ok': False, 'detail': 'not_bale_pv_instance'}
+
+        account_id = int(runtime.chatwoot.get('account_id', 0))
+        inbox_id = int(runtime.chatwoot.get('inbox_id', 0))
+        if not account_id or not inbox_id:
+            return {'ok': False, 'detail': 'missing_account_or_inbox_id'}
+
+        # Ensure connector is initialized
+        await bale_pv.connect(instance_key, runtime.platform_metadata)
+        result = await bale_pv.get_contacts(instance_key)
+        if not result.get('ok'):
+            return {'ok': False, 'detail': result.get('description', 'fetch_failed')}
+
+        contacts = result.get('contacts', [])
+        if not contacts:
+            return {'ok': True, 'created': 0, 'updated': 0, 'failed': 0, 'detail': 'no_contacts_found'}
+
+        client = self._get_chatwoot_client(runtime.chatwoot)
+        created = 0
+        updated = 0
+        failed = 0
+
+        import asyncio
+
+        for contact in contacts:
+            uid = contact.get('id')
+            name = str(contact.get('name') or '').strip()
+            if not uid:
+                continue
+            try:
+                # Search by identifier first to determine if this is create or update
+                identifier = self._prefixed_identifier(platform_key, str(uid))
+                found = await client.search_contacts(account_id, identifier)
+                payload = found.get('payload') if isinstance(found, dict) else None
+                was_existing = isinstance(payload, list) and payload and self._extract_id(payload[0])
+
+                await self._get_or_create_contact(
+                    client,
+                    account_id=account_id,
+                    inbox_id=inbox_id,
+                    chat_id=str(uid),
+                    platform_key=platform_key,
+                    from_name=name or None,
+                    first_name=name or None,
+                )
+                if was_existing:
+                    updated += 1
+                else:
+                    created += 1
+            except Exception as exc:
+                logger.warning(
+                    'sync_bale_pv_contact_failed instance=%s uid=%s name=%s error=%s',
+                    instance_key,
+                    uid,
+                    name,
+                    exc,
+                )
+                failed += 1
+            # Rate-limit: pause 2.0s between contacts to avoid hammering Chatwoot
+            await asyncio.sleep(2.0)
+
+        return {
+            'ok': True,
+            'created': created,
+            'updated': updated,
+            'failed': failed,
+            'total': len(contacts),
+        }
+
+    async def sync_bale_dialogs_to_chatwoot(
+        self,
+        db: Session,
+        instance_key: str,
+        runtime: Any,
+        *,
+        load_history: bool = True,
+        history_limit: int = 50,
+    ) -> dict[str, Any]:
+        """Fetch Bale dialogs and sync them (with optional history) to Chatwoot.
+
+        Contact naming convention:
+          - regular user:  '(user) Name'
+          - bot:           '(bot) Name'
+          - group:         '(group) Title'
+          - channel:       '(channel) Title'
+
+        Group/channel historical messages are prefixed with the sender name so
+        individual members are distinguishable in Chatwoot.
+        """
+        from app.connectors.bale_pv_connector import bale_pv
+
+        platform_key = self._platform_key(runtime)
+        if platform_key != 'bale_pv_enterprise':
+            return {'ok': False, 'detail': 'not_bale_pv_instance'}
+
+        account_id = int(runtime.chatwoot.get('account_id', 0))
+        inbox_id = int(runtime.chatwoot.get('inbox_id', 0))
+        if not account_id or not inbox_id:
+            return {'ok': False, 'detail': 'missing_account_or_inbox_id'}
+
+        await bale_pv.connect(instance_key, runtime.platform_metadata)
+        result = await bale_pv.sync_bale_dialogs(
+            instance_key,
+            load_history=load_history,
+            history_limit=history_limit,
+        )
+        if not result.get('ok'):
+            return {'ok': False, 'detail': result.get('description', 'load_dialogs_failed')}
+
+        dialogs = result.get('dialogs', [])
+        users_by_id = result.get('users_by_id', {})
+        history_by_peer = result.get('history_by_peer', {}) if load_history else {}
+        self_user_id = bale_pv.get_self_user_id(instance_key)
+
+        client = self._get_chatwoot_client(runtime.chatwoot)
+        created = 0
+        updated = 0
+        failed = 0
+        messages_imported = 0
+
+        import asyncio
+
+        for dlg in dialogs:
+            peer_id = dlg.get('peer_id')
+            peer_type = dlg.get('peer_type', 1)
+            peer_type_label = dlg.get('peer_type_label', 'user')
+            display_name = dlg.get('display_name') or f'({peer_type_label}) {peer_id}'
+            raw_name = dlg.get('raw_name') or str(peer_id)
+            is_bot = dlg.get('is_bot', False)
+
+            additional_attributes = {
+                'bale_peer_type': peer_type_label,
+                'bale_peer_id': peer_id,
+                'bale_peer_type_code': peer_type,
+                'bale_is_bot': is_bot,
+            }
+
+            try:
+                identifier = self._prefixed_identifier(platform_key, str(peer_id))
+                found = await client.search_contacts(account_id, identifier)
+                payload = found.get('payload') if isinstance(found, dict) else None
+                was_existing = isinstance(payload, list) and payload and self._extract_id(payload[0])
+
+                contact_id = await self._get_or_create_contact(
+                    client,
+                    account_id=account_id,
+                    inbox_id=inbox_id,
+                    chat_id=str(peer_id),
+                    platform_key=platform_key,
+                    from_name=display_name,
+                    first_name=display_name,
+                    additional_attributes=additional_attributes,
+                )
+
+                # Find or create conversation
+                conversation_id = await self._get_or_create_conversation_for_contact(
+                    client,
+                    account_id=account_id,
+                    inbox_id=inbox_id,
+                    contact_id=contact_id,
+                )
+
+                if conversation_id and load_history:
+                    peer_key = f'{peer_type}|{peer_id}'
+                    history = history_by_peer.get(peer_key, [])
+                    for msg in history:
+                        await self._import_historical_message(
+                            client,
+                            account_id=account_id,
+                            conversation_id=conversation_id,
+                            msg=msg,
+                            self_user_id=self_user_id,
+                            peer_type_label=peer_type_label,
+                        )
+                        messages_imported += 1
+                        await asyncio.sleep(0.2)
+
+                if was_existing:
+                    updated += 1
+                else:
+                    created += 1
+            except Exception as exc:
+                logger.warning(
+                    'sync_bale_dialog_failed instance=%s peer=%s type=%s error=%s',
+                    instance_key,
+                    peer_id,
+                    peer_type_label,
+                    exc,
+                )
+                failed += 1
+            await asyncio.sleep(1.0)
+
+        return {
+            'ok': True,
+            'created': created,
+            'updated': updated,
+            'failed': failed,
+            'dialogs': len(dialogs),
+            'messages_imported': messages_imported,
+        }
+
+    async def _get_or_create_conversation_for_contact(
+        self,
+        client: ChatwootClient,
+        *,
+        account_id: int,
+        inbox_id: int,
+        contact_id: int,
+    ) -> Optional[int]:
+        """Find an existing conversation for a contact in an inbox, or create one."""
+        try:
+            resp = await client.list_contact_conversations(account_id, contact_id)
+            payload = resp.get('payload') if isinstance(resp, dict) else None
+            if isinstance(payload, list):
+                for conv in payload:
+                    if not isinstance(conv, dict):
+                        continue
+                    if conv.get('inbox_id') == inbox_id:
+                        cid = self._extract_id(conv)
+                        if cid:
+                            return int(cid)
+        except Exception:
+            pass
+
+        try:
+            created = await client.create_conversation(
+                account_id,
+                {
+                    'inbox_id': inbox_id,
+                    'contact_id': contact_id,
+                    'status': 'open',
+                },
+            )
+            cid = self._extract_id(created) or self._extract_id((created or {}).get('payload'))
+            if cid:
+                return int(cid)
+        except Exception as exc:
+            logger.warning('create_conversation_failed account_id=%s contact_id=%s error=%s', account_id, contact_id, exc)
+        return None
+
+    async def _import_historical_message(
+        self,
+        client: ChatwootClient,
+        *,
+        account_id: int,
+        conversation_id: int,
+        msg: dict[str, Any],
+        self_user_id: Optional[int],
+        peer_type_label: str,
+    ) -> None:
+        """Post a single Bale historical message into a Chatwoot conversation."""
+        content = ''
+        message_data = msg.get('message') or {}
+        if message_data.get('type') == 'text':
+            content = message_data.get('text') or ''
+        elif message_data.get('type') == 'document':
+            parts = []
+            if message_data.get('caption'):
+                parts.append(message_data['caption'])
+            name = message_data.get('name') or 'file'
+            parts.append(f'[Attachment: {name}]')
+            content = '\n'.join(parts)
+
+        if not content:
+            return
+
+        sender_uid = msg.get('sender_uid')
+        sender_name = msg.get('sender_name') or str(sender_uid)
+        is_outgoing = self_user_id is not None and sender_uid == self_user_id
+
+        # For groups/channels, prefix with sender name so members are distinguishable
+        if peer_type_label in ('group', 'channel') and not is_outgoing:
+            content = f'{sender_name}: {content}'
+
+        data = {
+            'content': content,
+            'message_type': 'outgoing' if is_outgoing else 'incoming',
+            'private': False,
+        }
+        await client.post_message(account_id, conversation_id, data)
+
     async def _get_or_create_contact(
         self,
         client: ChatwootClient,
@@ -1067,11 +1434,15 @@ class BridgeService:
         phone_number: Optional[str] = None,
         first_name: Optional[str] = None,
         last_name: Optional[str] = None,
+        additional_attributes: Optional[dict[str, Any]] = None,
     ) -> int:
         """Internal helper to get or create contact."""
         identifier = self._prefixed_identifier(platform_key, chat_id)
         normalized_phone = self._normalize_phone_number(phone_number)
         resolved_name = str(first_name or from_name or chat_id).strip() or str(chat_id)
+        # Avoid using a raw numeric ID as the display name
+        if resolved_name == str(chat_id) and str(chat_id).isdigit():
+            resolved_name = f'{self._source_prefix(platform_key).title()} User {chat_id}'
         try:
             found = await client.search_contacts(account_id, identifier)
             payload = found.get('payload') if isinstance(found, dict) else None
@@ -1079,13 +1450,21 @@ class BridgeService:
                 first = payload[0] if isinstance(payload[0], dict) else {}
                 cid = self._extract_id(first)
                 if cid:
+                    await self._sync_contact_name_if_needed(
+                        client,
+                        account_id=account_id,
+                        contact_id=int(cid),
+                        current_contact=first,
+                        new_name=resolved_name,
+                        additional_attributes=additional_attributes,
+                    )
                     await self._sync_contact_phone_if_needed(
                         client,
                         account_id=account_id,
                         contact_id=int(cid),
                         current_contact=first,
                         phone_number=normalized_phone,
-                        fallback_name=f'{self._source_prefix(platform_key).title()} {cid}',
+                        fallback_name=resolved_name,
                     )
                     return int(cid)
         except Exception:
@@ -1118,6 +1497,8 @@ class BridgeService:
             create_payload['name'] = str(first_name).strip()
             if last_name:
                 create_payload['name'] = f"{create_payload['name']} {str(last_name).strip()}".strip()
+        if additional_attributes:
+            create_payload['additional_attributes'] = additional_attributes
 
         created = await client.create_contact(
             account_id,
@@ -1134,9 +1515,53 @@ class BridgeService:
             contact_id=int(cid),
             current_contact=(created.get('payload') if isinstance(created, dict) else {}) or {},
             phone_number=normalized_phone,
-            fallback_name=f'{self._source_prefix(platform_key).title()} {cid}',
+            fallback_name=resolved_name,
         )
         return int(cid)
+
+    async def _sync_contact_name_if_needed(
+        self,
+        client: ChatwootClient,
+        *,
+        account_id: int,
+        contact_id: int,
+        current_contact: dict[str, Any],
+        new_name: str,
+        additional_attributes: Optional[dict[str, Any]] = None,
+    ) -> None:
+        """Update contact name if current name is just a numeric ID and we now have a real name."""
+        current_name = str(current_contact.get('name') or '').strip()
+        # Skip if we don't have a better name
+        if not new_name or new_name == current_name:
+            return
+        # Update if current name is empty, a raw numeric ID, or a generic fallback
+        is_generic = (
+            not current_name
+            or current_name.isdigit()
+            or 'User' in current_name
+            or 'Contact' in current_name
+        )
+        if not is_generic:
+            return
+        update_payload: dict[str, Any] = {'name': new_name}
+        if additional_attributes:
+            update_payload['additional_attributes'] = additional_attributes
+        try:
+            await client.update_contact(account_id, int(contact_id), update_payload)
+            logger.info(
+                'updated chatwoot contact name account_id=%s contact_id=%s old_name=%s new_name=%s',
+                account_id,
+                contact_id,
+                current_name,
+                new_name,
+            )
+        except Exception as exc:
+            logger.warning(
+                'failed to update chatwoot contact name account_id=%s contact_id=%s error=%s',
+                account_id,
+                contact_id,
+                str(exc),
+            )
 
     async def _sync_contact_phone_if_needed(
         self,
@@ -1277,6 +1702,8 @@ class BridgeService:
                 candidate_phone = self._normalize_phone_number(contact_payload.get('phone_number'))
                 if candidate_phone and candidate_phone.lstrip('+') == normalized_phone.lstrip('+'):
                     return contact_payload
+            # Small pause between phone-search candidates to avoid burst requests
+            await asyncio.sleep(0.8)
 
         return None
 
@@ -1376,6 +1803,174 @@ class BridgeService:
             client = ChatwootClient(base_url=base_url, token=token)
             self._clients.set(key, client)
         return client
+
+    def _get_chatwoot_db_service(
+        self,
+        chatwoot_cfg: dict[str, Any],
+    ) -> Optional[ChatwootDatabaseService]:
+        """Return a direct DB accessor if credentials are configured.
+
+        Expects ``chatwoot_cfg['db_direct']`` to be a dict with:
+        ``host``, ``port``, ``database``, ``user``, ``password``.
+        """
+        db_cfg = chatwoot_cfg.get('db_direct')
+        if not isinstance(db_cfg, dict):
+            return None
+        host = str(db_cfg.get('host') or '').strip()
+        if not host:
+            return None
+        key = f"{host}:{db_cfg.get('port', 5432)}/{db_cfg.get('database', 'chatwoot_production')}"
+        svc = self._db_services.get(key)
+        if svc is None:
+            svc = ChatwootDatabaseService(
+                host=host,
+                port=int(db_cfg.get('port', 5432)),
+                database=str(db_cfg.get('database', 'chatwoot_production')).strip(),
+                user=str(db_cfg.get('user', '')).strip(),
+                password=str(db_cfg.get('password', '')).strip(),
+            )
+            self._db_services[key] = svc
+        return svc
+
+    async def _handle_platform_message_delete(
+        self,
+        *,
+        db: Session,
+        instance_key: str,
+        runtime: Any,
+        conversation: Any,
+        platform_message_id: str,
+    ) -> dict[str, Any]:
+        """Sync a Bale message delete to Chatwoot via the REST API."""
+        existing = self._messages.get_by_platform_message_id(db, conversation.id, platform_message_id)
+        if not existing or not existing.chatwoot_message_id:
+            logger.warning(
+                'platform_delete_no_mapping instance=%s platform_message_id=%s',
+                instance_key,
+                platform_message_id,
+            )
+            return {'message': 'ignored', 'status': 'delete_ignored', 'detail': 'no_mapping'}
+
+        chatwoot_message_id = str(existing.chatwoot_message_id).strip()
+        if not chatwoot_message_id.isdigit():
+            return {'message': 'ignored', 'status': 'delete_ignored', 'detail': 'invalid_chatwoot_id'}
+
+        client = self._get_chatwoot_client(runtime.chatwoot)
+        account_id = int(runtime.chatwoot.get('account_id', 0))
+        chatwoot_conversation_id = str(conversation.chatwoot_conversation_id or '').strip()
+        if not chatwoot_conversation_id.isdigit():
+            return {'message': 'ignored', 'status': 'delete_ignored', 'detail': 'invalid_conversation_id'}
+
+        try:
+            await client.delete_message(
+                account_id=account_id,
+                conversation_id=int(chatwoot_conversation_id),
+                message_id=int(chatwoot_message_id),
+            )
+            logger.info(
+                'platform_delete_synced instance=%s chatwoot_message_id=%s platform_message_id=%s',
+                instance_key,
+                chatwoot_message_id,
+                platform_message_id,
+            )
+            return {
+                'message': 'deleted',
+                'status': 'synced',
+                'chatwoot_message_id': chatwoot_message_id,
+                'platform_message_id': platform_message_id,
+            }
+        except Exception as exc:
+            logger.warning(
+                'platform_delete_failed instance=%s chatwoot_message_id=%s error=%s',
+                instance_key,
+                chatwoot_message_id,
+                exc,
+            )
+            return {'message': 'failed', 'status': 'delete_failed', 'detail': str(exc)}
+
+    async def _handle_platform_message_edit(
+        self,
+        *,
+        db: Session,
+        instance_key: str,
+        runtime: Any,
+        existing_mapping: Any,
+        new_text: str,
+        event: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Sync a Bale message edit to Chatwoot via direct PostgreSQL UPDATE.
+
+        Chatwoot has no content-edit REST API, so we bypass it and write
+        directly to the ``messages`` table. This requires ``db_direct``
+        credentials in the instance's ``chatwoot`` config.
+        """
+        chatwoot_message_id = existing_mapping.chatwoot_message_id
+        if not chatwoot_message_id or not str(chatwoot_message_id).strip().isdigit():
+            logger.warning(
+                'platform_edit_no_chatwoot_id instance=%s platform_message_id=%s',
+                instance_key,
+                existing_mapping.platform_message_id,
+            )
+            return {'message': 'ignored', 'status': 'edit_ignored', 'detail': 'no_chatwoot_message_id'}
+
+        db_svc = self._get_chatwoot_db_service(runtime.chatwoot)
+        if db_svc is None:
+            logger.warning(
+                'platform_edit_no_db_direct instance=%s chatwoot_message_id=%s',
+                instance_key,
+                chatwoot_message_id,
+            )
+            return {'message': 'ignored', 'status': 'edit_ignored', 'detail': 'db_direct_not_configured'}
+
+        try:
+            await db_svc.connect()
+            updated = await db_svc.update_message_content(
+                message_id=int(chatwoot_message_id),
+                new_content=new_text,
+            )
+            if updated:
+                # Refresh our mapping record with the new payload
+                self._messages.upsert(
+                    db,
+                    conversation_id=existing_mapping.conversation_id,
+                    direction=existing_mapping.direction,
+                    message_kind=existing_mapping.message_kind,
+                    status=MessageStatus.sent,
+                    chatwoot_message_id=str(chatwoot_message_id),
+                    platform_message_id=existing_mapping.platform_message_id,
+                    chatwoot_parent_message_id=existing_mapping.chatwoot_parent_message_id,
+                    platform_parent_message_id=existing_mapping.platform_parent_message_id,
+                    chatwoot_payload_json=existing_mapping.chatwoot_payload_json,
+                    platform_payload_json=self._payload_or_none(runtime, event),
+                )
+                db.commit()
+                logger.info(
+                    'platform_edit_synced instance=%s chatwoot_message_id=%s platform_message_id=%s',
+                    instance_key,
+                    chatwoot_message_id,
+                    existing_mapping.platform_message_id,
+                )
+                return {
+                    'message': 'edited',
+                    'status': 'synced',
+                    'chatwoot_message_id': str(chatwoot_message_id),
+                    'platform_message_id': str(existing_mapping.platform_message_id),
+                }
+            else:
+                logger.warning(
+                    'platform_edit_db_no_row instance=%s chatwoot_message_id=%s',
+                    instance_key,
+                    chatwoot_message_id,
+                )
+                return {'message': 'failed', 'status': 'edit_failed', 'detail': 'db_row_not_found'}
+        except Exception as exc:
+            logger.exception(
+                'platform_edit_sync_error instance=%s chatwoot_message_id=%s error=%s',
+                instance_key,
+                chatwoot_message_id,
+                exc,
+            )
+            return {'message': 'failed', 'status': 'edit_failed', 'detail': str(exc)}
 
     async def _handle_chatwoot_status_event(
         self,
@@ -2050,6 +2645,34 @@ class BridgeService:
         return name, ctype or None
 
     @staticmethod
+    def _normalize_filename_for_platform(
+        filename: Optional[str],
+        content_type: Optional[str],
+        url: Optional[str],
+    ) -> str:
+        """Ensure a filename has an extension for platform delivery.
+
+        Derives the extension from the content_type or the URL path if the
+        raw filename lacks one.
+        """
+        name = str(filename or '').strip() or 'file'
+        # Already has an extension?
+        if '.' in name.rsplit('/', 1)[-1]:
+            return name
+
+        ctype = str(content_type or '').strip().lower()
+        ext = ''
+        if ctype:
+            ext = BridgeService._preferred_extension_for_content_type(ctype) or (mimetypes.guess_extension(ctype) or '')
+        if not ext and url:
+            guessed, _ = mimetypes.guess_type(url)
+            if guessed:
+                ext = BridgeService._preferred_extension_for_content_type(guessed) or (mimetypes.guess_extension(guessed) or '')
+        if ext:
+            name = f'{name}{ext}'
+        return name
+
+    @staticmethod
     def _preferred_extension_for_content_type(content_type: str) -> Optional[str]:
         """Internal helper to preferred extension for content type."""
         mapping = {
@@ -2163,6 +2786,99 @@ class BridgeService:
             return True
 
         return False
+
+    @staticmethod
+    def _is_chatwoot_message_deleted(payload: dict[str, Any]) -> bool:
+        """Detect whether a Chatwoot message_updated webhook signals deletion.
+
+        Chatwoot's ``destroy`` action sets ``content_attributes['deleted'] = true``
+        and fires a ``message_updated`` event rather than a dedicated delete webhook.
+        """
+        content_attributes = payload.get('content_attributes') if isinstance(payload.get('content_attributes'), dict) else {}
+        message_obj = payload.get('message') if isinstance(payload.get('message'), dict) else {}
+        msg_content_attributes = (
+            message_obj.get('content_attributes') if isinstance(message_obj.get('content_attributes'), dict) else {}
+        )
+        return bool(
+            content_attributes.get('deleted')
+            or msg_content_attributes.get('deleted')
+        )
+
+    async def _handle_chatwoot_message_delete(
+        self,
+        db: Session,
+        instance_key: str,
+        payload: dict[str, Any],
+        runtime: Any,
+        connector: Any,
+    ) -> dict[str, Any]:
+        """Propagate a Chatwoot message deletion to the Bale platform."""
+        chatwoot_message_id = self._extract_chatwoot_message_id(payload)
+        if not chatwoot_message_id:
+            return {'message': 'ignored', 'detail': 'chatwoot_message_id_missing'}
+
+        chatwoot_conversation_id = self._extract_chatwoot_conversation_id(payload)
+        if not chatwoot_conversation_id:
+            return {'message': 'ignored', 'detail': 'chatwoot_conversation_id_missing'}
+
+        mapped_conversation = self._conversations.get_by_chatwoot_id(
+            db, runtime.instance.id, str(chatwoot_conversation_id)
+        )
+        if not mapped_conversation:
+            return {'message': 'ignored', 'detail': 'conversation_not_mapped'}
+
+        platform_message_id = None
+        if mapped_conversation.id:
+            mapping = self._messages.get_by_chatwoot_message_id(
+                db, mapped_conversation.id, str(chatwoot_message_id)
+            )
+            if mapping:
+                platform_message_id = mapping.platform_message_id
+
+        if not platform_message_id:
+            logger.warning(
+                'chatwoot_delete_no_platform_mapping instance=%s chatwoot_message_id=%s conversation_id=%s',
+                instance_key,
+                chatwoot_message_id,
+                chatwoot_conversation_id,
+            )
+            return {'message': 'ignored', 'detail': 'platform_message_not_mapped'}
+
+        destination_chat_id = mapped_conversation.platform_conversation_id
+        if not destination_chat_id:
+            return {'message': 'ignored', 'detail': 'destination_not_found'}
+
+        try:
+            await connector.connect(instance_key, runtime.platform_metadata, runtime.proxy)
+            await connector.delete_message(instance_key, str(destination_chat_id), str(platform_message_id))
+            logger.info(
+                'chatwoot_delete_propagated instance=%s chatwoot_message_id=%s platform_message_id=%s chat_id=%s',
+                instance_key,
+                chatwoot_message_id,
+                platform_message_id,
+                destination_chat_id,
+            )
+            return {
+                'message': 'deleted',
+                'status': 'propagated',
+                'chatwoot_message_id': str(chatwoot_message_id),
+                'platform_message_id': str(platform_message_id),
+            }
+        except Exception as exc:
+            logger.warning(
+                'chatwoot_delete_propagation_failed instance=%s chatwoot_message_id=%s platform_message_id=%s error=%s',
+                instance_key,
+                chatwoot_message_id,
+                platform_message_id,
+                exc,
+            )
+            return {
+                'message': 'failed',
+                'status': 'propagation_failed',
+                'chatwoot_message_id': str(chatwoot_message_id),
+                'platform_message_id': str(platform_message_id),
+                'detail': str(exc),
+            }
 
     @staticmethod
     def _extract_chatwoot_conversation_id(payload: dict[str, Any]) -> Optional[str]:

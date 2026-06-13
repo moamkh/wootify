@@ -15,13 +15,18 @@ Methods
 """
 
 import logging
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 from .messaging_messages import (
     SendMessageRequest,
     UpdateMessageRequest,
+    DeleteMessageRequest,
     MessageReadRequest,
     StopTypingRequest,
+    DocumentMessage,
+    LoadDialogsRequest,
+    LoadHistoryRequest,
+    LoadUsersRequest,
 )
 from .ws_client import BaleWebSocketClient
 
@@ -72,17 +77,18 @@ class BaleMessagingClient:
         peer_id: int,
         text: str,
         reply_to_message_id: Optional[int] = None,
-    ) -> bytes:
-        """Send a text message to a peer.
+    ) -> None:
+        """Send a text message to a peer (fire-and-forget).
 
-        Returns the raw protobuf response bytes.
+        Bale server acknowledges SendMessage via an update, not a response.
+        Using send_update avoids waiting for a response that never arrives.
         """
         req = SendMessageRequest(
             peer_id=peer_id,
             text=text,
             reply_to_message_id=reply_to_message_id,
         )
-        return await self.ws.send_request(
+        await self.ws.send_update(
             service_name=self.SERVICE,
             method="SendMessage",
             payload=req.serialize(),
@@ -106,6 +112,25 @@ class BaleMessagingClient:
         return await self.ws.send_request(
             service_name=self.SERVICE,
             method="UpdateMessage",
+            payload=req.serialize(),
+        )
+
+    async def delete_message(
+        self,
+        peer_id: int,
+        message_ids: List[int],
+    ) -> bytes:
+        """Delete one or more messages.
+
+        Returns the raw protobuf response bytes.
+        """
+        req = DeleteMessageRequest(
+            peer_id=peer_id,
+            message_ids=message_ids,
+        )
+        return await self.ws.send_request(
+            service_name=self.SERVICE,
+            method="DeleteMessage",
             payload=req.serialize(),
         )
 
@@ -134,5 +159,87 @@ class BaleMessagingClient:
         await self.ws.send_update(
             service_name=self.SERVICE,
             method="StopTyping",
+            payload=req.serialize(),
+        )
+
+    async def load_dialogs(
+        self,
+        limit: int = 100,
+        min_date: int = 0,
+        dialog_type: int = 0,
+        exclude_pinned: bool = False,
+    ) -> bytes:
+        """Fetch dialogs list (response bytes)."""
+        req = LoadDialogsRequest(
+            limit=limit,
+            min_date=min_date,
+            dialog_type=dialog_type,
+            exclude_pinned=exclude_pinned,
+        )
+        return await self.ws.send_request(
+            service_name=self.SERVICE,
+            method="LoadDialogs",
+            payload=req.serialize(),
+        )
+
+    async def load_history(
+        self,
+        peer_id: int,
+        peer_type: int = 1,
+        date: int = 0,
+        limit: int = 50,
+        load_mode: int = 2,
+    ) -> bytes:
+        """Fetch message history for a peer (response bytes)."""
+        req = LoadHistoryRequest(
+            peer_id=peer_id,
+            peer_type=peer_type,
+            date=date,
+            limit=limit,
+            load_mode=load_mode,
+        )
+        return await self.ws.send_request(
+            service_name=self.SERVICE,
+            method="LoadHistory",
+            payload=req.serialize(),
+        )
+
+    async def load_users(self, user_peers: list[dict[str, int]]) -> bytes:
+        """Fetch user details for the given peers (response bytes)."""
+        req = LoadUsersRequest(user_peers)
+        return await self.ws.send_request(
+            service_name=self.SERVICE,
+            method="LoadUsers",
+            payload=req.serialize(),
+        )
+
+    async def send_document(
+        self,
+        peer_id: int,
+        file_id: int,
+        access_hash: int,
+        file_size: int,
+        name: str,
+        mime_type: str,
+        caption: Optional[str] = None,
+        reply_to_message_id: Optional[int] = None,
+    ) -> None:
+        """Send a document/media message (fire-and-forget)."""
+        doc = DocumentMessage(
+            file_id=file_id,
+            access_hash=access_hash,
+            file_size=file_size,
+            name=name,
+            mime_type=mime_type,
+            caption=caption,
+        )
+        req = SendMessageRequest(
+            peer_id=peer_id,
+            document=doc.serialize(),
+            reply_to_message_id=reply_to_message_id,
+        )
+        await self.ws.send_update(
+            service_name=self.SERVICE,
+            method="SendMessage",
             payload=req.serialize(),
         )

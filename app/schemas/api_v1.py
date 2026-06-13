@@ -352,6 +352,15 @@ class BalePvContactsResponse(BaseModel):
     contacts: list[BalePvContact]
 
 
+class BalePvSyncContactsResponse(BaseModel):
+    """Response schema for Bale PV contacts sync operation."""
+    message: str
+    detail: Optional[str] = None
+    created: int = 0
+    updated: int = 0
+    failed: int = 0
+
+
 class BalePvDialog(BaseModel):
     """A single Bale PV dialog/conversation."""
     peer_id: int
@@ -364,3 +373,14 @@ class BalePvDialog(BaseModel):
 class BalePvDialogsResponse(BaseModel):
     """Response schema for Bale PV dialogs list."""
     dialogs: list[BalePvDialog]
+
+
+class BalePvSyncDialogsResponse(BaseModel):
+    """Response schema for Bale PV dialogs sync operation."""
+    message: str
+    detail: Optional[str] = None
+    created: int = 0
+    updated: int = 0
+    failed: int = 0
+    dialogs: int = 0
+    messages_imported: int = 0

@@ -31,9 +31,11 @@ Re-authentication may be required for WebSocket connectivity.
 
 import asyncio
 import logging
+import os
 import random
 import time
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import websockets
@@ -41,6 +43,34 @@ import websockets
 from .protobuf_wire import ProtobufMessage, ProtobufParser
 
 logger = logging.getLogger("bale_grpc_client.ws")
+
+# --- Raw debug file logger ---
+# Logs every incoming WebSocket frame (hex) to a file for reverse-engineering.
+_DEBUG_LOG_PATH = os.environ.get("BALE_WS_DEBUG_LOG", "bale_ws_debug.log")
+_debug_file_handler: Optional[logging.FileHandler] = None
+
+
+def _get_debug_logger() -> logging.Logger:
+    """Lazy-init a file logger that records raw WS frames."""
+    global _debug_file_handler
+    dbg = logging.getLogger("bale_grpc_client.ws.raw")
+    if _debug_file_handler is None and _DEBUG_LOG_PATH:
+        _debug_file_handler = logging.FileHandler(_DEBUG_LOG_PATH, mode="a", encoding="utf-8")
+        _debug_file_handler.setFormatter(logging.Formatter("%(message)s"))
+        dbg.addHandler(_debug_file_handler)
+        dbg.setLevel(logging.DEBUG)
+    return dbg
+
+
+def _log_raw_frame(label: str, data: bytes) -> None:
+    """Write a timestamped hex dump of raw WS data to the debug log."""
+    dbg = _get_debug_logger()
+    ts = datetime.now(timezone.utc).isoformat()
+    # Truncate hex if absurdly large (>64KB) to keep log usable
+    hex_data = data.hex()
+    if len(hex_data) > 131_072:
+        hex_data = hex_data[:131_072] + f"...[truncated {len(data)} bytes total]"
+    dbg.debug("[%s] %s | len=%d | hex=%s", ts, label, len(data), hex_data)
 
 
 # --- Protobuf Message Builders ---
@@ -118,6 +148,7 @@ class WsResponse:
     pong: Optional[bytes] = None
     handshake_response: Optional[bytes] = None
     index: Optional[int] = None
+    error: Optional[Dict[str, Any]] = None
 
     @classmethod
     def parse(cls, data: bytes) -> "WsResponse":
@@ -125,15 +156,33 @@ class WsResponse:
         fields = parser.parse()
         result = cls()
 
-        # Field 1: response (bytes)
+        # Field 1: response (inner Response message)
+        # Inner Response layout: 1=error, 2=response_payload, 3=index
         if 1 in fields:
-            result.response = fields[1][0]
-            # Parse inner response structure
-            p2 = ProtobufParser(result.response)
-            f2 = p2.parse()
-            result.index = f2.get(3, [None])[0]  # index field in response
+            inner_response = fields[1][0]
+            if isinstance(inner_response, bytes):
+                p2 = ProtobufParser(inner_response)
+                f2 = p2.parse()
+                result.index = f2.get(3, [None])[0]
+                # Error field (1) takes precedence over response payload.
+                if 1 in f2:
+                    error_bytes = f2[1][0]
+                    if isinstance(error_bytes, bytes):
+                        pe = ProtobufParser(error_bytes)
+                        fe = pe.parse()
+                        result.error = {
+                            "code": fe.get(1, [None])[0],
+                            "message": (
+                                fe.get(2, [b""])[0].decode("utf-8", errors="replace")
+                                if isinstance(fe.get(2, [b""])[0], bytes)
+                                else None
+                            ),
+                        }
+                else:
+                    result.response = f2.get(2, [None])[0]
 
-        # Field 2: update (bytes)
+        # Field 2: update (inner Update message wrapper).
+        # update_parser.parse_ws_update expects this wrapper (fields 1, 3, 4).
         if 2 in fields:
             result.update = fields[2][0]
 
@@ -262,6 +311,7 @@ class BaleWebSocketClient:
             while self._connected and self._ws:
                 msg = await self._ws.recv()
                 if isinstance(msg, bytes):
+                    _log_raw_frame("WS_RECV", msg)
                     await self._handle_message(msg)
         except websockets.exceptions.ConnectionClosed as e:
             logger.warning("WebSocket closed: code=%s reason=%s", e.code, e.reason)
@@ -280,19 +330,23 @@ class BaleWebSocketClient:
         resp = WsResponse.parse(data)
 
         if resp.handshake_response:
+            _log_raw_frame("HANDSHAKE", data)
             logger.debug("Received handshake response")
             return
 
         if resp.pong:
+            _log_raw_frame("PONG", data)
             logger.debug("Received pong")
             return
 
         if resp.terminate_session:
+            _log_raw_frame("TERMINATE", data)
             logger.warning("Received terminateSession")
             self._connected = False
             return
 
-        if resp.update:
+        if resp.update is not None:
+            _log_raw_frame("UPDATE", data)
             if self.update_queue is not None:
                 try:
                     self.update_queue.put_nowait(resp.update)
@@ -304,12 +358,22 @@ class BaleWebSocketClient:
                 except Exception:
                     logger.exception("on_update callback error")
 
-        if resp.response:
+        if resp.response is not None or resp.error is not None:
+            _log_raw_frame("RESPONSE", data)
             # Resolve pending response
             if resp.index is not None and resp.index in self._pending_responses:
                 future = self._pending_responses.pop(resp.index)
                 if not future.done():
-                    future.set_result(resp.response)
+                    if resp.error is not None:
+                        from .exceptions import BaleRpcError
+                        future.set_exception(
+                            BaleRpcError(
+                                f"{resp.error.get('code')}: {resp.error.get('message')}",
+                                code=resp.error.get("code"),
+                            )
+                        )
+                    else:
+                        future.set_result(resp.response)
             elif self.on_message:
                 try:
                     self.on_message(resp.response)

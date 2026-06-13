@@ -13,6 +13,7 @@ from typing import Generator
 from sqlalchemy import create_engine, event, text
 from sqlalchemy.engine import make_url
 from sqlalchemy.orm import Session, sessionmaker
+from sqlalchemy.pool import StaticPool
 
 from app.config import settings
 
@@ -83,7 +84,20 @@ def ensure_database_exists() -> None:
 
 ensure_database_exists()
 
-engine = create_engine(DATABASE_URL, connect_args=_connect_args(DATABASE_URL), pool_pre_ping=True)
+def _engine_kwargs(url: str) -> dict[str, Any]:
+    """Build extra engine kwargs for the active database backend."""
+    kwargs: dict[str, Any] = {"connect_args": _connect_args(url)}
+    if _is_sqlite_url(url):
+        # StaticPool reuses a single connection for SQLite, reducing
+        # connection churn and lock contention in WAL mode.
+        kwargs["poolclass"] = StaticPool
+        kwargs["pool_pre_ping"] = False
+    else:
+        kwargs["pool_pre_ping"] = True
+    return kwargs
+
+
+engine = create_engine(DATABASE_URL, **_engine_kwargs(DATABASE_URL))
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 
 

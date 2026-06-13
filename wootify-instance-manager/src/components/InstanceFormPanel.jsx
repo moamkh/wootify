@@ -119,6 +119,7 @@ export default function InstanceFormPanel({
   isFeatureSupported,
   onSave,
   onNewInstance,
+  onCreateInbox,
   onCreateEnterpriseInbox,
   onSaveEnterpriseSmsSync,
   onRunEnterpriseSmsSyncNow,
@@ -534,7 +535,7 @@ export default function InstanceFormPanel({
           Account ID
           <input value={form.chatwoot_account_id} onChange={(e) => setForm((s) => ({ ...s, chatwoot_account_id: e.target.value }))} />
         </label>
-        {isStandardBalePlatform ? (
+        {isStandardBalePlatform || isBalePvPlatform ? (
           <>
             <div className="row">
               <label>
@@ -554,6 +555,11 @@ export default function InstanceFormPanel({
               <input type="checkbox" checked={form.chatwoot_reopen_conversation} onChange={(e) => setForm((s) => ({ ...s, chatwoot_reopen_conversation: e.target.checked }))} />
               Reopen resolved Chatwoot conversation on inbound reply
             </label>
+            {isBalePvPlatform && selectedKey ? (
+              <button type="button" className="btn" disabled={busy || !selectedKey} onClick={() => onCreateInbox(selectedKey)}>
+                Create or Link Inbox
+              </button>
+            ) : null}
           </>
         ) : null}
         {!isEnterprisePlatform ? (

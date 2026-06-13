@@ -240,6 +240,19 @@ def _parse_message_content(data: bytes) -> Optional[Dict[str, Any]]:
         return {}
 
 
+def _log_unknown_wrapper_fields(wrapper: Dict[int, Any], raw_wrapper: bytes) -> None:
+    """Log unknown wrapper field numbers for reverse-engineering."""
+    known = {50, 55}  # 50=read receipt, 55=new message
+    unknown = [k for k in wrapper.keys() if k not in known]
+    if unknown:
+        logger.warning(
+            "bale_ws_unknown_wrapper_fields unknown=%s raw_len=%s raw_hex=%s",
+            unknown,
+            len(raw_wrapper),
+            raw_wrapper[:64].hex(),
+        )
+
+
 def parse_ws_update(data: bytes) -> Optional[Dict[str, Any]]:
     """Parse a WebSocket update frame.
 
@@ -260,18 +273,41 @@ def parse_ws_update(data: bytes) -> Optional[Dict[str, Any]]:
         outer = ProtobufParser(data).parse()
         inner_bytes = outer.get(1, [b""])[0]
         if not inner_bytes or not isinstance(inner_bytes, bytes):
+            # Log other outer fields for reverse-engineering
+            unknown_outer = [k for k in outer.keys() if k != 1]
+            if unknown_outer:
+                logger.warning(
+                    "bale_ws_unknown_outer_fields fields=%s raw_len=%s raw_hex=%s",
+                    unknown_outer,
+                    len(data),
+                    data[:64].hex(),
+                )
             return None
 
         # Unwrap inner {1: wrapper_bytes, 3: index, 4: timestamp}
         inner = ProtobufParser(inner_bytes).parse()
         wrapper_bytes = inner.get(1, [b""])[0]
         if not wrapper_bytes or not isinstance(wrapper_bytes, bytes):
+            unknown_inner = [k for k in inner.keys() if k != 1]
+            if unknown_inner:
+                logger.warning(
+                    "bale_ws_unknown_inner_fields fields=%s raw_len=%s raw_hex=%s",
+                    unknown_inner,
+                    len(inner_bytes),
+                    inner_bytes[:64].hex(),
+                )
             return None
 
         # Unwrap wrapper {55: update_message_bytes} (or 50 for read receipts)
         wrapper = ProtobufParser(wrapper_bytes).parse()
+        _log_unknown_wrapper_fields(wrapper, wrapper_bytes)
+
         update_bytes = wrapper.get(55, [None])[0]
         if not update_bytes or not isinstance(update_bytes, bytes):
+            # Try field 50 (read receipts / status updates)
+            read_bytes = wrapper.get(50, [None])[0]
+            if read_bytes and isinstance(read_bytes, bytes):
+                logger.debug("bale_ws_read_receipt_frame raw_len=%s", len(read_bytes))
             return None
 
         # Parse UpdateMessage
@@ -282,6 +318,17 @@ def parse_ws_update(data: bytes) -> Optional[Dict[str, Any]]:
         rid = update.get(4, [None])[0]
         msg_bytes = update.get(5, [None])[0]
 
+        # Log any unknown fields in UpdateMessage (could signal edits/deletes)
+        known_update_fields = {1, 2, 3, 4, 5, 9, 14}
+        unknown_update = [k for k in update.keys() if k not in known_update_fields]
+        if unknown_update:
+            logger.warning(
+                "bale_ws_unknown_updatemessage_fields fields=%s rid=%s sender=%s",
+                unknown_update,
+                rid,
+                sender_uid,
+            )
+
         peer = _parse_peer(peer_bytes) if isinstance(peer_bytes, bytes) else None
 
         result: Dict[str, Any] = {
@@ -290,6 +337,33 @@ def parse_ws_update(data: bytes) -> Optional[Dict[str, Any]]:
             "date": date,
             "peer": peer,
         }
+
+        # Try to extract reply_to message reference from undocumented fields
+        # (common candidates: 6, 7, 8 in UpdateMessage protobuf)
+        reply_to_msg_id: Optional[int] = None
+        for candidate_field in (6, 7, 8):
+            candidate_bytes = update.get(candidate_field, [None])[0]
+            if isinstance(candidate_bytes, bytes) and len(candidate_bytes) >= 2:
+                try:
+                    candidate = ProtobufParser(candidate_bytes).parse()
+                    # Look for an integer field (likely message_id)
+                    for msg_id_field in (1, 2, 4):
+                        val = candidate.get(msg_id_field, [None])[0]
+                        if isinstance(val, int) and val > 0:
+                            reply_to_msg_id = val
+                            logger.debug(
+                                "parse_ws_update found reply_to candidate_field=%s msg_id_field=%s msg_id=%s",
+                                candidate_field,
+                                msg_id_field,
+                                val,
+                            )
+                            break
+                    if reply_to_msg_id is not None:
+                        break
+                except Exception:
+                    pass
+        if reply_to_msg_id is not None:
+            result["reply_to_msg_id"] = reply_to_msg_id
 
         if msg_bytes and isinstance(msg_bytes, bytes):
             content = _parse_message_content(msg_bytes)

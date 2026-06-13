@@ -42,6 +42,8 @@ import {
   balePvSendCode,
   balePvValidateCode,
   balePvAuthStatus,
+  balePvSyncContacts,
+  balePvSyncDialogs,
 } from './api.js';
 import PageLoader from './components/PageLoader.jsx';
 
@@ -183,7 +185,7 @@ function defaultForm(features) {
     chatwoot_inbox_id: '',
     chatwoot_inbox_name: 'wootify-inbox',
     chatwoot_auto_create: false,
-    chatwoot_reopen_conversation: false,
+    chatwoot_reopen_conversation: true,
     chatwoot_webhook_url: '',
     feature_overrides: featureMap,
   };
@@ -945,6 +947,35 @@ export default function App() {
     }
   }
 
+  async function onBalePvSyncContacts(instanceKey) {
+    setBusy(true);
+    try {
+      const response = await balePvSyncContacts(instanceKey);
+      alert(
+        `Contacts synced: ${response.created || 0} created, ${response.updated || 0} updated, ${response.failed || 0} failed`
+      );
+    } catch (e) {
+      alert(e?.message || String(e));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function onBalePvSyncDialogs(instanceKey) {
+    setBusy(true);
+    try {
+      const response = await balePvSyncDialogs(instanceKey);
+      alert(
+        `Dialogs synced: ${response.dialogs || 0} dialogs, ${response.created || 0} created, ${response.updated || 0} updated, ${response.failed || 0} failed, ${response.messages_imported || 0} messages imported`
+      );
+      await refreshInstances();
+    } catch (e) {
+      alert(e?.message || String(e));
+    } finally {
+      setBusy(false);
+    }
+  }
+
   async function onCreateEnterpriseInbox(routeKey, instanceKey = selectedKey) {
     if (!instanceKey) return;
     setBusy(true);
@@ -1347,6 +1378,8 @@ export default function App() {
     onToggleEnabled,
     onCreateInbox,
     onCreateEnterpriseInbox,
+    onBalePvSyncContacts,
+    onBalePvSyncDialogs,
     onDelete,
   };
 
@@ -1369,6 +1402,7 @@ export default function App() {
     isFeatureSupported,
     onSave,
     onNewInstance,
+    onCreateInbox,
     onCreateEnterpriseInbox,
     onSaveEnterpriseSmsSync,
     onRunEnterpriseSmsSyncNow,
@@ -1552,6 +1586,8 @@ export default function App() {
             conversationsCount={conversations.length}
             enterpriseSessionsCount={enterpriseSessions.length}
             enterpriseManualsCount={enterpriseManuals.length}
+            onBalePvSyncContacts={onBalePvSyncContacts}
+            onBalePvSyncDialogs={onBalePvSyncDialogs}
           />
         ) : (
           <InstancesPage
@@ -1564,6 +1600,8 @@ export default function App() {
             onToggleEnabled={onToggleEnabled}
             onCreateInbox={onCreateInbox}
             onCreateEnterpriseInbox={onCreateEnterpriseInbox}
+            onBalePvSyncContacts={onBalePvSyncContacts}
+            onBalePvSyncDialogs={onBalePvSyncDialogs}
             onDelete={onDelete}
             PLATFORM_TELEGRAM={PLATFORM_TELEGRAM}
             PLATFORM_BALE_ENTERPRISE={PLATFORM_BALE_ENTERPRISE}

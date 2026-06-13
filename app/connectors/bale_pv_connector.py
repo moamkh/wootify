@@ -11,6 +11,7 @@ import json
 import logging
 import re
 import time
+import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -62,6 +63,10 @@ class BalePvInstanceRuntime:
     session_dir: Path = field(default_factory=lambda: Path("./data/bale_pv_sessions"))
     auth_state: str = "unauthenticated"  # unauthenticated | code_sent | authenticated
     transaction_hash: Optional[str] = None
+    session_id: Optional[str] = None  # UUID-based session identifier
+    user_cache: Dict[int, str] = field(default_factory=dict)  # uid -> display name
+    self_user_id: Optional[int] = None  # extracted from JWT payload
+    last_user_cache_refresh: float = 0.0  # unix timestamp
 
 
 class BalePvConnector:
@@ -77,9 +82,124 @@ class BalePvConnector:
             raise RuntimeError(f"Bale PV instance '{instance}' is not configured")
         return runtime
 
+    @staticmethod
+    def _normalize_bale_phone(phone: str) -> str:
+        """Normalize an Iranian phone number for Bale auth.
+
+        Strips non-digits. If it starts with 0, replaces with 98.
+        Examples: 09136421196 → 989136421196, +989136421196 → 989136421196
+        """
+        digits = re.sub(r"\D", "", str(phone or "").strip())
+        if digits.startswith("0") and len(digits) == 11:
+            digits = "98" + digits[1:]
+        elif digits.startswith("+"):
+            digits = digits[1:]
+        return digits
+
     def _session_path(self, runtime: BalePvInstanceRuntime) -> Path:
         runtime.session_dir.mkdir(parents=True, exist_ok=True)
+        if runtime.session_id:
+            return runtime.session_dir / f"{runtime.phone_number}_{runtime.session_id}.session"
+        # Fallback to old naming for backwards compat during migration
         return runtime.session_dir / f"{runtime.phone_number}.session"
+
+    def _sid_path(self, runtime: BalePvInstanceRuntime) -> Path:
+        runtime.session_dir.mkdir(parents=True, exist_ok=True)
+        return runtime.session_dir / f"{runtime.instance_key}.sid"
+
+    def _get_or_create_session_id(self, runtime: BalePvInstanceRuntime) -> str:
+        """Read existing session ID from .sid file or generate a new one."""
+        sid_file = self._sid_path(runtime)
+        if sid_file.exists():
+            existing = sid_file.read_text().strip()
+            if existing:
+                return existing
+        new_sid = str(uuid.uuid4())
+        sid_file.write_text(new_sid, encoding="utf-8")
+        self._logger.info(
+            "bale_pv session_id_created instance=%s sid=%s",
+            runtime.instance_key,
+            new_sid,
+        )
+        return new_sid
+
+    def _migrate_old_session(self, runtime: BalePvInstanceRuntime) -> bool:
+        """Copy JWT from old phone-number-only session file to new UUID-based one."""
+        old_path = runtime.session_dir / f"{runtime.phone_number}.session"
+        if not old_path.exists():
+            return False
+        new_path = self._session_path(runtime)
+        if new_path.exists():
+            return False
+        try:
+            content = old_path.read_text(encoding="utf-8")
+            new_path.write_text(content, encoding="utf-8")
+            self._logger.info(
+                "bale_pv session_migrated instance=%s old=%s new=%s",
+                runtime.instance_key,
+                old_path.name,
+                new_path.name,
+            )
+            return True
+        except Exception as exc:
+            self._logger.warning(
+                "bale_pv session_migration_failed instance=%s error=%s",
+                runtime.instance_key,
+                exc,
+            )
+            return False
+
+    def _cleanup_old_sessions(self, runtime: BalePvInstanceRuntime) -> None:
+        """Remove old phone-number-only session files for this PC."""
+        try:
+            for f in runtime.session_dir.glob("*.session"):
+                # Keep UUID-based sessions (contain underscore)
+                if "_" not in f.name:
+                    f.unlink()
+                    self._logger.info(
+                        "bale_pv old_session_removed file=%s",
+                        f.name,
+                    )
+        except Exception as exc:
+            self._logger.warning("bale_pv old_session_cleanup_failed error=%s", exc)
+
+    @staticmethod
+    def _extract_user_id_from_jwt(jwt: str) -> Optional[int]:
+        """Extract user_id from JWT payload without verification."""
+        try:
+            import base64
+            parts = jwt.split(".")
+            if len(parts) < 2:
+                return None
+            payload_b64 = parts[1]
+            # Pad base64 if needed
+            pad = 4 - len(payload_b64) % 4
+            if pad != 4:
+                payload_b64 += "=" * pad
+            payload_json = base64.urlsafe_b64decode(payload_b64).decode("utf-8")
+            payload = json.loads(payload_json)
+            # Bale JWT: payload.payload.user_id
+            inner = payload.get("payload", {})
+            uid = inner.get("user_id")
+            return int(uid) if uid is not None else None
+        except Exception:
+            return None
+
+    def _load_session_jwt(self, runtime: BalePvInstanceRuntime) -> Optional[str]:
+        """Load JWT string from session file."""
+        session_file = self._session_path(runtime)
+        if not session_file.exists():
+            return None
+        try:
+            content = session_file.read_text().strip()
+            if content.startswith("jwt:") and len(content) > 20:
+                return content[4:]
+            if content.startswith("{"):
+                data = json.loads(content)
+                return str(data.get("jwt") or "")
+            return None
+        except Exception:
+            return None
 
     def _has_valid_session(self, runtime: BalePvInstanceRuntime) -> bool:
         session_file = self._session_path(runtime)
@@ -109,9 +229,10 @@ class BalePvConnector:
         If a valid session exists, starts the WebSocket listener.
         Otherwise leaves the runtime in 'unauthenticated' state.
         """
-        phone_number = str(params.get("bale_pv_phone_number") or "").strip()
-        if not phone_number:
+        phone_number_raw = str(params.get("bale_pv_phone_number") or "").strip()
+        if not phone_number_raw:
             raise RuntimeError(f"Bale PV instance '{instance}' missing bale_pv_phone_number")
+        phone_number = self._normalize_bale_phone(phone_number_raw)
 
         existing = self._instances.get(instance)
         if existing and existing.phone_number == phone_number:
@@ -138,20 +259,34 @@ class BalePvConnector:
         )
         self._instances[instance] = runtime
 
+        # Ensure each instance has its own UUID-based session
+        runtime.session_id = self._get_or_create_session_id(runtime)
+        self._migrate_old_session(runtime)
+        self._cleanup_old_sessions(runtime)
+
         if self._has_valid_session(runtime):
             runtime.auth_state = "authenticated"
+            # Extract self user ID from JWT so we can skip outgoing message echoes
+            jwt = self._load_session_jwt(runtime)
+            if jwt:
+                runtime.self_user_id = self._extract_user_id_from_jwt(jwt)
             self._logger.info(
-                "bale_pv session_exists instance=%s phone=%s",
+                "bale_pv session_exists instance=%s phone=%s sid=%s self_uid=%s",
                 instance,
                 phone_number,
+                runtime.session_id,
+                runtime.self_user_id,
             )
             # Attempt to start messaging client (may fail if JWT expired)
             await self._start_messaging_client(runtime)
+            # Refresh user cache for contact name lookups
+            await self._refresh_user_cache(runtime)
         else:
             self._logger.info(
-                "bale_pv awaiting_auth instance=%s phone=%s",
+                "bale_pv awaiting_auth instance=%s phone=%s sid=%s",
                 instance,
                 phone_number,
+                runtime.session_id,
             )
 
     async def disconnect(self, instance: str) -> None:
@@ -199,8 +334,10 @@ class BalePvConnector:
         try:
             peer_id = int(chat_id)
             reply_to = None
-            if quoted and quoted.get("message_id"):
-                reply_to = int(quoted["message_id"])
+            if quoted:
+                reply_to_val = quoted.get("message_id") or quoted.get("id")
+                if reply_to_val is not None:
+                    reply_to = int(reply_to_val)
 
             response = await runtime.client.send_message(
                 peer_id=peer_id,
@@ -212,7 +349,7 @@ class BalePvConnector:
                 instance,
                 chat_id,
             )
-            return {"ok": True, "result": {"raw_response": response.hex()}}
+            return {"ok": True, "result": {"raw_response": response.hex() if response else None}}
         except Exception as exc:
             self._logger.exception(
                 "bale_pv send_text error instance=%s chat_id=%s",
@@ -231,19 +368,382 @@ class BalePvConnector:
         quoted: Optional[Dict] = None,
         reply_markup: Any = None,
     ) -> Dict:
-        """Send media via the userbot."""
+        """Send media via the userbot.
+
+        Tries to upload the file to Bale's Nasim storage and send it as a
+        DocumentMessage. Falls back to a text message with the attachment
+        URL if upload fails.
+        """
         runtime = self._get_runtime(instance)
         if runtime.auth_state != "authenticated":
             raise RuntimeError(f"Instance {instance} is not authenticated")
 
+        if runtime.client is None:
+            raise RuntimeError("Bale PV messaging client is not connected")
+
+        # Resolve media to bytes
+        file_bytes: Optional[bytes] = None
+        if isinstance(media_url_or_bytes, bytes):
+            file_bytes = media_url_or_bytes
+        elif isinstance(media_url_or_bytes, str):
+            # Download from URL
+            self._logger.info(
+                "bale_pv media_download_start instance=%s url=%s",
+                instance,
+                media_url_or_bytes[:120],
+            )
+            try:
+                import httpx
+                async with httpx.AsyncClient(follow_redirects=True, timeout=60) as client:
+                    resp = await client.get(media_url_or_bytes)
+                    self._logger.info(
+                        "bale_pv media_download_status instance=%s status=%s len=%s",
+                        instance,
+                        resp.status_code,
+                        len(resp.content),
+                    )
+                    if resp.status_code == 200:
+                        file_bytes = resp.content
+                    else:
+                        self._logger.warning(
+                            "bale_pv media_download_failed instance=%s url=%s status=%s body=%s",
+                            instance,
+                            media_url_or_bytes[:120],
+                            resp.status_code,
+                            resp.text[:200],
+                        )
+            except Exception as exc:
+                self._logger.warning(
+                    "bale_pv media_download_error instance=%s url=%s error=%s",
+                    instance,
+                    media_url_or_bytes[:120],
+                    exc,
+                )
+
+        if file_bytes:
+            try:
+                uploaded = await self._upload_file_to_nasim(
+                    instance, chat_id, file_bytes, filename, caption, quoted
+                )
+                if uploaded:
+                    return uploaded
+            except Exception as exc:
+                self._logger.warning(
+                    "bale_pv media_upload_failed instance=%s error=%s",
+                    instance,
+                    exc,
+                )
+
+        # Fallback: send text with attachment info
         self._logger.warning(
-            "bale_pv send_media_not_implemented instance=%s",
+            "bale_pv send_media_fallback instance=%s chat_id=%s filename=%s",
             instance,
+            chat_id,
+            filename,
         )
-        raise RuntimeError(
-            "Bale PV userbot send_media is not yet implemented. "
-            "Media upload requires file service protobuf messages."
+        parts: List[str] = []
+        if caption:
+            parts.append(str(caption))
+        if isinstance(media_url_or_bytes, str):
+            parts.append(f"[Attachment: {filename}]\n{media_url_or_bytes}")
+        else:
+            parts.append(f"[Attachment: {filename}]")
+        fallback_text = "\n".join(parts)
+
+        result = await self.send_text(
+            instance,
+            chat_id,
+            fallback_text,
+            quoted=quoted,
         )
+        result["_media_fallback"] = True
+        result["_original_filename"] = filename
+        return result
+
+    async def _upload_file_to_nasim(
+        self,
+        instance: str,
+        chat_id: str,
+        file_bytes: bytes,
+        filename: str,
+        caption: Optional[str] = None,
+        quoted: Optional[Dict] = None,
+    ) -> Optional[Dict]:
+        """Upload file to Bale Nasim storage and send as DocumentMessage."""
+        import httpx
+        from bale_grpc_client.messaging_messages import (
+            GetNasimFileUploadUrlRequest,
+            SendMessageRequest,
+            DocumentMessage,
+            Peer,
+            SendTypeValue,
+        )
+        from bale_grpc_client.protobuf_wire import (
+            grpc_web_frame,
+            parse_grpc_web_response,
+            ProtobufMessage,
+            ProtobufParser,
+        )
+
+        runtime = self._get_runtime(instance)
+        peer_id = int(chat_id)
+
+        # Resolve mime type
+        import mimetypes
+        mime_type = mimetypes.guess_type(filename)[0] or "application/octet-stream"
+
+        # Build upload URL request
+        req = GetNasimFileUploadUrlRequest(
+            expected_size=len(file_bytes),
+            name=filename,
+            mime_type=mime_type,
+            uid=peer_id,
+            send_type=SendTypeValue.SEND_TYPE_DOCUMENT,
+            peer_type=Peer.PEER_TYPE_USER,
+            access_hash=0,
+        )
+
+        session_file = self._session_path(runtime)
+        jwt_raw = session_file.read_text().strip()
+        if jwt_raw.startswith("{"):
+            jwt = json.loads(jwt_raw).get("jwt", "")
+        else:
+            jwt = jwt_raw[4:] if jwt_raw.startswith("jwt:") else jwt_raw
+
+        async with httpx.AsyncClient(follow_redirects=True) as client:
+            # Establish cookie session
+            cookie_resp = await client.post(
+                "https://next-ws.bale.ai/set-cookie/",
+                headers={
+                    "Authorization": f"Bearer {jwt}",
+                    "Origin": "https://web.bale.ai",
+                },
+            )
+            if cookie_resp.status_code != 200:
+                self._logger.warning(
+                    "bale_pv set_cookie_failed instance=%s status=%s",
+                    instance,
+                    cookie_resp.status_code,
+                )
+                return None
+
+            # Call GetNasimFileUploadUrl
+            resp = await client.post(
+                "https://next-ws.bale.ai/ai.bale.server.Files/GetNasimFileUploadUrl",
+                content=grpc_web_frame(req.serialize()),
+                headers={
+                    "content-type": "application/grpc-web+proto",
+                    "x-grpc-web": "1",
+                    "mt_app_version": "157595",
+                    "app_version": "157595",
+                    "browser_type": "1",
+                    "mt_browser_type": "1",
+                    "browser_version": "148.0.0.0",
+                    "mt_browser_version": "148.0.0.0",
+                    "os_type": "3",
+                    "mt_os_type": "3",
+                    "session_id": str(int(time.time() * 1000)),
+                    "mt_session_id": str(int(time.time() * 1000)),
+                },
+            )
+
+            msg, status, grpc_msg = parse_grpc_web_response(resp.content)
+            if status != 0:
+                self._logger.warning(
+                    "bale_pv GetNasimFileUploadUrl grpc_error instance=%s status=%s msg=%s",
+                    instance,
+                    status,
+                    grpc_msg,
+                )
+                return None
+
+            # Parse upload URL response
+            fields = ProtobufParser(msg).parse()
+            upload_url = ""
+            file_id = 0
+            chunk_size = len(file_bytes)
+            self._logger.info("bale_pv upload_url_response fields=%s", fields)
+            for key, vals in fields.items():
+                if key == 2 and vals:
+                    val = vals[0]
+                    if isinstance(val, bytes):
+                        val = val.decode("utf-8", errors="replace")
+                    if isinstance(val, str) and val.startswith("http"):
+                        upload_url = val
+                elif key == 1 and vals and isinstance(vals[0], int):
+                    file_id = vals[0]
+                elif key == 4 and vals and isinstance(vals[0], int):
+                    chunk_size = vals[0]
+
+            if not upload_url:
+                self._logger.warning(
+                    "bale_pv GetNasimFileUploadUrl no_url instance=%s msg_len=%s fields=%s",
+                    instance,
+                    len(msg),
+                    fields,
+                )
+                return None
+            if not file_id:
+                self._logger.warning(
+                    "bale_pv GetNasimFileUploadUrl no_file_id instance=%s fields=%s",
+                    instance,
+                    fields,
+                )
+                return None
+
+            self._logger.info(
+                "bale_pv uploading file instance=%s url=%s size=%s file_id=%s chunk_size=%s",
+                instance,
+                upload_url[:120],
+                len(file_bytes),
+                file_id,
+                chunk_size,
+            )
+
+            # Upload file bytes via PUT (matching Balethon behaviour)
+            upload_resp = await client.put(
+                upload_url,
+                content=file_bytes,
+            )
+            if upload_resp.status_code not in (200, 201, 204):
+                self._logger.warning(
+                    "bale_pv file_upload_failed instance=%s status=%s url=%s body=%s",
+                    instance,
+                    upload_resp.status_code,
+                    upload_url[:80],
+                    upload_resp.text[:200],
+                )
+                return None
+
+            self._logger.info(
+                "bale_pv file_uploaded instance=%s file_id=%s size=%s",
+                instance,
+                file_id,
+                len(file_bytes),
+            )
+
+            # Send document message via WebSocket
+            reply_to = None
+            if quoted:
+                reply_to_val = quoted.get("message_id") or quoted.get("id")
+                if reply_to_val is not None:
+                    reply_to = int(reply_to_val)
+
+            await runtime.client.send_document(
+                peer_id=peer_id,
+                file_id=file_id,
+                access_hash=peer_id,
+                file_size=len(file_bytes),
+                name=filename,
+                mime_type=mime_type,
+                caption=caption or None,
+                reply_to_message_id=reply_to,
+            )
+            return {"ok": True, "result": {"file_id": file_id, "name": filename}}
+
+    async def update_message(
+        self,
+        instance: str,
+        chat_id: str,
+        message_id: str,
+        text: str,
+    ) -> Dict[str, Any]:
+        """Edit an existing message via the userbot.
+
+        Args:
+            instance: Connector instance key.
+            chat_id: Target peer ID (as string).
+            message_id: Bale message rid (as string).
+            text: New message text.
+
+        Returns:
+            Dict with ``ok`` status and raw response metadata.
+        """
+        runtime = self._get_runtime(instance)
+        if runtime.auth_state != "authenticated":
+            raise RuntimeError(f"Instance {instance} is not authenticated")
+
+        try:
+            peer_id = int(chat_id)
+            rid = int(message_id)
+        except (ValueError, TypeError) as exc:
+            raise RuntimeError(f"Invalid chat_id or message_id: {exc}") from exc
+
+        try:
+            response = await runtime.client.update_message(
+                peer_id=peer_id,
+                message_id=rid,
+                text=text,
+            )
+            self._logger.info(
+                "bale_pv update_message ok instance=%s chat_id=%s message_id=%s",
+                instance,
+                chat_id,
+                message_id,
+            )
+            return {
+                "ok": True,
+                "result": {"raw_response": response.hex() if response else None},
+            }
+        except Exception as exc:
+            self._logger.exception(
+                "bale_pv update_message error instance=%s chat_id=%s message_id=%s",
+                instance,
+                chat_id,
+                message_id,
+            )
+            raise RuntimeError(f"update_message failed: {exc}") from exc
+
+    async def delete_message(
+        self,
+        instance: str,
+        chat_id: str,
+        message_id: str,
+    ) -> Dict[str, Any]:
+        """Delete a message via the userbot.
+
+        Args:
+            instance: Connector instance key.
+            chat_id: Target peer ID (as string).
+            message_id: Bale message rid (as string).
+
+        Returns:
+            Dict with ``ok`` status and raw response metadata.
+        """
+        runtime = self._get_runtime(instance)
+        if runtime.auth_state != "authenticated":
+            raise RuntimeError(f"Instance {instance} is not authenticated")
+
+        try:
+            peer_id = int(chat_id)
+            rid = int(message_id)
+        except (ValueError, TypeError) as exc:
+            raise RuntimeError(f"Invalid chat_id or message_id: {exc}") from exc
+
+        try:
+            response = await runtime.client.delete_message(
+                peer_id=peer_id,
+                message_ids=[rid],
+                just_mine=False,
+            )
+            self._logger.info(
+                "bale_pv delete_message ok instance=%s chat_id=%s message_id=%s",
+                instance,
+                chat_id,
+                message_id,
+            )
+            return {
+                "ok": True,
+                "result": {"raw_response": response.hex() if response else None},
+            }
+        except Exception as exc:
+            self._logger.exception(
+                "bale_pv delete_message error instance=%s chat_id=%s message_id=%s",
+                instance,
+                chat_id,
+                message_id,
+            )
+            raise RuntimeError(f"delete_message failed: {exc}") from exc
 
     async def get_updates(
         self, instance: str, offset: Optional[int] = None, timeout: Optional[int] = None
@@ -268,6 +768,11 @@ class BalePvConnector:
         if not runtime.ws_task or runtime.ws_task.done():
             await self._start_messaging_client(runtime)
 
+        # Ensure user cache is populated for contact name lookups
+        cache_stale = (time.time() - runtime.last_user_cache_refresh) > 300  # 5 minutes
+        if not runtime.user_cache or cache_stale:
+            await self._refresh_user_cache(runtime)
+
         updates: List[Dict[str, Any]] = []
         max_items = 50
         wait_seconds = min(timeout or 1, 5)
@@ -276,7 +781,7 @@ class BalePvConnector:
             # Wait for at least one raw protobuf update, then drain the queue
             raw = await asyncio.wait_for(runtime.message_queue.get(), timeout=wait_seconds)
             if raw:
-                parsed = self._parse_raw_update(raw)
+                parsed = self._parse_raw_update(raw, runtime.user_cache, runtime.self_user_id)
                 if parsed:
                     updates.append(parsed)
             # Drain remaining without blocking
@@ -284,7 +789,7 @@ class BalePvConnector:
                 try:
                     raw = runtime.message_queue.get_nowait()
                     if raw:
-                        parsed = self._parse_raw_update(raw)
+                        parsed = self._parse_raw_update(raw, runtime.user_cache, runtime.self_user_id)
                         if parsed:
                             updates.append(parsed)
                 except asyncio.QueueEmpty:
@@ -298,7 +803,7 @@ class BalePvConnector:
         }
 
     @staticmethod
-    def _parse_raw_update(raw: Any) -> Optional[Dict[str, Any]]:
+    def _parse_raw_update(raw: Any, user_cache: Optional[Dict[int, str]] = None, self_user_id: Optional[int] = None) -> Optional[Dict[str, Any]]:
         """Parse a raw protobuf update into a Bot-API-style update dict."""
         from bale_grpc_client.update_parser import parse_ws_update
 
@@ -317,15 +822,38 @@ class BalePvConnector:
         if not isinstance(sender_uid, int):
             return None
 
+        peer = parsed.get("peer") or {}
+        peer_id = peer.get("id") or sender_uid
+        peer_type = peer.get("type", 1)
+
+        is_outgoing = self_user_id is not None and sender_uid == self_user_id
+
+        # Determine chat_id based on peer type
+        if is_outgoing:
+            # Outgoing echo: the conversation is the peer we sent to
+            chat_id = str(peer_id)
+        elif peer_type == 1:
+            # Incoming 1:1 message
+            chat_id = str(sender_uid)
+        else:
+            # Incoming group/channel message: conversation is the group/channel
+            chat_id = str(peer_id)
+
+        # Look up sender name from user cache (populated from contacts)
+        cached_name = ""
+        if user_cache and isinstance(sender_uid, int):
+            cached_name = user_cache.get(sender_uid, "")
+
         text = parsed.get("text") or ""
+
+        # For group/channel messages, prefix with sender name so members are distinguishable
+        if peer_type in (2, 3) and not is_outgoing and text:
+            sender_label = cached_name or str(sender_uid)
+            text = f"{sender_label}: {text}"
+
         rid = parsed.get("rid")
         date = parsed.get("date")
         media = parsed.get("media")
-        peer = parsed.get("peer") or {}
-        peer_id = peer.get("id") or sender_uid
-
-        # For private chats, chat_id = sender_uid
-        chat_id = str(sender_uid)
 
         message: Dict[str, Any] = {
             "message_id": str(rid) if rid else None,
@@ -333,15 +861,23 @@ class BalePvConnector:
             "chat": {"id": chat_id, "type": "private"},
             "from": {
                 "id": sender_uid,
-                "first_name": str(chat_id),
+                "first_name": cached_name,
+                "username": cached_name,
             },
             "text": text,
         }
+        if is_outgoing:
+            message["_outgoing"] = True
 
-        # Attach media metadata for downstream processing
+        # Pass through reply-to reference so reply threading works
+        reply_to_msg_id = parsed.get("reply_to_msg_id")
+        if reply_to_msg_id is not None:
+            message["reply_to_message"] = {"message_id": str(reply_to_msg_id)}
+
+        # Attach media metadata for downstream processing.
+        # Detect the media category from the declared MIME type and set the
+        # appropriate Bot-API field so _extract_file can route it correctly.
         if media:
-            # Store composite file_id so download_file_by_id can reconstruct
-            # the GetNasimFileUrl request (needs file_id + access_hash + peer_id)
             composite = {
                 "file_id": media.get("file_id"),
                 "access_hash": media.get("access_hash"),
@@ -349,19 +885,121 @@ class BalePvConnector:
                 "file_name": media.get("file_name", ""),
             }
             media["file_id"] = json.dumps(composite, separators=(",", ":"))
-            message["document"] = media
+
+            mime = str(media.get("mime_type") or "").strip().lower()
+            file_name = str(media.get("file_name") or "").strip().lower()
+            width = media.get("width")
+            height = media.get("height")
+
+            # Build a base dict that _extract_file will read
+            media_entry = {
+                "file_id": media["file_id"],
+                "file_name": media.get("file_name", ""),
+                "mime_type": media.get("mime_type", ""),
+            }
+            if width is not None:
+                media_entry["width"] = width
+            if height is not None:
+                media_entry["height"] = height
+
+            if mime.startswith("image/"):
+                if mime == "image/webp" or file_name.endswith(".webp"):
+                    # Treat WEBP as stickers (Bale/Telegram convention).
+                    # We intentionally omit the thumbnail file_id because Bale
+                    # does not expose a separate thumbnail file; including the
+                    # same composite JSON under thumbnail.file_id confuses the
+                    # downstream extractor. Width/height are preserved so UI
+                    # can render the sticker at the right aspect ratio.
+                    sticker_thumb: Dict[str, Any] = {}
+                    if width is not None:
+                        sticker_thumb["width"] = width
+                    if height is not None:
+                        sticker_thumb["height"] = height
+                    message["sticker"] = {
+                        "file_id": media["file_id"],
+                        "mime_type": media.get("mime_type", ""),
+                        "thumbnail": sticker_thumb if sticker_thumb else None,
+                    }
+                else:
+                    # Photos: Bot-API expects a list, last element is used
+                    message["photo"] = [media_entry]
+            elif mime.startswith("video/"):
+                message["video"] = media_entry
+            elif mime.startswith("audio/"):
+                if mime == "audio/ogg" or file_name.endswith(".ogg"):
+                    # Voice messages are typically OGG in Bale
+                    message["voice"] = media_entry
+                else:
+                    message["audio"] = media_entry
+            else:
+                message["document"] = media_entry
+
             message["mime_type"] = media.get("mime_type", "")
             message["file_name"] = media.get("file_name", "")
-            # Add image dimensions if available
-            if "width" in media:
-                message["width"] = media["width"]
-            if "height" in media:
-                message["height"] = media["height"]
+            if width is not None:
+                message["width"] = width
+            if height is not None:
+                message["height"] = height
 
         return {
             "update_id": int(rid or 0),
             "message": message,
         }
+
+    @staticmethod
+    def _extract_url_from_nasim_response(msg: bytes) -> Optional[str]:
+        """Try multiple protobuf field layouts to extract the download URL.
+
+        Bale has changed the ``GetNasimFileUrl`` response schema in the past.
+        We try the most common layouts and fall back gracefully.
+        """
+        from bale_grpc_client.protobuf_wire import ProtobufParser
+
+        fields = ProtobufParser(msg).parse()
+
+        # Layout A: field 1 = nested message, field 2 of that nested msg = url string
+        file_url_bytes = fields.get(1, [None])[0]
+        if isinstance(file_url_bytes, bytes) and len(file_url_bytes) > 4:
+            try:
+                url_fields = ProtobufParser(file_url_bytes).parse()
+                url_val = url_fields.get(2, [b""])[0]
+                if isinstance(url_val, bytes) and url_val:
+                    return url_val.decode("utf-8", errors="replace")
+            except Exception:
+                pass
+
+        # Layout B: field 1 = direct string URL
+        if isinstance(file_url_bytes, bytes) and file_url_bytes.startswith(b"http"):
+            return file_url_bytes.decode("utf-8", errors="replace")
+
+        # Layout C: field 2 = direct string URL
+        url_val = fields.get(2, [b""])[0]
+        if isinstance(url_val, bytes) and url_val.startswith(b"http"):
+            return url_val.decode("utf-8", errors="replace")
+
+        # Layout D: field 1 = nested message, field 1 of that nested msg = url string
+        if isinstance(file_url_bytes, bytes) and len(file_url_bytes) > 4:
+            try:
+                url_fields = ProtobufParser(file_url_bytes).parse()
+                url_val = url_fields.get(1, [b""])[0]
+                if isinstance(url_val, bytes) and url_val:
+                    return url_val.decode("utf-8", errors="replace")
+            except Exception:
+                pass
+
+        return None
+
+    @staticmethod
+    def _is_valid_image_bytes(content: bytes) -> bool:
+        """Quick sanity check that bytes look like a known image format."""
+        if not content:
+            return False
+        return (
+            content.startswith(b"\x89PNG\r\n\x1a\n")
+            or content.startswith(b"\xff\xd8\xff")
+            or content.startswith((b"GIF87a", b"GIF89a"))
+            or (len(content) > 12 and content[:4] == b"RIFF" and content[8:12] == b"WEBP")
+        )
 
     async def download_file_by_id(
         self, instance: str, file_id: str
@@ -374,6 +1012,7 @@ class BalePvConnector:
         """
         runtime = self._get_runtime(instance)
         if runtime.auth_state != "authenticated":
+            self._logger.warning("bale_pv download_file_by_id not_authenticated instance=%s", instance)
             return b"", None, None
 
         # Parse composite file_id
@@ -381,7 +1020,6 @@ class BalePvConnector:
             file_info = json.loads(file_id)
             fid = int(file_info["file_id"])
             ahash = int(file_info["access_hash"])
-            peer_id = int(file_info["peer_id"])
             filename = file_info.get("file_name", "")
         except (json.JSONDecodeError, KeyError, ValueError) as exc:
             self._logger.warning(
@@ -396,8 +1034,6 @@ class BalePvConnector:
             import httpx
             from bale_grpc_client.messaging_messages import GetNasimFileUrlRequest
             from bale_grpc_client.protobuf_wire import (
-                ProtobufMessage,
-                ProtobufParser,
                 grpc_web_frame,
                 parse_grpc_web_response,
             )
@@ -409,7 +1045,7 @@ class BalePvConnector:
             else:
                 jwt = jwt_raw[4:] if jwt_raw.startswith("jwt:") else jwt_raw
 
-            async with httpx.AsyncClient() as client:
+            async with httpx.AsyncClient(follow_redirects=True) as client:
                 # Establish cookie session
                 cookie_resp = await client.post(
                     "https://next-ws.bale.ai/set-cookie/",
@@ -419,6 +1055,11 @@ class BalePvConnector:
                     },
                 )
                 if cookie_resp.status_code != 200:
+                    self._logger.warning(
+                        "bale_pv set_cookie_failed instance=%s status=%s",
+                        instance,
+                        cookie_resp.status_code,
+                    )
                     return b"", None, None
 
                 req = GetNasimFileUrlRequest(
@@ -444,44 +1085,58 @@ class BalePvConnector:
                     },
                 )
 
-                msg, status, _ = parse_grpc_web_response(resp.content)
+                msg, status, grpc_msg = parse_grpc_web_response(resp.content)
                 if status != 0:
                     self._logger.warning(
-                        "bale_pv GetNasimFileUrl grpc_error instance=%s status=%s",
+                        "bale_pv GetNasimFileUrl grpc_error instance=%s status=%s msg=%s",
                         instance,
                         status,
+                        grpc_msg,
                     )
                     return b"", None, None
 
-                fields = ProtobufParser(msg).parse()
-                file_url_bytes = fields.get(1, [None])[0]
-                if not file_url_bytes or not isinstance(file_url_bytes, bytes):
+                download_url = self._extract_url_from_nasim_response(msg)
+                if not download_url:
+                    self._logger.warning(
+                        "bale_pv GetNasimFileUrl no_url instance=%s msg_len=%s fields=%s",
+                        instance,
+                        len(msg),
+                        msg[:32].hex() if msg else "empty",
+                    )
                     return b"", None, None
 
-                url_fields = ProtobufParser(file_url_bytes).parse()
-                url_val = url_fields.get(2, [b""])[0]
-                if not url_val or not isinstance(url_val, bytes):
-                    return b"", None, None
-
-                download_url = url_val.decode("utf-8")
                 self._logger.info(
                     "bale_pv downloading file instance=%s url=%s",
                     instance,
-                    download_url[:80],
+                    download_url[:120],
                 )
 
                 # Download the actual file
                 file_resp = await client.get(download_url)
                 if file_resp.status_code != 200:
+                    self._logger.warning(
+                        "bale_pv file_download_failed instance=%s status=%s url=%s",
+                        instance,
+                        file_resp.status_code,
+                        download_url[:80],
+                    )
                     return b"", None, None
 
+                content = file_resp.content
                 content_type = file_resp.headers.get("content-type")
-                return file_resp.content, content_type, filename or None
+                self._logger.info(
+                    "bale_pv file_downloaded instance=%s size=%s ctype=%s",
+                    instance,
+                    len(content),
+                    content_type,
+                )
+                return content, content_type, filename or None
 
         except Exception as exc:
             self._logger.exception(
-                "bale_pv download_file_by_id error instance=%s",
+                "bale_pv download_file_by_id error instance=%s file_id=%s",
                 instance,
+                file_id,
             )
             return b"", None, None
 
@@ -592,6 +1247,13 @@ class BalePvConnector:
             "phone_number": runtime.phone_number,
             "has_session_file": has_session,
         }
+
+    def get_self_user_id(self, instance: str) -> Optional[int]:
+        """Return the authenticated user's own Bale ID (from JWT), or None."""
+        runtime = self._instances.get(instance)
+        if not runtime:
+            return None
+        return runtime.self_user_id
 
     # ------------------------------------------------------------------
     # Internal WebSocket listener
@@ -706,6 +1368,178 @@ class BalePvConnector:
 
         return {"ok": True, "dialogs": dialogs}
 
+    async def sync_bale_dialogs(
+        self,
+        instance: str,
+        *,
+        limit: int = 200,
+        load_history: bool = False,
+        history_limit: int = 50,
+    ) -> Dict[str, Any]:
+        """Fetch Bale dialogs, user details, and optionally history.
+
+        Returns a dict with:
+          - dialogs: list of normalized dialog objects
+          - users_by_id: map of uid -> user dict (includes is_bot)
+          - groups_by_id: map of group id -> group dict
+          - history_by_peer: map of peer key -> list of messages (if load_history)
+        """
+        import asyncio
+        from bale_grpc_client.dialog_parser import (
+            parse_load_dialogs_response,
+            parse_load_users_response,
+            parse_load_history_response,
+        )
+        from bale_grpc_client.messaging_messages import Peer
+
+        runtime = self._get_runtime(instance)
+        if runtime.auth_state != "authenticated":
+            return {"ok": False, "description": "not_authenticated"}
+
+        if runtime.client is None:
+            return {"ok": False, "description": "messaging_client_not_connected"}
+
+        try:
+            raw = await runtime.client.load_dialogs(limit=limit)
+        except Exception as exc:
+            self._logger.warning("bale_pv load_dialogs_failed instance=%s error=%s", instance, exc)
+            return {"ok": False, "description": f"load_dialogs_failed: {exc}"}
+
+        parsed = parse_load_dialogs_response(raw)
+        dialogs = parsed.get("dialogs", [])
+        users = parsed.get("users", [])
+        groups = parsed.get("groups", [])
+
+        self._logger.info(
+            "bale_pv load_dialogs ok instance=%s dialogs=%s users=%s groups=%s",
+            instance,
+            len(dialogs),
+            len(users),
+            len(groups),
+        )
+
+        # Build lookup maps
+        users_by_id: Dict[int, Dict[str, Any]] = {}
+        groups_by_id: Dict[int, Dict[str, Any]] = {}
+        for u in users:
+            uid = u.get("id")
+            if uid is not None:
+                users_by_id[int(uid)] = u
+                if u.get("name"):
+                    runtime.user_cache[int(uid)] = u["name"]
+        for g in groups:
+            gid = g.get("id")
+            if gid is not None:
+                groups_by_id[int(gid)] = g
+
+        # Load user details for any missing users referenced by dialogs
+        user_peer_ids = set()
+        for d in dialogs:
+            peer = d.get("peer") or {}
+            if peer.get("type") == Peer.PEER_TYPE_USER:
+                uid = peer.get("id")
+                if uid is not None and int(uid) not in users_by_id:
+                    user_peer_ids.add(int(uid))
+
+        if user_peer_ids:
+            try:
+                peers = [{"uid": uid} for uid in user_peer_ids]
+                users_raw = await runtime.client.load_users(peers)
+                extra = parse_load_users_response(users_raw)
+                for u in extra.get("users", []):
+                    uid = u.get("id")
+                    if uid is not None:
+                        users_by_id[int(uid)] = u
+                self._logger.info(
+                    "bale_pv load_users ok instance=%s count=%s",
+                    instance,
+                    len(extra.get("users", [])),
+                )
+            except Exception as exc:
+                self._logger.warning("bale_pv load_users_failed instance=%s error=%s", instance, exc)
+
+        # Normalize dialogs with display names
+        normalized_dialogs: List[Dict[str, Any]] = []
+        for d in dialogs:
+            peer = d.get("peer") or {}
+            peer_type = peer.get("type", Peer.PEER_TYPE_USER)
+            peer_id = peer.get("id")
+            if peer_id is None:
+                continue
+
+            display_name = None
+            is_bot = False
+            peer_type_label = "user"
+
+            if peer_type == Peer.PEER_TYPE_USER:
+                user = users_by_id.get(int(peer_id), {})
+                display_name = user.get("name") or user.get("nick") or str(peer_id)
+                is_bot = bool(user.get("is_bot"))
+                peer_type_label = "bot" if is_bot else "user"
+            elif peer_type == Peer.PEER_TYPE_GROUP:
+                group = groups_by_id.get(int(peer_id), {})
+                display_name = group.get("title") or str(peer_id)
+                peer_type_label = "group"
+            elif peer_type == Peer.PEER_TYPE_CHANNEL:
+                group = groups_by_id.get(int(peer_id), {})
+                display_name = group.get("title") or str(peer_id)
+                peer_type_label = "channel"
+
+            normalized = {
+                "peer_id": int(peer_id),
+                "peer_type": int(peer_type),
+                "peer_type_label": peer_type_label,
+                "display_name": f"({peer_type_label}) {display_name}" if display_name else f"({peer_type_label}) {peer_id}",
+                "raw_name": display_name,
+                "is_bot": is_bot,
+                "unread_count": d.get("unread_count", 0),
+                "date": d.get("date"),
+                "rid": d.get("rid"),
+            }
+            normalized_dialogs.append(normalized)
+
+        result: Dict[str, Any] = {
+            "ok": True,
+            "dialogs": normalized_dialogs,
+            "users_by_id": users_by_id,
+            "groups_by_id": groups_by_id,
+        }
+
+        # Optionally load recent history for each dialog
+        if load_history:
+            history_by_peer: Dict[str, List[Dict[str, Any]]] = {}
+            for dlg in normalized_dialogs:
+                peer_key = f"{dlg['peer_type']}|{dlg['peer_id']}"
+                try:
+                    raw_hist = await runtime.client.load_history(
+                        peer_id=dlg["peer_id"],
+                        peer_type=dlg["peer_type"],
+                        limit=history_limit,
+                    )
+                    hist = parse_load_history_response(raw_hist)
+                    messages = hist.get("history", [])
+                    # Enrich sender names for group messages
+                    for msg in messages:
+                        sender_uid = msg.get("sender_uid")
+                        if sender_uid is not None:
+                            sender = users_by_id.get(int(sender_uid), {})
+                            msg["sender_name"] = sender.get("name") or sender.get("nick") or str(sender_uid)
+                            msg["sender_is_bot"] = bool(sender.get("is_bot"))
+                    history_by_peer[peer_key] = messages
+                    # Small delay to avoid hammering the server
+                    await asyncio.sleep(0.3)
+                except Exception as exc:
+                    self._logger.warning(
+                        "bale_pv load_history_failed instance=%s peer=%s error=%s",
+                        instance,
+                        peer_key,
+                        exc,
+                    )
+                    history_by_peer[peer_key] = []
+            result["history_by_peer"] = history_by_peer
+
+        return result
+
     async def get_contacts(self, instance: str) -> Dict[str, Any]:
         """Fetch contacts list for an authenticated instance.
 
@@ -777,30 +1611,105 @@ class BalePvConnector:
                     }
 
                 fields = ProtobufParser(msg).parse()
-                contacts = []
+                user_ids: List[int] = []
                 user_bytes_list = fields.get(3, [])
                 for ub in user_bytes_list:
                     uf = ProtobufParser(ub).parse()
                     uid = uf.get(1, [None])[0]
-                    # GetContacts only returns IDs; names require LoadUsers call
-                    name_val = uf.get(2, [None])[0]
-                    nick_val = uf.get(5, [None])[0]
-                    name = ""
-                    nick = ""
-                    if isinstance(name_val, bytes):
-                        name = name_val.decode("utf-8", errors="replace")
-                    if isinstance(nick_val, bytes):
-                        nick = nick_val.decode("utf-8", errors="replace")
+                    if isinstance(uid, int):
+                        user_ids.append(uid)
+
+                # Fetch names via LoadUsers (field 4 contains the display name)
+                name_map: Dict[int, str] = {}
+                if user_ids:
+                    lu_req = ProtobufMessage()
+                    for uid in user_ids:
+                        uid_msg = ProtobufMessage()
+                        uid_msg.add_int64(1, uid)
+                        lu_req.add_message(1, uid_msg)
+                    lu_resp = await client.post(
+                        "https://next-ws.bale.ai/bale.users.v1.Users/LoadUsers",
+                        content=grpc_web_frame(lu_req.serialize()),
+                        headers={
+                            "content-type": "application/grpc-web+proto",
+                            "x-grpc-web": "1",
+                            "mt_app_version": "157595",
+                            "app_version": "157595",
+                            "browser_type": "1",
+                            "mt_browser_type": "1",
+                            "browser_version": "148.0.0.0",
+                            "mt_browser_version": "148.0.0.0",
+                            "os_type": "3",
+                            "mt_os_type": "3",
+                            "session_id": str(int(time.time() * 1000)),
+                            "mt_session_id": str(int(time.time() * 1000)),
+                        },
+                    )
+                    lu_msg, lu_status, _ = parse_grpc_web_response(lu_resp.content)
+                    if lu_status == 0 and lu_msg:
+                        lu_fields = ProtobufParser(lu_msg).parse()
+                        for user_bytes in lu_fields.get(1, []):
+                            if not isinstance(user_bytes, bytes):
+                                continue
+                            uuf = ProtobufParser(user_bytes).parse()
+                            uid = uuf.get(1, [None])[0]
+                            name_bytes = uuf.get(4, [None])[0]
+                            display_name = ""
+                            if isinstance(name_bytes, bytes):
+                                try:
+                                    nested = ProtobufParser(name_bytes).parse()
+                                    name_val = nested.get(1, [None])[0]
+                                    if isinstance(name_val, bytes):
+                                        display_name = name_val.decode("utf-8", errors="replace")
+                                except Exception:
+                                    pass
+                            if isinstance(uid, int):
+                                name_map[uid] = display_name
+
+                contacts = []
+                for uid in user_ids:
                     contacts.append({
                         "id": uid,
-                        "name": name,
-                        "nick": nick,
+                        "name": name_map.get(uid, ""),
                     })
 
+                self._logger.info(
+                    "bale_pv get_contacts ok instance=%s count=%s names=%s",
+                    instance,
+                    len(contacts),
+                    sum(1 for c in contacts if c["name"]),
+                )
                 return {"ok": True, "contacts": contacts}
         except Exception as exc:
             self._logger.exception("bale_pv get_contacts error")
             return {"ok": False, "description": str(exc)}
+
+    async def _refresh_user_cache(self, runtime: BalePvInstanceRuntime) -> None:
+        """Fetch contacts and populate the user_cache for name lookups."""
+        result = await self.get_contacts(runtime.instance_key)
+        if not result.get("ok"):
+            self._logger.warning(
+                "bale_pv user_cache_refresh_failed instance=%s error=%s",
+                runtime.instance_key,
+                result.get("description"),
+            )
+            return
+        contacts = result.get("contacts") or []
+        before = len(runtime.user_cache)
+        for contact in contacts:
+            uid = contact.get("id")
+            if uid is None:
+                continue
+            name = contact.get("name") or ""
+            if name:
+                runtime.user_cache[int(uid)] = str(name).strip()
+        runtime.last_user_cache_refresh = time.time()
+        self._logger.info(
+            "bale_pv user_cache_refreshed instance=%s before=%s after=%s",
+            runtime.instance_key,
+            before,
+            len(runtime.user_cache),
+        )
 
     async def _ws_listen(self, runtime: BalePvInstanceRuntime) -> None:
         """Background WebSocket listener — keeps connection alive and reconnects."""

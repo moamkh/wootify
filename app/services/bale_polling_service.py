@@ -176,6 +176,9 @@ class BalePollingService:
                         processed_update_id = str(normalized_update_id)
 
                     update_processed = False
+                    # Rate-limit: small pause between updates to avoid hammering Chatwoot
+                    await asyncio.sleep(0.5)
+
                     if platform_key == 'bale_enterprise':
                         try:
                             with SessionLocal() as db:
@@ -765,16 +768,27 @@ class BalePollingService:
             content, content_type, file_path = await connector.download_file_by_id(instance_key, file_id=file_id)
             if content:
                 resolved_filename = filename or (str(file_path).split('/')[-1] if file_path else 'file')
-                resolved_content_type = self._resolve_attachment_content_type(
-                    content_type=content_type,
-                    content_type_hint=content_type_hint,
+                resolved_content_type = self._normalize_content_type(
                     filename=resolved_filename,
+                    content_type=content_type or content_type_hint,
                     content=content,
                 )
-                resolved_filename = self._resolve_attachment_filename(
-                    filename=resolved_filename,
-                    content_type=resolved_content_type,
-                )
+                # Sanity-check: if we claim it's an image, the bytes should look like one
+                if resolved_content_type and resolved_content_type.startswith('image/'):
+                    is_valid_image = (
+                        content.startswith(b'\x89PNG\r\n\x1a\n')
+                        or content.startswith(b'\xff\xd8\xff')
+                        or content.startswith((b'GIF87a', b'GIF89a'))
+                        or (len(content) > 12 and content[:4] == b'RIFF' and content[8:12] == b'WEBP')
+                    )
+                    if not is_valid_image:
+                        self._logger.warning(
+                            'bale_polling image_bytes_mismatch instance=%s filename=%s claimed=%s actual_bytes=%s',
+                            instance_key,
+                            resolved_filename,
+                            resolved_content_type,
+                            content[:8].hex(),
+                        )
                 attachments.append(
                     {
                         'filename': resolved_filename,
@@ -783,7 +797,7 @@ class BalePollingService:
                     }
                 )
 
-        return {
+        event: dict[str, Any] = {
             'chat_id': str(chat_id),
             'platform_key': str(platform_key or '').strip().lower() or None,
             'from_name': from_name,
@@ -794,37 +808,56 @@ class BalePollingService:
             'attachments': attachments,
             'contact': contact_payload,
         }
+        if message.get('_outgoing'):
+            event['outgoing'] = True
+        if message.get('_deleted'):
+            event['_deleted'] = True
+        return event
 
     @staticmethod
-    def _extract_file(message: dict[str, Any]) -> tuple[Optional[str], Optional[str], Optional[str]]:
-        """Internal helper to extract file."""
-        doc = message.get('document')
-        if isinstance(doc, dict) and doc.get('file_id'):
-            return str(doc.get('file_id')), doc.get('file_name'), doc.get('mime_type')
+    def _extract_file(
+        message: dict[str, Any],
+    ) -> tuple[Optional[str], Optional[str], Optional[str]]:
+        """Extract a single Bale attachment reference from a message."""
+        doc = message.get("document")
+        if isinstance(doc, dict) and doc.get("file_id"):
+            return str(doc.get("file_id")), doc.get("file_name"), doc.get("mime_type")
 
-        video = message.get('video')
-        if isinstance(video, dict) and video.get('file_id'):
-            return str(video.get('file_id')), 'video.mp4', video.get('mime_type') or 'video/mp4'
+        video = message.get("video")
+        if isinstance(video, dict) and video.get("file_id"):
+            return (
+                str(video.get("file_id")),
+                "video.mp4",
+                video.get("mime_type") or "video/mp4",
+            )
 
-        photo = message.get('photo')
+        photo = message.get("photo")
         if isinstance(photo, list) and photo:
             candidate = photo[-1]
-            if isinstance(candidate, dict) and candidate.get('file_id'):
-                return str(candidate.get('file_id')), 'photo.jpg', 'image/jpeg'
+            if isinstance(candidate, dict) and candidate.get("file_id"):
+                return str(candidate.get("file_id")), "photo.jpg", "image/jpeg"
 
-        voice = message.get('voice')
-        if isinstance(voice, dict) and voice.get('file_id'):
-            return str(voice.get('file_id')), 'voice.ogg', voice.get('mime_type') or 'audio/ogg'
+        audio = message.get("audio")
+        if isinstance(audio, dict) and audio.get("file_id"):
+            return (
+                str(audio.get("file_id")),
+                audio.get("file_name") or "audio.ogg",
+                audio.get("mime_type"),
+            )
 
-        audio = message.get('audio')
-        if isinstance(audio, dict) and audio.get('file_id'):
-            return str(audio.get('file_id')), audio.get('file_name') or 'audio.ogg', audio.get('mime_type')
+        voice = message.get("voice")
+        if isinstance(voice, dict) and voice.get("file_id"):
+            return (
+                str(voice.get("file_id")),
+                "voice.ogg",
+                voice.get("mime_type") or "audio/ogg",
+            )
 
-        sticker = message.get('sticker')
-        if isinstance(sticker, dict) and sticker.get('file_id'):
-            thumbnail = sticker.get('thumbnail')
-            thumb_id = thumbnail.get('file_id') if isinstance(thumbnail, dict) else None
-            return str(thumb_id or sticker.get('file_id')), 'sticker.webp', 'image/webp'
+        sticker = message.get("sticker")
+        if isinstance(sticker, dict) and sticker.get("file_id"):
+            thumbnail = sticker.get("thumbnail")
+            thumb_id = thumbnail.get("file_id") if isinstance(thumbnail, dict) else None
+            return str(thumb_id or sticker.get("file_id")), "sticker.webp", "image/webp"
 
         return None, None, None
 
@@ -867,57 +900,37 @@ class BalePollingService:
         }
 
     @staticmethod
-    def _resolve_attachment_content_type(
-        *,
-        content_type: Optional[str],
-        content_type_hint: Optional[str],
-        filename: str,
-        content: bytes,
+    def _normalize_content_type(
+        *, filename: str, content_type: Optional[str], content: bytes
     ) -> Optional[str]:
-        """Internal helper to resolve attachment content type."""
-        raw = str(content_type or '').strip().lower()
-        if raw and raw != 'application/octet-stream':
+        """Resolve a usable content type for an attachment."""
+        raw = str(content_type or "").strip().lower()
+        if raw and raw != "application/octet-stream":
             return raw
 
-        hinted = str(content_type_hint or '').strip().lower()
-        if hinted:
-            return hinted
+        guessed = mimetypes.guess_type(str(filename or "").strip())[0]
+        if guessed:
+            return guessed.lower()
 
-        guessed_from_name = mimetypes.guess_type(str(filename or '').strip())[0]
-        if guessed_from_name:
-            return guessed_from_name.lower()
-
-        return BalePollingService._guess_content_type_from_bytes(content)
-
-    @staticmethod
-    def _resolve_attachment_filename(*, filename: str, content_type: Optional[str]) -> str:
-        """Internal helper to resolve attachment filename."""
-        name = str(filename or '').strip() or 'file'
-        if '.' in name.rsplit('/', 1)[-1]:
-            return name
-
-        ctype = str(content_type or '').strip().lower()
-        if not ctype:
-            return name
-
-        ext = BalePollingService._preferred_extension_for_content_type(ctype) or (mimetypes.guess_extension(ctype) or '')
-        if ext:
-            return f'{name}{ext}'
-        return name
-
-    @staticmethod
-    def _preferred_extension_for_content_type(content_type: str) -> Optional[str]:
-        """Internal helper to preferred extension for content type."""
-        mapping = {
-            'audio/ogg': '.ogg',
-            'audio/mpeg': '.mp3',
-            'video/mp4': '.mp4',
-            'image/jpeg': '.jpg',
-            'image/png': '.png',
-            'image/webp': '.webp',
-            'image/gif': '.gif',
-        }
-        return mapping.get(str(content_type or '').strip().lower())
+        if content.startswith(b"%PDF"):
+            return "application/pdf"
+        if content.startswith(b"\x89PNG\r\n\x1a\n"):
+            return "image/png"
+        if content.startswith(b"\xff\xd8\xff"):
+            return "image/jpeg"
+        if content.startswith((b"GIF87a", b"GIF89a")):
+            return "image/gif"
+        if len(content) > 12 and content[:4] == b"RIFF" and content[8:12] == b"WEBP":
+            return "image/webp"
+        if content.startswith(b"OggS"):
+            return "audio/ogg"
+        if len(content) > 12 and content[:4] == b"RIFF" and content[8:12] == b"WAVE":
+            return "audio/wav"
+        if content.startswith(b"ID3") or (len(content) > 1 and content[0] == 0xFF and (content[1] & 0xE0) == 0xE0):
+            return "audio/mpeg"
+        if len(content) > 8 and content[4:8] == b"ftyp":
+            return "video/mp4"
+        return None
 
     @staticmethod
     def _guess_content_type_from_bytes(content: bytes) -> Optional[str]:

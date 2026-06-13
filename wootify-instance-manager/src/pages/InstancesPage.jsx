@@ -10,6 +10,8 @@ export default function InstancesPage({
   onToggleEnabled,
   onCreateInbox,
   onCreateEnterpriseInbox,
+  onBalePvSyncContacts,
+  onBalePvSyncDialogs,
   onDelete,
   PLATFORM_TELEGRAM,
   PLATFORM_BALE_ENTERPRISE,
@@ -174,6 +176,30 @@ export default function InstancesPage({
                       {isBalePv ? 'Link Inbox' : 'Create Inbox'}
                     </button>
                   )}
+                  {isBalePv && onBalePvSyncContacts ? (
+                    <button
+                      className="btn"
+                      disabled={busy}
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        onBalePvSyncContacts(item.instance_key);
+                      }}
+                    >
+                      Sync Contacts
+                    </button>
+                  ) : null}
+                  {isBalePv && onBalePvSyncDialogs ? (
+                    <button
+                      className="btn"
+                      disabled={busy}
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        onBalePvSyncDialogs(item.instance_key);
+                      }}
+                    >
+                      Sync Dialogs
+                    </button>
+                  ) : null}
                   <button
                     className="btn danger"
                     disabled={busy}

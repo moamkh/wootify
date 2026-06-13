@@ -91,6 +91,43 @@ class Peer:
         return msg.serialize()
 
 
+class ExPeer:
+    """Extended peer identifier for file operations."""
+
+    def __init__(self, peer_id: int, peer_type: int = Peer.PEER_TYPE_USER, access_hash: int = 0):
+        self.peer_id = peer_id
+        self.peer_type = peer_type
+        self.access_hash = access_hash
+
+    def serialize(self) -> bytes:
+        msg = ProtobufMessage()
+        msg.add_int32(1, self.peer_type)
+        msg.add_int64(2, self.peer_id)
+        msg.add_int64(3, self.access_hash)
+        return msg.serialize()
+
+
+class SendTypeValue:
+    """Send type wrapper for file upload."""
+
+    SEND_TYPE_UNKNOWN = 0
+    SEND_TYPE_PHOTO = 1
+    SEND_TYPE_VIDEO = 2
+    SEND_TYPE_VOICE = 3
+    SEND_TYPE_GIF = 4
+    SEND_TYPE_AUDIO = 5
+    SEND_TYPE_DOCUMENT = 6
+    SEND_TYPE_STICKER = 7
+
+    def __init__(self, send_type: int):
+        self.send_type = send_type
+
+    def serialize(self) -> bytes:
+        msg = ProtobufMessage()
+        msg.add_int32(1, self.send_type)
+        return msg.serialize()
+
+
 class TextMessage:
     """Text message content."""
 
@@ -109,13 +146,58 @@ class TextMessage:
 class MessageContent:
     """Message content wrapper (selects content type via field number)."""
 
-    def __init__(self, text: Optional[str] = None):
+    def __init__(self, text: Optional[str] = None, document: Optional[bytes] = None):
         self.text = text
+        self.document = document
 
     def serialize(self) -> bytes:
         msg = ProtobufMessage()
         if self.text is not None:
             msg.add_message(15, TextMessage(self.text))
+        if self.document is not None:
+            msg.add_bytes(4, self.document)
+        return msg.serialize()
+
+
+class DocumentMessage:
+    """Document message for media attachments.
+
+    Fields:
+      1: fileId (int64)
+      2: accessHash (int64)
+      3: fileSize (int32)
+      4: name (string)
+      5: mimeType (string)
+      6: thumb (FastThumb)
+      7: ext (DocumentEx)
+      8: caption (TextMessage)
+    """
+
+    def __init__(
+        self,
+        file_id: int,
+        access_hash: int,
+        file_size: int,
+        name: str,
+        mime_type: str,
+        caption: Optional[str] = None,
+    ):
+        self.file_id = file_id
+        self.access_hash = access_hash
+        self.file_size = file_size
+        self.name = name
+        self.mime_type = mime_type
+        self.caption = caption
+
+    def serialize(self) -> bytes:
+        msg = ProtobufMessage()
+        msg.add_int64(1, self.file_id)
+        msg.add_int64(2, self.access_hash)
+        msg.add_int32(3, self.file_size)
+        msg.add_string(4, self.name)
+        msg.add_string(5, self.mime_type)
+        if self.caption is not None:
+            msg.add_message(8, TextMessage(self.caption))
         return msg.serialize()
 
 
@@ -194,12 +276,14 @@ class SendMessageRequest:
     def __init__(
         self,
         peer_id: int,
-        text: str,
+        text: Optional[str] = None,
+        document: Optional[bytes] = None,
         random_id: Optional[int] = None,
         reply_to_message_id: Optional[int] = None,
     ):
         self.peer_id = peer_id
         self.text = text
+        self.document = document
         # Use a large random int64 if not provided
         self.random_id = random_id or random.randint(1, 2**63 - 1)
         self.reply_to_message_id = reply_to_message_id
@@ -209,7 +293,7 @@ class SendMessageRequest:
         msg = ProtobufMessage()
         msg.add_message(1, peer)
         msg.add_int64(2, self.random_id)
-        msg.add_message(3, MessageContent(text=self.text))
+        msg.add_message(3, MessageContent(text=self.text, document=self.document))
         if self.reply_to_message_id is not None:
             # Field 4: replyTo peer (same type, different message_id as id)
             msg.add_message(4, Peer(self.reply_to_message_id))
@@ -235,9 +319,30 @@ class UpdateMessageRequest:
         peer = Peer(self.peer_id)
         msg = ProtobufMessage()
         msg.add_message(1, peer)
-        # message_id is typically the message to edit
+        # message_id is typically the message to edit (rid field)
         msg.add_int64(2, self.message_id)
         msg.add_message(3, MessageContent(text=self.text))
+        msg.add_message(6, peer)
+        return msg.serialize()
+
+
+class DeleteMessageRequest:
+    """Request payload for bale.messaging.v2.Messaging/DeleteMessage."""
+
+    def __init__(
+        self,
+        peer_id: int,
+        message_ids: List[int],
+    ):
+        self.peer_id = peer_id
+        self.message_ids = message_ids
+
+    def serialize(self) -> bytes:
+        peer = Peer(self.peer_id)
+        msg = ProtobufMessage()
+        msg.add_message(1, peer)
+        # rids field is packed repeated int64
+        msg.add_packed_int64(2, self.message_ids)
         msg.add_message(6, peer)
         return msg.serialize()
 
@@ -352,6 +457,56 @@ class StringValueWrapper:
         return msg.serialize()
 
 
+class GetNasimFileUploadUrlRequest:
+    """Request for ai.bale.server.Files/GetNasimFileUploadUrl.
+
+    Fields:
+      1: expectedSize (int32)
+      2: crc (int64)
+      3: uid (int64)
+      4: name (string)
+      5: mimeType (string)
+      6: exPeer (ExPeer)
+      7: sendType (SendTypeValue)
+      8: chunkSize (int64)
+    """
+
+    def __init__(
+        self,
+        expected_size: int,
+        name: str,
+        mime_type: str,
+        uid: int,
+        send_type: int,
+        peer_type: int = Peer.PEER_TYPE_USER,
+        access_hash: int = 0,
+        crc: int = 0,
+        chunk_size: int = 0,
+    ):
+        self.expected_size = expected_size
+        self.crc = crc
+        self.uid = uid
+        self.name = name
+        self.mime_type = mime_type
+        self.peer_type = peer_type
+        self.access_hash = access_hash
+        self.send_type = send_type
+        self.chunk_size = chunk_size
+
+    def serialize(self) -> bytes:
+        msg = ProtobufMessage()
+        msg.add_int32(1, self.expected_size)
+        msg.add_int64(2, self.crc)
+        msg.add_int64(3, self.uid)
+        msg.add_string(4, self.name)
+        msg.add_string(5, self.mime_type)
+        msg.add_message(6, ExPeer(self.uid, self.peer_type, self.access_hash))
+        msg.add_message(7, SendTypeValue(self.send_type))
+        if self.chunk_size:
+            msg.add_int64(8, self.chunk_size)
+        return msg.serialize()
+
+
 def build_ws_frame(
     service: str,
     method: str,
@@ -366,3 +521,108 @@ def build_ws_frame(
         metadata=metadata,
     )
     return WsClientPack(inner).serialize()
+
+
+# ------------------------------------------------------------------
+# Dialog / History / User loaders
+# ------------------------------------------------------------------
+
+class UserOutPeer:
+    """UserOutPeer { uid(1), accessHash(2) } for LoadUsers."""
+
+    def __init__(self, uid: int, access_hash: int = 0):
+        self.uid = uid
+        self.access_hash = access_hash
+
+    def serialize(self) -> bytes:
+        msg = ProtobufMessage()
+        msg.add_int32(1, self.uid)
+        msg.add_int64(2, self.access_hash)
+        return msg.serialize()
+
+
+class LoadDialogsRequest:
+    """Request for bale.messaging.v2.Messaging/LoadDialogs.
+
+    Fields:
+      1: minDate (int64)
+      2: limit (int32)
+      3: optimizations (repeated int32)
+      4: dialogType (int32)
+      5: excludePinnedDialogs (bool)
+      6: archiveFilter (int32)
+    """
+
+    def __init__(
+        self,
+        limit: int = 100,
+        min_date: int = 0,
+        dialog_type: int = 0,
+        exclude_pinned: bool = False,
+        archive_filter: int = 0,
+    ):
+        self.limit = limit
+        self.min_date = min_date
+        self.dialog_type = dialog_type
+        self.exclude_pinned = exclude_pinned
+        self.archive_filter = archive_filter
+
+    def serialize(self) -> bytes:
+        msg = ProtobufMessage()
+        msg.add_int64(1, self.min_date)
+        msg.add_int32(2, self.limit)
+        msg.add_int32(4, self.dialog_type)
+        msg.add_bool(5, self.exclude_pinned)
+        msg.add_int32(6, self.archive_filter)
+        return msg.serialize()
+
+
+class LoadHistoryRequest:
+    """Request for bale.messaging.v2.Messaging/LoadHistory.
+
+    Fields:
+      1: peer (Peer)
+      2: date (int64)
+      4: loadMode (int32)
+      5: limit (int32)
+      6: optimizations (repeated int32)
+    """
+
+    def __init__(
+        self,
+        peer_id: int,
+        peer_type: int = Peer.PEER_TYPE_USER,
+        date: int = 0,
+        limit: int = 50,
+        load_mode: int = 2,
+    ):
+        self.peer_id = peer_id
+        self.peer_type = peer_type
+        self.date = date
+        self.limit = limit
+        self.load_mode = load_mode
+
+    def serialize(self) -> bytes:
+        msg = ProtobufMessage()
+        msg.add_message(1, Peer(self.peer_id, self.peer_type))
+        msg.add_int64(2, self.date)
+        msg.add_int32(4, self.load_mode)
+        msg.add_int32(5, self.limit)
+        return msg.serialize()
+
+
+class LoadUsersRequest:
+    """Request for bale.messaging.v2.Messaging/LoadUsers.
+
+    Fields:
+      1: userPeers (repeated UserOutPeer)
+    """
+
+    def __init__(self, user_peers: List[Dict[str, int]]):
+        self.user_peers = user_peers
+
+    def serialize(self) -> bytes:
+        msg = ProtobufMessage()
+        for up in self.user_peers:
+            msg.add_message(1, UserOutPeer(up["uid"], up.get("access_hash", 0)))
+        return msg.serialize()

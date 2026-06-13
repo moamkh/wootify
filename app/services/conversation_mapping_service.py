@@ -10,12 +10,21 @@ import datetime as dt
 import logging
 from typing import Optional
 
+from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import Session
+from tenacity import retry, retry_if_exception_type, stop_after_attempt, wait_exponential
 
 from app.models import Conversation
 from app.repositories.conversation_repository import ConversationRepository
 
 logger = logging.getLogger('app.services.conversation_mapping')
+
+_DB_RETRY = retry(
+    retry=retry_if_exception_type(OperationalError),
+    stop=stop_after_attempt(5),
+    wait=wait_exponential(multiplier=0.5, min=0.5, max=10),
+    reraise=True,
+)
 
 
 class ConversationMappingService:
@@ -90,6 +99,7 @@ class ConversationMappingService:
             )
             raise
 
+    @_DB_RETRY
     def upsert(
         self,
         db: Session,

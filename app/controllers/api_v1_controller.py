@@ -12,6 +12,7 @@ import logging
 from pathlib import Path
 from typing import Any, Optional
 
+import httpx
 from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile, status
 from sqlalchemy.orm import Session
 
@@ -20,6 +21,8 @@ from app.schemas.api_v1 import (
     AutoCreateInboxResponse,
     BalePvContactsResponse,
     BalePvDialogsResponse,
+    BalePvSyncContactsResponse,
+    BalePvSyncDialogsResponse,
     ConversationListResponse,
     ConversationResponse,
     CreateInboxResponse,
@@ -479,6 +482,25 @@ async def create_chatwoot_inbox(instance_key: str, db: Session = Depends(get_db)
             exc=exc,
             instance_key=instance_key,
         )
+    except httpx.HTTPStatusError as exc:
+        url = str(exc.request.url) if exc.request else 'unknown'
+        status_code = exc.response.status_code if exc.response else 'unknown'
+        _raise_http_error(
+            status_code=502,
+            detail=f'Chatwoot API returned {status_code} for {url}',
+            endpoint='create_chatwoot_inbox',
+            exc=exc,
+            instance_key=instance_key,
+        )
+    except httpx.RequestError as exc:
+        url = str(exc.request.url) if exc.request else 'unknown'
+        _raise_http_error(
+            status_code=502,
+            detail=f'Could not reach Chatwoot at {url}: {type(exc).__name__}',
+            endpoint='create_chatwoot_inbox',
+            exc=exc,
+            instance_key=instance_key,
+        )
     except Exception as exc:
         _raise_http_error(
             status_code=500,
@@ -675,6 +697,99 @@ async def bale_pv_contacts(instance_key: str, db: Session = Depends(get_db)):
         )
 
 
+@router.post('/instances/{instance_key}/bale-pv/sync-contacts', response_model=BalePvSyncContactsResponse)
+async def bale_pv_sync_contacts(instance_key: str, db: Session = Depends(get_db)):
+    """Sync Bale PV contacts to Chatwoot."""
+    try:
+        runtime = _require_instance_runtime(db, instance_key)
+        if runtime.platform_type.key != 'bale_pv_enterprise':
+            _raise_http_error(
+                status_code=400,
+                detail='not a bale_pv_enterprise instance',
+                endpoint='bale_pv_sync_contacts',
+                instance_key=instance_key,
+            )
+        bridge = BridgeService()
+        result = await bridge.sync_bale_pv_contacts(db, instance_key, runtime)
+        if not result.get('ok'):
+            _raise_http_error(
+                status_code=400,
+                detail=result.get('detail', 'sync_failed'),
+                endpoint='bale_pv_sync_contacts',
+                instance_key=instance_key,
+            )
+        return BalePvSyncContactsResponse(
+            message='contacts_synced',
+            detail=f"total={result.get('total', 0)}",
+            created=result.get('created', 0),
+            updated=result.get('updated', 0),
+            failed=result.get('failed', 0),
+        )
+    except HTTPException:
+        raise
+    except Exception as exc:
+        _raise_http_error(
+            status_code=500,
+            detail='internal server error',
+            endpoint='bale_pv_sync_contacts',
+            exc=exc,
+            instance_key=instance_key,
+        )
+
+
+@router.post('/instances/{instance_key}/bale-pv/sync-dialogs', response_model=BalePvSyncDialogsResponse)
+async def bale_pv_sync_dialogs(
+    instance_key: str,
+    load_history: bool = True,
+    history_limit: int = 50,
+    db: Session = Depends(get_db),
+):
+    """Sync Bale PV dialogs (with optional history) to Chatwoot."""
+    try:
+        runtime = _require_instance_runtime(db, instance_key)
+        if runtime.platform_type.key != 'bale_pv_enterprise':
+            _raise_http_error(
+                status_code=400,
+                detail='not a bale_pv_enterprise instance',
+                endpoint='bale_pv_sync_dialogs',
+                instance_key=instance_key,
+            )
+        bridge = BridgeService()
+        result = await bridge.sync_bale_dialogs_to_chatwoot(
+            db,
+            instance_key,
+            runtime,
+            load_history=load_history,
+            history_limit=history_limit,
+        )
+        if not result.get('ok'):
+            _raise_http_error(
+                status_code=400,
+                detail=result.get('detail', 'sync_failed'),
+                endpoint='bale_pv_sync_dialogs',
+                instance_key=instance_key,
+            )
+        return BalePvSyncDialogsResponse(
+            message='dialogs_synced',
+            detail=f"dialogs={result.get('dialogs', 0)}",
+            created=result.get('created', 0),
+            updated=result.get('updated', 0),
+            failed=result.get('failed', 0),
+            dialogs=result.get('dialogs', 0),
+            messages_imported=result.get('messages_imported', 0),
+        )
+    except HTTPException:
+        raise
+    except Exception as exc:
+        _raise_http_error(
+            status_code=500,
+            detail='internal server error',
+            endpoint='bale_pv_sync_dialogs',
+            exc=exc,
+            instance_key=instance_key,
+        )
+
+
 @router.get('/instances/{instance_key}/bale-pv/dialogs', response_model=BalePvDialogsResponse)
 async def bale_pv_dialogs(instance_key: str, db: Session = Depends(get_db)):
     """Fetch dialogs for a Bale PV instance."""
@@ -746,9 +861,16 @@ async def _handle_chatwoot_webhook(
     except HTTPException:
         raise
     except ValueError as exc:
+        detail = str(exc)
+        # Only return 404 for genuine "instance not found" errors;
+        # everything else is a validation / configuration problem → 400
+        if 'instance not found' in detail.lower():
+            status_code = 404
+        else:
+            status_code = 400
         _raise_http_error(
-            status_code=404,
-            detail=str(exc),
+            status_code=status_code,
+            detail=detail,
             endpoint='webhook_chatwoot',
             exc=exc,
             instance_key=instance_key,

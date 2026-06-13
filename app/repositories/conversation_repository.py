@@ -8,9 +8,18 @@ from __future__ import annotations
 
 from typing import Optional
 
+from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import Session, selectinload
+from tenacity import retry, retry_if_exception_type, stop_after_attempt, wait_exponential
 
 from app.models import Conversation
+
+_DB_RETRY = retry(
+    retry=retry_if_exception_type(OperationalError),
+    stop=stop_after_attempt(5),
+    wait=wait_exponential(multiplier=0.5, min=0.5, max=10),
+    reraise=True,
+)
 
 
 class ConversationRepository:
@@ -75,6 +84,7 @@ class ConversationRepository:
             query = query.filter(Conversation.chatwoot_inbox_id == str(chatwoot_inbox_id))
         return query.order_by(Conversation.is_active.desc(), Conversation.updated_at.desc()).all()
 
+    @_DB_RETRY
     def deactivate_platform_mappings(
         self,
         instance_id: str,
@@ -92,6 +102,7 @@ class ConversationRepository:
             query = query.filter(Conversation.id != str(exclude_conversation_id))
         query.update({Conversation.is_active: False}, synchronize_session=False)
 
+    @_DB_RETRY
     def save(self, row: Conversation) -> Conversation:
         """Save."""
         self.db.add(row)

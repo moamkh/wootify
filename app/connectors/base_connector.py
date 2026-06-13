@@ -41,6 +41,23 @@ class PlatformConnector(Protocol):
     ) -> dict[str, Any]:
         """Send media content to the target platform chat."""
 
+    async def update_message(
+        self,
+        instance: str,
+        chat_id: str,
+        message_id: str,
+        text: str,
+    ) -> dict[str, Any]:
+        """Edit an existing message on the target platform."""
+
+    async def delete_message(
+        self,
+        instance: str,
+        chat_id: str,
+        message_id: str,
+    ) -> dict[str, Any]:
+        """Delete a message on the target platform."""
+
     async def get_updates(
         self,
         instance: str,

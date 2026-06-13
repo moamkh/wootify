@@ -47,6 +47,25 @@ class BaleConnector:
         """Send media."""
         raise NotImplementedError
 
+    async def update_message(
+        self,
+        instance: str,
+        chat_id: str,
+        message_id: str,
+        text: str,
+    ) -> Dict[str, Any]:
+        """Edit an existing message."""
+        raise NotImplementedError
+
+    async def delete_message(
+        self,
+        instance: str,
+        chat_id: str,
+        message_id: str,
+    ) -> Dict[str, Any]:
+        """Delete a message."""
+        raise NotImplementedError
+
     async def connect(
         self,
         instance: str,

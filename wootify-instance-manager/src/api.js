@@ -258,3 +258,19 @@ export function balePvValidateCode(instanceKey, code) {
 export function balePvAuthStatus(instanceKey) {
   return fetchJSON(`/api/v1/instances/${encodeURIComponent(instanceKey)}/bale-pv/auth/status`);
 }
+
+export function balePvSyncContacts(instanceKey) {
+  return fetchJSON(`/api/v1/instances/${encodeURIComponent(instanceKey)}/bale-pv/sync-contacts`, {
+    method: 'POST',
+  });
+}
+
+
+export function balePvSyncDialogs(instanceKey, loadHistory = true, historyLimit = 50) {
+  const params = new URLSearchParams();
+  params.set('load_history', loadHistory ? 'true' : 'false');
+  params.set('history_limit', String(historyLimit));
+  return fetchJSON(`/api/v1/instances/${encodeURIComponent(instanceKey)}/bale-pv/sync-dialogs?${params.toString()}`, {
+    method: 'POST',
+  });
+}

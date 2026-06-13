@@ -115,7 +115,9 @@ class ChatwootClient:
         files: Any = None,
         log_http_error: bool = True,
     ) -> Any:
-        """Internal helper to request."""
+        """Internal helper to request with retry on transient errors."""
+        import asyncio
+
         url = f"{self.base_url}{path}"
         target = self._safe_target(path)
 
@@ -135,91 +137,120 @@ class ChatwootClient:
         )
 
         start = time.monotonic()
+        last_exc: Optional[Exception] = None
 
-        try:
-            resp = await self._client.request(
-                method,
-                url,
-                headers=self._headers(),
-                json=json_data,
-                data=data,
-                files=files,
-            )
-
-            elapsed = round(time.monotonic() - start, 3)
-
-            logger.info(
-                "chatwoot.request response method=%s status=%s elapsed=%ss",
-                method.upper(),
-                resp.status_code,
-                elapsed,
-            )
-
-            resp.raise_for_status()
-            if resp.status_code == 204 or not resp.content:
-                return {"ok": True}
-
+        for attempt in range(3):
             try:
-                payload = resp.json()
-            except Exception:
-                payload = {
-                    "ok": False,
-                    "error_code": resp.status_code,
-                    "description": truncate_text(resp.text, 500),
-                }
-
-            # Chatwoot sometimes returns errors inside 200 responses
-            if isinstance(payload, dict) and payload.get("error"):
-                logger.error(
-                    "chatwoot.api_error target=%s response=%s",
-                    target,
-                    payload,
+                resp = await self._client.request(
+                    method,
+                    url,
+                    headers=self._headers(),
+                    json=json_data,
+                    data=data,
+                    files=files,
                 )
 
-            return payload
+                elapsed = round(time.monotonic() - start, 3)
 
-        except httpx.ReadTimeout:
-            logger.error(
-                "chatwoot.request READ TIMEOUT target=%s elapsed=%ss",
-                target,
-                round(time.monotonic() - start, 3),
-            )
-            raise
+                logger.info(
+                    "chatwoot.request response method=%s status=%s elapsed=%ss",
+                    method.upper(),
+                    resp.status_code,
+                    elapsed,
+                )
 
-        except httpx.ReadError:
-            logger.error(
-                "chatwoot.request READ ERROR target=%s elapsed=%ss",
-                target,
-                round(time.monotonic() - start, 3),
-            )
-            raise
+                # Retry on transient status codes before raising
+                if resp.status_code in (429, 502, 503, 504) and attempt < 2:
+                    wait = 2 ** attempt
+                    logger.warning(
+                        "chatwoot.request retry status=%s attempt=%s wait=%ss",
+                        resp.status_code,
+                        attempt + 1,
+                        wait,
+                    )
+                    await asyncio.sleep(wait)
+                    continue
 
-        except httpx.HTTPStatusError as e:
-            response = e.response
-            body = ""
-            try:
-                body = truncate_text(response.text or "", 1000) if response is not None else ""
-            except Exception:
+                resp.raise_for_status()
+                if resp.status_code == 204 or not resp.content:
+                    return {"ok": True}
+
+                try:
+                    payload = resp.json()
+                except Exception:
+                    payload = {
+                        "ok": False,
+                        "error_code": resp.status_code,
+                        "description": truncate_text(resp.text, 500),
+                    }
+
+                # Chatwoot sometimes returns errors inside 200 responses
+                if isinstance(payload, dict) and payload.get("error"):
+                    logger.error(
+                        "chatwoot.api_error target=%s response=%s",
+                        target,
+                        payload,
+                    )
+
+                return payload
+
+            except httpx.ReadTimeout:
+                if attempt < 2:
+                    wait = 2 ** attempt
+                    logger.warning(
+                        "chatwoot.request retry timeout attempt=%s wait=%ss",
+                        attempt + 1,
+                        wait,
+                    )
+                    await asyncio.sleep(wait)
+                    continue
+                logger.error(
+                    "chatwoot.request READ TIMEOUT target=%s elapsed=%ss",
+                    target,
+                    round(time.monotonic() - start, 3),
+                )
+                raise
+
+            except httpx.ReadError:
+                if attempt < 2:
+                    wait = 2 ** attempt
+                    logger.warning(
+                        "chatwoot.request retry read_error attempt=%s wait=%ss",
+                        attempt + 1,
+                        wait,
+                    )
+                    await asyncio.sleep(wait)
+                    continue
+                logger.error(
+                    "chatwoot.request READ ERROR target=%s elapsed=%ss",
+                    target,
+                    round(time.monotonic() - start, 3),
+                )
+                raise
+
+            except httpx.HTTPStatusError as e:
+                last_exc = e
+                response = e.response
                 body = ""
-            if log_http_error:
-                logger.error(
-                    "chatwoot.request HTTP ERROR target=%s status=%s body=%s error=%s",
-                    target,
-                    response.status_code if response is not None else "unknown",
-                    body,
-                    str(e),
-                    exc_info=True,
-                )
-            raise
+                try:
+                    body = truncate_text(response.text or "", 1000) if response is not None else ""
+                except Exception:
+                    body = ""
+                if log_http_error:
+                    logger.error(
+                        "chatwoot.request HTTP ERROR target=%s status=%s body=%s error=%s",
+                        target,
+                        response.status_code if response is not None else "unknown",
+                        body,
+                        str(e),
+                        exc_info=True,
+                    )
+                raise
 
-        except Exception as e:
-            logger.error(
-                "chatwoot.request FAILED target=%s error=%s",
-                target,
-                str(e),
-                exc_info=True,
-            )
-            raise
+        # Should never reach here, but satisfy type checker
+        if last_exc:
+            raise last_exc
+        raise RuntimeError("unexpected end of retry loop")
 
     # -------------------------
     # public api
@@ -427,6 +458,18 @@ class ChatwootClient:
                     json_data=data,
                 )
             raise
+
+    async def delete_message(
+        self,
+        account_id: int,
+        conversation_id: int,
+        message_id: int,
+    ) -> Any:
+        """Delete a message from a conversation."""
+        return await self._request(
+            "DELETE",
+            f"/api/v1/accounts/{account_id}/conversations/{conversation_id}/messages/{message_id}",
+        )
 
     async def close(self) -> None:
         """Close."""

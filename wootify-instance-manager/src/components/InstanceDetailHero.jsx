@@ -19,6 +19,8 @@ export default function InstanceDetailHero({
   onToggleEnabled,
   onCreateInbox,
   onCreateEnterpriseInbox,
+  onBalePvSyncContacts,
+  onBalePvSyncDialogs,
   onDelete,
 }) {
   return (
@@ -144,6 +146,16 @@ export default function InstanceDetailHero({
               {isBalePvPlatform ? 'Link Inbox' : 'Create Inbox'}
             </button>
           )}
+          {isBalePvPlatform && onBalePvSyncContacts ? (
+            <button className="btn" disabled={busy} onClick={() => onBalePvSyncContacts(selectedInstance.instance_key)}>
+              Sync Contacts
+            </button>
+          ) : null}
+          {isBalePvPlatform && onBalePvSyncDialogs ? (
+            <button className="btn" disabled={busy} onClick={() => onBalePvSyncDialogs(selectedInstance.instance_key)}>
+              Sync Dialogs
+            </button>
+          ) : null}
           <button className="btn danger" disabled={busy} onClick={() => onDelete(selectedInstance.instance_key)}>
             Delete
           </button>

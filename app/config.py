@@ -29,7 +29,7 @@ class Settings(BaseSettings):
     DATABASE_AUTO_CREATE: bool = True
     POSTGRES_ADMIN_DATABASE: str = 'postgres'
     SQLITE_MIGRATION_SOURCE_URL: str = default_sqlite_database_url
-    SQLITE_BUSY_TIMEOUT_MS: int = 30000
+    SQLITE_BUSY_TIMEOUT_MS: int = 60000
     SQLITE_JOURNAL_MODE: str = 'WAL'
 
     CHATWOOT_BASE_URL: str = 'http://localhost:3000'
