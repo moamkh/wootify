@@ -21,6 +21,7 @@ from app.schemas.api_v1 import (
     AutoCreateInboxResponse,
     BalePvContactsResponse,
     BalePvDialogsResponse,
+    BalePvRemoveChatwootContactsResponse,
     BalePvSyncContactsResponse,
     BalePvSyncDialogsResponse,
     ConversationListResponse,
@@ -56,6 +57,8 @@ from app.schemas.api_v1 import (
     SimulatePlatformEventRequest,
 )
 from app.services.bridge_service import BridgeService
+from app import runtime_registry
+from app.services.chatwoot_bridge_service import chatwoot_bridge
 from app.services.conversation_mapping_service import ConversationMappingService
 from app.services.enterprise_bale_service import EnterpriseBaleService
 from app.services.enterprise_telegram_service import EnterpriseTelegramService
@@ -597,6 +600,16 @@ async def bale_pv_validate_code(instance_key: str, payload: dict[str, Any], db: 
                 endpoint='bale_pv_validate_code',
                 instance_key=instance_key,
             )
+        # Register the adapter runtime so inbound polling and outbound webhooks
+        # can use it immediately.
+        try:
+            await runtime_registry.connect_instance(
+                instance_key,
+                'bale_pv_enterprise',
+                runtime.platform_metadata,
+            )
+        except Exception:
+            pass
         return GenericMessageResponse(
             message='authenticated',
             detail=f"jwt_saved={result.get('jwt_saved')}",
@@ -790,6 +803,227 @@ async def bale_pv_sync_dialogs(
         )
 
 
+@router.post(
+    '/instances/{instance_key}/bale-pv/remove-chatwoot-contacts',
+    response_model=BalePvRemoveChatwootContactsResponse,
+)
+async def bale_pv_remove_chatwoot_contacts(
+    instance_key: str,
+    dry_run: bool = False,
+    db: Session = Depends(get_db),
+):
+    """Remove Chatwoot contacts that still exist in the Bale PV contact list.
+
+    This is useful for cleaning up contacts that were synced from Bale PV to
+    Chatwoot but are no longer desired. Set ``dry_run=true`` to preview deletions.
+    """
+    try:
+        runtime = _require_instance_runtime(db, instance_key)
+        if runtime.platform_type.key != 'bale_pv_enterprise':
+            _raise_http_error(
+                status_code=400,
+                detail='not a bale_pv_enterprise instance',
+                endpoint='bale_pv_remove_chatwoot_contacts',
+                instance_key=instance_key,
+            )
+        bridge = BridgeService()
+        result = await bridge.remove_bale_pv_contacts_from_chatwoot(
+            db,
+            instance_key,
+            runtime,
+            dry_run=dry_run,
+        )
+        if not result.get('ok'):
+            _raise_http_error(
+                status_code=400,
+                detail=result.get('detail', 'remove_failed'),
+                endpoint='bale_pv_remove_chatwoot_contacts',
+                instance_key=instance_key,
+            )
+        return BalePvRemoveChatwootContactsResponse(
+            message='contacts_removed' if not dry_run else 'dry_run',
+            detail=f"deleted={result.get('deleted', 0)}",
+            deleted=result.get('deleted', 0),
+            failed=result.get('failed', 0),
+            skipped=result.get('skipped', 0),
+            total_bale=result.get('total_bale', 0),
+            total_chatwoot=result.get('total_chatwoot', 0),
+            dry_run=dry_run,
+        )
+    except HTTPException:
+        raise
+    except Exception as exc:
+        _raise_http_error(
+            status_code=500,
+            detail='internal server error',
+            endpoint='bale_pv_remove_chatwoot_contacts',
+            exc=exc,
+            instance_key=instance_key,
+        )
+
+
+@router.post('/instances/{instance_key}/bale-pv/resolve-phone')
+async def bale_pv_resolve_phone(
+    instance_key: str,
+    payload: dict[str, Any],
+    db: Session = Depends(get_db),
+):
+    """Resolve a raw phone number to a Bale user_id + access_hash.
+
+    The result is persisted in ``bale_pv_phone_resolved_users`` so subsequent
+    outbound messages do not need to re-import the contact.
+    """
+    try:
+        runtime = _require_instance_runtime(db, instance_key)
+        if runtime.platform_type.key != 'bale_pv_enterprise':
+            _raise_http_error(
+                status_code=400,
+                detail='not a bale_pv_enterprise instance',
+                endpoint='bale_pv_resolve_phone',
+                instance_key=instance_key,
+            )
+        phone_number = str(payload.get('phone_number') or '').strip()
+        if not phone_number:
+            _raise_http_error(
+                status_code=400,
+                detail='phone_number is required',
+                endpoint='bale_pv_resolve_phone',
+                instance_key=instance_key,
+            )
+        await bale_pv.connect(instance_key, runtime.platform_metadata)
+        user = await bale_pv.resolve_phone_to_user(instance_key, phone_number)
+        return {
+            'bale_user_id': user.get('id'),
+            'access_hash': user.get('access_hash'),
+            'name': user.get('name'),
+            'local_name': user.get('local_name'),
+            'nick': user.get('nick'),
+        }
+    except HTTPException:
+        raise
+    except RuntimeError as exc:
+        _raise_http_error(
+            status_code=404,
+            detail=str(exc),
+            endpoint='bale_pv_resolve_phone',
+            instance_key=instance_key,
+        )
+    except Exception as exc:
+        _raise_http_error(
+            status_code=500,
+            detail='internal server error',
+            endpoint='bale_pv_resolve_phone',
+            exc=exc,
+            instance_key=instance_key,
+        )
+
+
+@router.post('/instances/{instance_key}/bale-pv/send-by-phone', response_model=GenericMessageResponse)
+async def bale_pv_send_by_phone(
+    instance_key: str,
+    payload: dict[str, Any],
+    db: Session = Depends(get_db),
+):
+    """Send a text message to a raw phone number via Bale PV.
+
+    The phone is resolved to a Bale user (if not already cached), the Chatwoot
+    contact is updated with the resolved identifier/name, and the message is sent.
+    """
+    try:
+        runtime = _require_instance_runtime(db, instance_key)
+        if runtime.platform_type.key != 'bale_pv_enterprise':
+            _raise_http_error(
+                status_code=400,
+                detail='not a bale_pv_enterprise instance',
+                endpoint='bale_pv_send_by_phone',
+                instance_key=instance_key,
+            )
+        phone_number = str(payload.get('phone_number') or '').strip()
+        text = str(payload.get('text') or '').strip()
+        if not phone_number or not text:
+            _raise_http_error(
+                status_code=400,
+                detail='phone_number and text are required',
+                endpoint='bale_pv_send_by_phone',
+                instance_key=instance_key,
+            )
+        await bale_pv.connect(instance_key, runtime.platform_metadata)
+        result = await bale_pv.send_text_by_phone(
+            instance_key,
+            phone_number=phone_number,
+            text=text,
+        )
+        return GenericMessageResponse(
+            message='sent',
+            detail=str(result.get('result')),
+            status='ok',
+        )
+    except HTTPException:
+        raise
+    except RuntimeError as exc:
+        _raise_http_error(
+            status_code=400,
+            detail=str(exc),
+            endpoint='bale_pv_send_by_phone',
+            instance_key=instance_key,
+        )
+    except Exception as exc:
+        _raise_http_error(
+            status_code=500,
+            detail='internal server error',
+            endpoint='bale_pv_send_by_phone',
+            exc=exc,
+            instance_key=instance_key,
+        )
+
+
+@router.post('/instances/{instance_key}/bale-pv/debug-load-users')
+async def bale_pv_debug_load_users(
+    instance_key: str,
+    payload: dict[str, Any],
+    db: Session = Depends(get_db),
+):
+    """Debug endpoint: load user details for a list of Bale UIDs."""
+    try:
+        runtime = _require_instance_runtime(db, instance_key)
+        if runtime.platform_type.key != 'bale_pv_enterprise':
+            _raise_http_error(
+                status_code=400,
+                detail='not a bale_pv_enterprise instance',
+                endpoint='bale_pv_debug_load_users',
+                instance_key=instance_key,
+            )
+        uids = payload.get('uids') or []
+        if not uids:
+            _raise_http_error(
+                status_code=400,
+                detail='uids is required',
+                endpoint='bale_pv_debug_load_users',
+                instance_key=instance_key,
+            )
+        await bale_pv.connect(instance_key, runtime.platform_metadata)
+        rt = bale_pv._get_runtime(instance_key)
+        from bale_grpc_client.dialog_parser import parse_load_users_response
+        user_peers = [{"uid": int(uid), "access_hash": 0} for uid in uids]
+        raw = await rt.client.load_users(user_peers)
+        parsed = parse_load_users_response(raw)
+        return {
+            'ok': True,
+            'requested': uids,
+            'users': parsed.get('users', []),
+        }
+    except HTTPException:
+        raise
+    except Exception as exc:
+        _raise_http_error(
+            status_code=500,
+            detail='internal server error',
+            endpoint='bale_pv_debug_load_users',
+            exc=exc,
+            instance_key=instance_key,
+        )
+
+
 @router.get('/instances/{instance_key}/bale-pv/dialogs', response_model=BalePvDialogsResponse)
 async def bale_pv_dialogs(instance_key: str, db: Session = Depends(get_db)):
     """Fetch dialogs for a Bale PV instance."""
@@ -851,6 +1085,8 @@ async def _handle_chatwoot_webhook(
             result = await enterprise.receive_chatwoot_webhook(db, resolved_instance_key, payload)
         elif runtime.platform_type.key == 'telegram_enterprise':
             result = await enterprise_telegram.receive_chatwoot_webhook(db, resolved_instance_key, payload)
+        elif runtime.platform_type.key == 'bale_pv_enterprise':
+            result = await chatwoot_bridge.handle_chatwoot_webhook(db, resolved_instance_key, payload)
         else:
             result = await bridge.receive_chatwoot_webhook(db, resolved_instance_key, payload)
         return GenericMessageResponse(
@@ -901,6 +1137,7 @@ async def _handle_chatwoot_webhook(
 async def simulate_platform_event(instance_key: str, payload: SimulatePlatformEventRequest, db: Session = Depends(get_db)):
     """Simulate platform event."""
     try:
+        runtime = _require_instance_runtime(db, instance_key)
         event = {
             'chat_id': payload.chat_id,
             'from_name': payload.from_name,
@@ -920,7 +1157,10 @@ async def simulate_platform_event(instance_key: str, payload: SimulatePlatformEv
                 }
             )
 
-        result = await bridge.ingest_platform_event(db, instance_key, event)
+        if runtime.platform_type.key == 'bale_pv_enterprise':
+            result = await chatwoot_bridge.ingest_platform_event(db, instance_key, event)
+        else:
+            result = await bridge.ingest_platform_event(db, instance_key, event)
         return GenericMessageResponse(
             message=str(result.get('message') or 'ok'),
             detail=result.get('detail'),

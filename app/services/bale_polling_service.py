@@ -1,8 +1,20 @@
-"""
-Module Overview
----------------
-Purpose: Service-layer business logic for connector and synchronization workflows.
-Documentation Standard: module/class/public-method docstrings.
+"""Bale polling service — connector lifecycle and update dispatch.
+
+This service owns the long-running poll loop for every active Bale instance
+(both ``bale`` bot-API and ``bale_pv``/``bale_pv_enterprise`` userbot).
+
+Responsibilities
+----------------
+* Start and supervise per-instance polling tasks across server restarts.
+* Normalise raw WebSocket/gRPC updates from ``BalePvConnector`` into the
+  canonical event shape expected by ``ChatwootBridgeService``.
+* Resolve inbound media references (via ``BalePvAdapter.resolve_attachments``)
+  before handing events to the bridge.
+* Route events to the correct downstream handler:
+    - ``bale_pv_enterprise`` → ``EnterpriseBaleService``
+    - ``bale_pv``            → ``ChatwootBridgeService`` via ``BalePvAdapter``
+    - ``bale`` (legacy bot)  → ``BridgeService`` / ``EnterpriseBaleService``
+* Detect and recover from stalled or crashed poll tasks.
 """
 from __future__ import annotations
 
@@ -17,21 +29,29 @@ from typing import Any, Optional
 import httpx
 from sqlalchemy.exc import OperationalError
 
+from app.adapters.bale_pv import BalePvAdapter
 from app.config import settings
 from app.connectors.registry import connector_registry
 from app.db import SessionLocal
+from app import runtime_registry
 from app.services.bridge_service import BridgeService
+from app.services.chatwoot_bridge_service import chatwoot_bridge
 from app.services.enterprise_bale_service import EnterpriseBaleService
 from app.services.enterprise_telegram_service import EnterpriseTelegramService
 from app.services.instance_service import InstanceService
 
 
 class BalePollingService:
-    """Service for bale polling domain workflows."""
+    """Manages polling lifecycle for all active Bale connector instances.
+
+    Instantiated once at application startup (see ``app/main.py``).  Call
+    ``start()`` to begin supervising poll tasks and ``stop()`` to shut them
+    all down cleanly.
+    """
+
     def __init__(self) -> None:
-        """Initialize the instance."""
-        self._logger = logging.getLogger('app.services.bale_polling')
-        self._sms_logger = logging.getLogger('app.services.enterprise_sms')
+        self._logger = logging.getLogger("app.services.bale_polling")
+        self._sms_logger = logging.getLogger("app.services.enterprise_sms")
         self._stop = asyncio.Event()
         self._manager_task: Optional[asyncio.Task] = None
         self._poll_tasks: dict[str, asyncio.Task] = {}
@@ -118,6 +138,7 @@ class BalePollingService:
     async def _run_instance(self, instance_key: str) -> None:
         """Internal helper to run instance."""
         while not self._stop.is_set():
+            self._logger.debug('poll iteration instance=%s', instance_key)
             poll_interval = settings.BALE_POLL_INTERVAL_SECONDS
             runtime_instance_id: Optional[str] = None
             try:
@@ -145,6 +166,19 @@ class BalePollingService:
                     runtime_instance_id=runtime_instance_id,
                 )
 
+                # Register the Bale PV adapter runtime first so inbound normalization
+                # and outbound webhooks can use it even if the connector is still
+                # completing authentication.
+                if platform_key == 'bale_pv_enterprise':
+                    try:
+                        await runtime_registry.connect_instance(instance_key, platform_key, cfg)
+                    except Exception as exc:
+                        self._logger.warning(
+                            'bale_pv_adapter_register_failed instance=%s error=%s',
+                            instance_key,
+                            exc,
+                        )
+
                 await connector.connect(instance_key, cfg, runtime.proxy)
 
                 offset = None
@@ -152,7 +186,9 @@ class BalePollingService:
                 if last_update and str(last_update).isdigit():
                     offset = int(last_update) + 1
 
+                self._logger.debug('poll get_updates instance=%s offset=%s timeout=%s', instance_key, offset, long_poll_timeout)
                 resp = await connector.get_updates(instance_key, offset=offset, timeout=long_poll_timeout)
+                self._logger.debug('poll get_updates_done instance=%s ok=%s result_count=%s', instance_key, resp.get('ok') if isinstance(resp, dict) else None, len(resp.get('result', [])) if isinstance(resp, dict) else None)
                 if not isinstance(resp, dict) or not resp.get('ok'):
                     await self._update_runtime_state_with_retry(
                         runtime_instance_id,
@@ -219,13 +255,21 @@ class BalePollingService:
                         if handled:
                             update_processed = True
                         else:
-                            event = await self._platform_update_to_event(instance_key, platform_key, update, connector=connector)
+                            if platform_key == 'bale_pv_enterprise':
+                                event = await self._normalize_with_adapter(instance_key, update)
+                            else:
+                                event = await self._platform_update_to_event(instance_key, platform_key, update, connector=connector)
+                            self._logger.debug('poll normalized instance=%s update_id=%s event=%s', instance_key, processed_update_id, bool(event))
                             if not event:
                                 update_processed = True
                             else:
                                 try:
                                     with SessionLocal() as db:
-                                        await self._bridge.ingest_platform_event(db, instance_key, event)
+                                        if platform_key == 'bale_pv_enterprise':
+                                            await chatwoot_bridge.ingest_platform_event(db, instance_key, event)
+                                        else:
+                                            await self._bridge.ingest_platform_event(db, instance_key, event)
+                                    self._logger.debug('poll bridge_ingest_ok instance=%s update_id=%s', instance_key, processed_update_id)
                                 except Exception as exc:
                                     self._logger.error(
                                         'bridge_ingest_error instance=%s update_id=%s error_type=%s error=%s',
@@ -438,6 +482,7 @@ class BalePollingService:
                         touch_sync=touch_sync,
                         last_enterprise_sms_sync_at=last_enterprise_sms_sync_at,
                     )
+                self._logger.debug('runtime_state_updated instance=%s last_error=%s touch_sync=%s', instance_id, last_error, touch_sync)
                 return True
             except OperationalError as exc:
                 if not self._is_sqlite_locked_error(exc):
@@ -731,6 +776,52 @@ class BalePollingService:
             return False
         return bool(default)
 
+    async def _normalize_with_adapter(
+        self,
+        instance_key: str,
+        update: dict[str, Any],
+    ) -> Optional[dict[str, Any]]:
+        """Normalize a Bale PV update using the new adapter runtime."""
+        from app.runtime_registry import get_runtime
+        runtime = get_runtime(instance_key)
+        if not runtime:
+            self._logger.warning('bale_pv_adapter_no_runtime instance=%s', instance_key)
+            return None
+        event = runtime.adapter.normalize_incoming_update(update)
+        if not event:
+            self._logger.debug('bale_pv_adapter_normalize_skipped instance=%s', instance_key)
+            return None
+
+        original_refs = event.get("attachments") or []
+        if original_refs:
+            self._logger.info(
+                'bale_pv_adapter_normalizing_attachments instance=%s message_id=%s refs=%s',
+                instance_key,
+                event.get('message_id'),
+                [
+                    {'filename': ref.get('filename'), 'content_type': ref.get('content_type'), 'file_id': str(ref.get('file_id', ''))[:80]}
+                    for ref in original_refs
+                ],
+            )
+            try:
+                event["attachments"] = await runtime.adapter.resolve_attachments(event["attachments"])
+            except Exception as exc:
+                self._logger.warning(
+                    'bale_pv_adapter_resolve_attachments_failed instance=%s error=%s',
+                    instance_key,
+                    exc,
+                    exc_info=True,
+                )
+                event["attachments"] = []
+            if original_refs and not event.get("attachments"):
+                self._logger.warning(
+                    'bale_pv_adapter_attachments_dropped instance=%s message_id=%s original_count=%s',
+                    instance_key,
+                    event.get('message_id'),
+                    len(original_refs),
+                )
+        return event
+
     async def _platform_update_to_event(
         self,
         instance_key: str,
@@ -753,6 +844,14 @@ class BalePollingService:
         from_name = ' '.join([str(sender.get('first_name') or '').strip(), str(sender.get('last_name') or '').strip()]).strip()
         from_name = from_name or sender.get('username')
 
+        chat_type = str(chat.get('type') or 'private').strip().lower() or 'private'
+        # For groups/channels the contact in Chatwoot should be named after the
+        # group/channel, not the individual sender, so the conversation is identifiable.
+        if chat_type in ('group', 'channel'):
+            chat_title = chat.get('title')
+            if chat_title:
+                from_name = str(chat_title).strip()
+
         text = message.get('text') or message.get('caption') or ''
         if not text:
             text = self._extract_contact_text(message) or ''
@@ -768,27 +867,27 @@ class BalePollingService:
             content, content_type, file_path = await connector.download_file_by_id(instance_key, file_id=file_id)
             if content:
                 resolved_filename = filename or (str(file_path).split('/')[-1] if file_path else 'file')
-                resolved_content_type = self._normalize_content_type(
+                resolved_content_type = BalePvAdapter._normalize_content_type(
                     filename=resolved_filename,
                     content_type=content_type or content_type_hint,
                     content=content,
                 )
-                # Sanity-check: if we claim it's an image, the bytes should look like one
-                if resolved_content_type and resolved_content_type.startswith('image/'):
-                    is_valid_image = (
-                        content.startswith(b'\x89PNG\r\n\x1a\n')
-                        or content.startswith(b'\xff\xd8\xff')
-                        or content.startswith((b'GIF87a', b'GIF89a'))
-                        or (len(content) > 12 and content[:4] == b'RIFF' and content[8:12] == b'WEBP')
-                    )
-                    if not is_valid_image:
+                # Convert WEBP stickers to JPEG/PNG so Chatwoot can render them.
+                if resolved_content_type == 'image/webp':
+                    converted, ext, converted_ct = BalePvAdapter._convert_webp(content)
+                    if converted and ext and converted_ct:
+                        content = converted
+                        resolved_content_type = converted_ct
+                        resolved_filename = str(resolved_filename).rsplit('.', 1)[0] + ext
+                    else:
                         self._logger.warning(
-                            'bale_polling image_bytes_mismatch instance=%s filename=%s claimed=%s actual_bytes=%s',
+                            'bale_polling webp_conversion_failed instance=%s filename=%s',
                             instance_key,
                             resolved_filename,
-                            resolved_content_type,
-                            content[:8].hex(),
                         )
+                resolved_filename = BalePvAdapter._normalize_filename_extension(
+                    resolved_filename, resolved_content_type
+                )
                 attachments.append(
                     {
                         'filename': resolved_filename,
@@ -800,6 +899,7 @@ class BalePollingService:
         event: dict[str, Any] = {
             'chat_id': str(chat_id),
             'platform_key': str(platform_key or '').strip().lower() or None,
+            'chat_type': str(chat.get('type') or 'private').strip().lower() or 'private',
             'from_name': from_name,
             'text': str(text),
             'message_id': str(message_id) if message_id is not None else None,
@@ -875,67 +975,6 @@ class BalePollingService:
         if not phone:
             return None
         if full_name:
-            return f'Shared phone number: {phone} ({full_name})'
-        return f'Shared phone number: {phone}'
-
-    @staticmethod
-    def _extract_contact_payload(message: dict[str, Any]) -> Optional[dict[str, Any]]:
-        """Internal helper to extract contact payload."""
-        contact = message.get('contact')
-        if not isinstance(contact, dict):
-            return None
-
-        phone = str(contact.get('phone_number') or '').strip()
-        if not phone:
-            return None
-
-        first_name = str(contact.get('first_name') or '').strip() or None
-        last_name = str(contact.get('last_name') or '').strip() or None
-        user_id = contact.get('user_id')
-        return {
-            'phone_number': phone,
-            'first_name': first_name,
-            'last_name': last_name,
-            'user_id': str(user_id).strip() if user_id is not None else None,
-        }
-
-    @staticmethod
-    def _normalize_content_type(
-        *, filename: str, content_type: Optional[str], content: bytes
-    ) -> Optional[str]:
-        """Resolve a usable content type for an attachment."""
-        raw = str(content_type or "").strip().lower()
-        if raw and raw != "application/octet-stream":
-            return raw
-
-        guessed = mimetypes.guess_type(str(filename or "").strip())[0]
-        if guessed:
-            return guessed.lower()
-
-        if content.startswith(b"%PDF"):
-            return "application/pdf"
-        if content.startswith(b"\x89PNG\r\n\x1a\n"):
-            return "image/png"
-        if content.startswith(b"\xff\xd8\xff"):
-            return "image/jpeg"
-        if content.startswith((b"GIF87a", b"GIF89a")):
-            return "image/gif"
-        if len(content) > 12 and content[:4] == b"RIFF" and content[8:12] == b"WEBP":
-            return "image/webp"
-        if content.startswith(b"OggS"):
-            return "audio/ogg"
-        if len(content) > 12 and content[:4] == b"RIFF" and content[8:12] == b"WAVE":
-            return "audio/wav"
-        if content.startswith(b"ID3") or (len(content) > 1 and content[0] == 0xFF and (content[1] & 0xE0) == 0xE0):
-            return "audio/mpeg"
-        if len(content) > 8 and content[4:8] == b"ftyp":
-            return "video/mp4"
-        return None
-
-    @staticmethod
-    def _guess_content_type_from_bytes(content: bytes) -> Optional[str]:
-        """Internal helper to guess content type from bytes."""
-        if not content:
             return None
         if content.startswith(b'\x89PNG\r\n\x1a\n'):
             return 'image/png'
@@ -954,4 +993,3 @@ class BalePollingService:
         if len(content) > 8 and content[4:8] == b'ftyp':
             return 'video/mp4'
         return None
-

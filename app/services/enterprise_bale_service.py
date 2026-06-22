@@ -1,8 +1,18 @@
-"""
-Module Overview
----------------
-Purpose: Service-layer business logic for Bale Enterprise bot flows and Chatwoot routing.
-Documentation Standard: module/class/public-method docstrings.
+"""Enterprise Bale service — bot-flow orchestration and Chatwoot routing.
+
+This service handles the full lifecycle of messages arriving from the Bale
+Enterprise bot connector and routes them to Chatwoot conversations.
+
+Key responsibilities
+--------------------
+* Map inbound Bale bot updates to Chatwoot contacts and conversations.
+* Drive a state-machine that guides users through phone-number verification,
+  welcome messages, and agent-handoff flows.
+* Download and convert inbound media (photos, documents, stickers) before
+  attaching them to Chatwoot messages.  WEBP stickers are converted to JPEG
+  via ``BalePvAdapter._convert_webp`` so Chatwoot can render them inline.
+* Route outbound Chatwoot messages back to the correct Bale peer.
+* Integrate with the Novin SMS gateway for OTP delivery.
 """
 
 from __future__ import annotations
@@ -2818,6 +2828,14 @@ class EnterpriseBaleService:
             content_type=content_type or content_type_hint,
             content=content,
         )
+        # Chatwoot cannot display WEBP stickers — convert to JPEG/PNG.
+        if resolved_content_type == "image/webp":
+            from app.adapters.bale_pv import BalePvAdapter
+            converted, ext, converted_ct = BalePvAdapter._convert_webp(content)
+            if converted and ext and converted_ct:
+                content = converted
+                resolved_filename = str(resolved_filename).rsplit(".", 1)[0] + ext
+                resolved_content_type = converted_ct
         return [
             {
                 "filename": resolved_filename,
@@ -3224,7 +3242,7 @@ class EnterpriseBaleService:
 
     @staticmethod
     def _is_missing_chatwoot_resource(response: Optional[httpx.Response]) -> bool:
-        """Identify deleted or missing Chatwoot resource responses."""
+        """Return True when a Chatwoot 404 response indicates a missing resource."""
         if response is None or response.status_code != 404:
             return False
         body = ""

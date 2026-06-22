@@ -88,6 +88,9 @@ class Settings(BaseSettings):
     LOG_HTTP_REQUESTS: bool = False
     LOG_COLOR: bool = True
     LOG_COLOR_FORCE: bool = False
+    LOG_FILE_PATH: str = str(repo_root / 'backend.log')
+    LOG_FILE_MAX_BYTES: int = 10 * 1024 * 1024
+    LOG_FILE_BACKUP_COUNT: int = 5
 
     @property
     def resolved_database_url(self) -> str:

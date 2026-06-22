@@ -27,6 +27,9 @@ from .messaging_messages import (
     LoadDialogsRequest,
     LoadHistoryRequest,
     LoadUsersRequest,
+    ImportContactsRequest,
+    PhoneContact,
+    GetContactsRequest,
 )
 from .ws_client import BaleWebSocketClient
 
@@ -53,7 +56,10 @@ class BaleMessagingClient:
         )
         self._last_message_handler: Optional[Any] = None
 
-    def _on_message(self, data: bytes) -> None:
+    def _on_message(self, data: Optional[bytes]) -> None:
+        if data is None:
+            logger.debug("Received message response: None")
+            return
         logger.debug("Received message response: %s bytes", len(data))
 
     def _on_update(self, data: bytes) -> None:
@@ -77,6 +83,7 @@ class BaleMessagingClient:
         peer_id: int,
         text: str,
         reply_to_message_id: Optional[int] = None,
+        access_hash: Optional[int] = None,
     ) -> None:
         """Send a text message to a peer (fire-and-forget).
 
@@ -87,6 +94,7 @@ class BaleMessagingClient:
             peer_id=peer_id,
             text=text,
             reply_to_message_id=reply_to_message_id,
+            access_hash=access_hash,
         )
         await self.ws.send_update(
             service_name=self.SERVICE,
@@ -208,7 +216,7 @@ class BaleMessagingClient:
         """Fetch user details for the given peers (response bytes)."""
         req = LoadUsersRequest(user_peers)
         return await self.ws.send_request(
-            service_name=self.SERVICE,
+            service_name="bale.users.v1.Users",
             method="LoadUsers",
             payload=req.serialize(),
         )
@@ -217,29 +225,81 @@ class BaleMessagingClient:
         self,
         peer_id: int,
         file_id: int,
-        access_hash: int,
+        file_access_hash: int,
         file_size: int,
         name: str,
         mime_type: str,
         caption: Optional[str] = None,
         reply_to_message_id: Optional[int] = None,
+        thumb: Optional[Any] = None,
+        ext: Optional[Any] = None,
+        peer_access_hash: int = 0,
     ) -> None:
-        """Send a document/media message (fire-and-forget)."""
+        """Send a document/media message (fire-and-forget).
+
+        ``file_access_hash`` is the access_hash returned by
+        GetNasimFileUploadUrl for this specific file and belongs in the
+        DocumentMessage.  ``peer_access_hash`` is the recipient peer's
+        access_hash (used to build an ExPeer in SendMessageRequest) and is
+        kept separate so the server can authenticate both the file reference
+        and the target peer independently.
+        """
         doc = DocumentMessage(
             file_id=file_id,
-            access_hash=access_hash,
+            access_hash=file_access_hash,
             file_size=file_size,
             name=name,
             mime_type=mime_type,
             caption=caption,
+            thumb=thumb,
+            ext=ext,
         )
         req = SendMessageRequest(
             peer_id=peer_id,
             document=doc.serialize(),
             reply_to_message_id=reply_to_message_id,
+            access_hash=peer_access_hash or None,
         )
         await self.ws.send_update(
             service_name=self.SERVICE,
             method="SendMessage",
+            payload=req.serialize(),
+        )
+
+    async def import_contacts(
+        self,
+        phones: List[Dict[str, Any]],
+        optimizations: Optional[List[int]] = None,
+    ) -> bytes:
+        """Import phone contacts and return resolved user details.
+
+        Each phone entry should be a dict with keys:
+          - phone_number (int or str)
+          - name (optional str)
+        """
+        contacts = []
+        for entry in phones:
+            pn = entry["phone_number"]
+            if isinstance(pn, str):
+                pn = int(pn.replace("+", "").replace(" ", ""))
+            contacts.append(PhoneContact(phone_number=pn, name=entry.get("name")))
+        req = ImportContactsRequest(phones=contacts, optimizations=optimizations)
+        return await self.ws.send_request(
+            service_name="bale.users.v1.Users",
+            method="ImportContacts",
+            payload=req.serialize(),
+        )
+
+    async def get_contacts(
+        self,
+        contacts_hash: str = "",
+        optimizations: Optional[List[int]] = None,
+    ) -> bytes:
+        """Fetch the authenticated account's contact list (response bytes)."""
+        from .messaging_messages import GetContactsRequest
+        req = GetContactsRequest(contacts_hash=contacts_hash, optimizations=optimizations)
+        return await self.ws.send_request(
+            service_name="bale.users.v1.Users",
+            method="GetContacts",
             payload=req.serialize(),
         )

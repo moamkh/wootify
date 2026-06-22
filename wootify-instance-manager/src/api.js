@@ -274,3 +274,12 @@ export function balePvSyncDialogs(instanceKey, loadHistory = true, historyLimit 
     method: 'POST',
   });
 }
+
+
+export function balePvRemoveChatwootContacts(instanceKey, dryRun = false) {
+  const params = new URLSearchParams();
+  params.set('dry_run', dryRun ? 'true' : 'false');
+  return fetchJSON(`/api/v1/instances/${encodeURIComponent(instanceKey)}/bale-pv/remove-chatwoot-contacts?${params.toString()}`, {
+    method: 'POST',
+  });
+}

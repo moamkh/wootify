@@ -317,6 +317,8 @@ class InstanceService:
                 row.last_platform_update_id = str(last_platform_update_id)
             if last_error is not None:
                 row.last_error = last_error
+            else:
+                row.last_error = None
             if touch_sync:
                 row.last_sync_at = _dt.datetime.utcnow()
             if last_enterprise_sms_sync_at is not None:

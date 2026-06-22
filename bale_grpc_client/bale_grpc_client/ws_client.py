@@ -30,6 +30,7 @@ Re-authentication may be required for WebSocket connectivity.
 """
 
 import asyncio
+import json
 import logging
 import os
 import random
@@ -44,14 +45,25 @@ from .protobuf_wire import ProtobufMessage, ProtobufParser
 
 logger = logging.getLogger("bale_grpc_client.ws")
 
-# --- Raw debug file logger ---
-# Logs every incoming WebSocket frame (hex) to a file for reverse-engineering.
-_DEBUG_LOG_PATH = os.environ.get("BALE_WS_DEBUG_LOG", "bale_ws_debug.log")
+# ---------------------------------------------------------------------------
+# Optional raw-frame debug logger
+# ---------------------------------------------------------------------------
+# When the BALE_WS_DEBUG_LOG environment variable is set to a file path, every
+# inbound WebSocket frame is appended to that file as hex + decoded text.
+# This is disabled by default (empty string).  Enable temporarily to capture
+# traffic for protocol reverse-engineering; never leave enabled in production
+# as it generates hundreds of MB of output quickly.
+_DEBUG_LOG_PATH = os.environ.get("BALE_WS_DEBUG_LOG", "")
 _debug_file_handler: Optional[logging.FileHandler] = None
 
 
 def _get_debug_logger() -> logging.Logger:
-    """Lazy-init a file logger that records raw WS frames."""
+    """Return a file logger that records raw WS frames (hex + decoded).
+
+    The handler is created lazily on first call and reused thereafter.
+    If ``BALE_WS_DEBUG_LOG`` is unset or empty the returned logger has no
+    handlers and all calls to it are no-ops.
+    """
     global _debug_file_handler
     dbg = logging.getLogger("bale_grpc_client.ws.raw")
     if _debug_file_handler is None and _DEBUG_LOG_PATH:
@@ -62,15 +74,229 @@ def _get_debug_logger() -> logging.Logger:
     return dbg
 
 
+# Known field-name maps for the Bale Y/Z wrapper layers. These make the raw
+# debug logs readable even without the official .proto files.
+_Z_WRAPPER_NAMES: Dict[int, str] = {
+    1: "response",
+    2: "update",
+    3: "terminate_session",
+    4: "pong",
+    5: "handshake_response",
+}
+
+_INNER_WRAPPER_NAMES: Dict[int, str] = {
+    1: "payload",
+    3: "index",
+    4: "server_ts",
+    5: "status",
+}
+
+_CONTAINER_NAMES: Dict[int, str] = {
+    1: "event_wrapper",
+    2: "container_seq_or_uid",
+    3: "container_counter",
+    4: "container_ts",
+}
+
+_EVENT_WRAPPER_NAMES: Dict[int, str] = {
+    4: "status",
+    5: "heartbeat",
+    19: "message_status",
+    21: "typing",
+    46: "contact_status",
+    50: "read_receipt",
+    55: "new_message",
+    131: "app_settings",
+    162: "channel_message",
+}
+
+_UPDATE_MESSAGE_NAMES: Dict[int, str] = {
+    1: "peer",
+    2: "sender_uid",
+    3: "date",
+    4: "rid",
+    5: "message",
+    6: "reply_to_or_fwd",
+    7: "forward_or_reply",
+    8: "reply_to_or_fwd_alt",
+    9: "sender_peer",
+    14: "peer_info",
+}
+
+_MESSAGE_NAMES: Dict[int, str] = {
+    4: "document",
+    15: "text",
+}
+
+_TEXT_MESSAGE_NAMES: Dict[int, str] = {
+    1: "text",
+}
+
+_DOCUMENT_MESSAGE_NAMES: Dict[int, str] = {
+    1: "file_id",
+    2: "access_hash",
+    3: "file_size",
+    4: "name",
+    5: "mime_type",
+    6: "thumb",
+    7: "ext",
+    8: "caption",
+}
+
+_PEER_NAMES: Dict[int, str] = {
+    1: "type",
+    2: "id",
+    3: "access_hash",
+}
+
+# Common bale.users.v1.Users response schemas (used by LoadUsers/ImportContacts).
+_USER_NAMES: Dict[int, str] = {
+    1: "id",
+    2: "access_hash",
+    3: "name",
+    4: "local_name",
+    5: "sex",
+    6: "avatar",
+    7: "username_or_bot",
+    9: "nick",
+    16: "about_or_deleted",
+    19: "created_at_or_last_seen",
+    20: "ex_info",
+}
+
+_LOAD_USERS_RESPONSE_NAMES: Dict[int, str] = {
+    1: "users",
+}
+
+# Generic Int64Value / StringValue / BoolValue wrappers.
+_INT64_VALUE_NAMES: Dict[int, str] = {
+    1: "value",
+}
+
+_EX_INFO_NAMES: Dict[int, str] = {
+    1: "flags",
+}
+
+
+def _decode_protobuf_for_log(
+    data: bytes,
+    *,
+    depth: int = 0,
+    max_depth: int = 8,
+    names: Optional[Dict[int, str]] = None,
+) -> Any:
+    """Recursively decode protobuf bytes into a human-readable structure.
+
+    Length-delimited fields are tried as UTF-8 strings, then as nested
+    protobuf messages, then left as hex. Varints and fixed fields are
+    shown as integers / hex.
+
+    When ``names`` is provided, field numbers are replaced with readable
+    names in the output and the next nesting level gets a schema hint when
+    we know it.
+    """
+    if depth >= max_depth:
+        return data.hex()
+
+    try:
+        fields = ProtobufParser(data).parse()
+    except Exception:
+        return data.hex()
+
+    result: Dict[str, List[Any]] = {}
+    for field_number, values in fields.items():
+        key = names.get(field_number, str(field_number)) if names else str(field_number)
+        # Decide which schema to use for children of this field.
+        child_names: Optional[Dict[int, str]] = None
+        if names is _Z_WRAPPER_NAMES:
+            if field_number == 1:  # response -> inner Response message
+                child_names = {1: "error", 2: "response_payload", 3: "index"}
+            elif field_number == 2:  # update -> inner wrapper
+                child_names = _INNER_WRAPPER_NAMES
+            else:
+                child_names = None
+        elif names is not None and set(names.keys()) == {1, 2, 3} and "response_payload" in names.values():
+            # Inside the inner Response message: field 2 is the service payload.
+            if field_number == 2:
+                # Heuristic: LoadUsers/ImportContacts responses wrap repeated User in field 1.
+                child_names = _LOAD_USERS_RESPONSE_NAMES
+            elif field_number == 1:  # error
+                child_names = {1: "code", 2: "message"}
+        elif names is _INNER_WRAPPER_NAMES and field_number == 1:
+            # payload may be a container or a raw event wrapper.
+            child_names = _CONTAINER_NAMES
+        elif names is _CONTAINER_NAMES and field_number == 1:
+            child_names = _EVENT_WRAPPER_NAMES
+        elif names is _EVENT_WRAPPER_NAMES and field_number in (55, 162):
+            child_names = _UPDATE_MESSAGE_NAMES
+        elif names is _UPDATE_MESSAGE_NAMES and field_number == 1:
+            child_names = _PEER_NAMES
+        elif names is _UPDATE_MESSAGE_NAMES and field_number == 5:
+            child_names = _MESSAGE_NAMES
+        elif names is _MESSAGE_NAMES and field_number == 15:
+            child_names = _TEXT_MESSAGE_NAMES
+        elif names is _MESSAGE_NAMES and field_number == 4:
+            child_names = _DOCUMENT_MESSAGE_NAMES
+        elif names is _LOAD_USERS_RESPONSE_NAMES and field_number == 1:
+            child_names = _USER_NAMES
+        elif names is _USER_NAMES and field_number == 19:
+            child_names = _INT64_VALUE_NAMES
+        elif names is _USER_NAMES and field_number == 20:
+            child_names = _EX_INFO_NAMES
+
+        decoded_values: List[Any] = []
+        for value in values:
+            if isinstance(value, bytes):
+                # If we have a schema hint for this field, prefer protobuf.
+                if child_names is not None:
+                    try:
+                        nested = _decode_protobuf_for_log(
+                            value, depth=depth + 1, max_depth=max_depth, names=child_names
+                        )
+                        decoded_values.append(nested)
+                        continue
+                    except Exception:
+                        pass
+                # Otherwise try UTF-8 string first.
+                try:
+                    text = value.decode("utf-8")
+                    decoded_values.append(text)
+                    continue
+                except UnicodeDecodeError:
+                    pass
+                # Try nested protobuf without a schema.
+                try:
+                    nested = _decode_protobuf_for_log(
+                        value, depth=depth + 1, max_depth=max_depth, names=None
+                    )
+                    decoded_values.append(nested)
+                    continue
+                except Exception:
+                    pass
+                # Fall back to hex.
+                decoded_values.append(value.hex())
+            elif isinstance(value, int):
+                decoded_values.append(value)
+            else:
+                decoded_values.append(str(value))
+        result[key] = decoded_values
+    return result
+
+
 def _log_raw_frame(label: str, data: bytes) -> None:
-    """Write a timestamped hex dump of raw WS data to the debug log."""
+    """Write a timestamped decoded dump of raw WS data to the debug log."""
     dbg = _get_debug_logger()
     ts = datetime.now(timezone.utc).isoformat()
-    # Truncate hex if absurdly large (>64KB) to keep log usable
-    hex_data = data.hex()
-    if len(hex_data) > 131_072:
-        hex_data = hex_data[:131_072] + f"...[truncated {len(data)} bytes total]"
-    dbg.debug("[%s] %s | len=%d | hex=%s", ts, label, len(data), hex_data)
+    # Start decoding with the Z-wrapper schema so top-level fields get names.
+    decoded = _decode_protobuf_for_log(data, names=_Z_WRAPPER_NAMES)
+    try:
+        decoded_str = json.dumps(decoded, ensure_ascii=False, indent=2)
+    except Exception:
+        decoded_str = repr(decoded)
+    # Truncate if absurdly large (>64KB) to keep log usable
+    if len(decoded_str) > 131_072:
+        decoded_str = decoded_str[:131_072] + f"...[truncated {len(data)} bytes total]"
+    dbg.debug("[%s] %s | len=%d | decoded=%s", ts, label, len(data), decoded_str)
 
 
 # --- Protobuf Message Builders ---
@@ -448,7 +674,10 @@ class BaleWebSocketClient:
                 return False
 
     async def close(self) -> None:
-        """Close WebSocket connection."""
+        """Close the WebSocket connection and cancel all pending requests.
+
+        Safe to call multiple times; subsequent calls are no-ops.
+        """
         self._connected = False
         if self._listen_task:
             self._listen_task.cancel()
@@ -459,7 +688,7 @@ class BaleWebSocketClient:
         if self._ws:
             await self._ws.close()
             self._ws = None
-        # Cancel any pending futures
+        # Cancel any in-flight response futures so callers don't hang.
         for future in self._pending_responses.values():
             if not future.done():
                 future.cancel()

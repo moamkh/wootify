@@ -44,6 +44,7 @@ import {
   balePvAuthStatus,
   balePvSyncContacts,
   balePvSyncDialogs,
+  balePvRemoveChatwootContacts,
 } from './api.js';
 import PageLoader from './components/PageLoader.jsx';
 
@@ -976,6 +977,30 @@ export default function App() {
     }
   }
 
+  async function onBalePvRemoveChatwootContacts(instanceKey) {
+    setBusy(true);
+    try {
+      const dryRun = true;
+      const preview = await balePvRemoveChatwootContacts(instanceKey, dryRun);
+      const confirmed = window.confirm(
+        `Dry run: ${preview.deleted || 0} Chatwoot contacts would be deleted (Bale contacts: ${preview.total_bale || 0}, Chatwoot BALE_PV checked: ${preview.total_chatwoot || 0}).\n\nConfirm to actually delete them.`
+      );
+      if (!confirmed) {
+        alert('Deletion cancelled.');
+        return;
+      }
+      const response = await balePvRemoveChatwootContacts(instanceKey, false);
+      alert(
+        `Chatwoot contacts removed: ${response.deleted || 0} deleted, ${response.failed || 0} failed, ${response.skipped || 0} skipped`
+      );
+      await refreshInstances();
+    } catch (e) {
+      alert(e?.message || String(e));
+    } finally {
+      setBusy(false);
+    }
+  }
+
   async function onCreateEnterpriseInbox(routeKey, instanceKey = selectedKey) {
     if (!instanceKey) return;
     setBusy(true);
@@ -1588,6 +1613,7 @@ export default function App() {
             enterpriseManualsCount={enterpriseManuals.length}
             onBalePvSyncContacts={onBalePvSyncContacts}
             onBalePvSyncDialogs={onBalePvSyncDialogs}
+            onBalePvRemoveChatwootContacts={onBalePvRemoveChatwootContacts}
           />
         ) : (
           <InstancesPage
@@ -1602,6 +1628,7 @@ export default function App() {
             onCreateEnterpriseInbox={onCreateEnterpriseInbox}
             onBalePvSyncContacts={onBalePvSyncContacts}
             onBalePvSyncDialogs={onBalePvSyncDialogs}
+            onBalePvRemoveChatwootContacts={onBalePvRemoveChatwootContacts}
             onDelete={onDelete}
             PLATFORM_TELEGRAM={PLATFORM_TELEGRAM}
             PLATFORM_BALE_ENTERPRISE={PLATFORM_BALE_ENTERPRISE}

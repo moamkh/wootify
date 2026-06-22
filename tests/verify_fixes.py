@@ -78,6 +78,17 @@ class TestDatabaseSchema:
             }
         assert "last_enterprise_sms_sync_at" in cols
 
+    def test_bale_pv_phone_resolved_users_table_exists(self):
+        engine = create_engine("sqlite:///./wootify.db")
+        with engine.connect() as conn:
+            tables = {
+                row[0]
+                for row in conn.execute(
+                    text("SELECT name FROM sqlite_master WHERE type='table'")
+                )
+            }
+        assert "bale_pv_phone_resolved_users" in tables
+
 
 class TestEnterpriseBaleServiceNoSideEffects:
     """Verify _active_live_session_for_state no longer mutates."""
@@ -280,3 +291,45 @@ class TestImportSanity:
         assert EnterpriseDocumentService
         assert EnterpriseGreValidator
         assert InstanceService
+
+
+class TestBalePvImportContacts:
+    """Verify ImportContacts protobuf builder round-trips."""
+
+    def test_import_contacts_request_serializes(self):
+        from bale_grpc_client.messaging_messages import ImportContactsRequest, PhoneContact
+        from bale_grpc_client.protobuf_wire import ProtobufParser
+
+        req = ImportContactsRequest(
+            phones=[PhoneContact(phone_number=989136421196, name="Test")],
+            optimizations=[],
+        )
+        data = req.serialize()
+        fields = ProtobufParser(data).parse()
+        # phones is field 1 (length-delimited message)
+        assert 1 in fields
+        # optimizations omitted when empty
+        assert 3 not in fields
+
+    def test_import_contacts_request_with_optimizations(self):
+        from bale_grpc_client.messaging_messages import ImportContactsRequest, PhoneContact
+        from bale_grpc_client.protobuf_wire import ProtobufParser
+
+        req = ImportContactsRequest(
+            phones=[PhoneContact(phone_number=989136421196)],
+            optimizations=[1, 2],
+        )
+        data = req.serialize()
+        fields = ProtobufParser(data).parse()
+        assert 1 in fields
+        assert 3 in fields
+        # Packed repeated int32
+        assert len(fields[3]) == 1
+
+    def test_parse_import_contacts_response_handles_empty(self):
+        from bale_grpc_client.dialog_parser import parse_import_contacts_response
+
+        parsed = parse_import_contacts_response(b"")
+        assert parsed["users"] == []
+        assert parsed["seq"] == 0
+        assert parsed["state"] == b""

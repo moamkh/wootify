@@ -51,7 +51,7 @@ File Service (ai.bale.server.Files):
 
 import random
 import time
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Union
 
 from .protobuf_wire import ProtobufMessage
 
@@ -159,6 +159,94 @@ class MessageContent:
         return msg.serialize()
 
 
+class FastThumb:
+    """FastThumb { width(1), height(2), thumb(3) }.
+
+    A tiny JPEG/PNG thumbnail that the Bale client shows while the full
+    media downloads.
+    """
+
+    def __init__(self, width: int, height: int, thumb: bytes):
+        self.width = width
+        self.height = height
+        self.thumb = thumb
+
+    def serialize(self) -> bytes:
+        msg = ProtobufMessage()
+        msg.add_int32(1, self.width)
+        msg.add_int32(2, self.height)
+        msg.add_bytes(3, self.thumb)
+        return msg.serialize()
+
+
+class ImageDimensions:
+    """Image/video dimensions { width(1), height(2) }."""
+
+    def __init__(self, width: int, height: int):
+        self.width = width
+        self.height = height
+
+    def serialize(self) -> bytes:
+        msg = ProtobufMessage()
+        msg.add_int32(1, self.width)
+        msg.add_int32(2, self.height)
+        return msg.serialize()
+
+
+class ImageExt:
+    """Image/video document extension { image(1) }."""
+
+    def __init__(self, width: int, height: int):
+        self.width = width
+        self.height = height
+
+    def serialize(self) -> bytes:
+        msg = ProtobufMessage()
+        msg.add_message(1, ImageDimensions(self.width, self.height))
+        return msg.serialize()
+
+
+class AudioMeta:
+    """Audio metadata { duration(1), title(2), performer(3), genre(4), album(6) }."""
+
+    def __init__(
+        self,
+        duration: int = 0,
+        title: Optional[str] = None,
+        performer: Optional[str] = None,
+        genre: Optional[str] = None,
+        album: Optional[str] = None,
+    ):
+        self.duration = duration
+        self.title = title
+        self.performer = performer
+        self.genre = genre
+        self.album = album
+
+    def serialize(self) -> bytes:
+        msg = ProtobufMessage()
+        msg.add_int32(1, self.duration)
+        msg.add_string(2, self.title)
+        msg.add_string(3, self.performer)
+        msg.add_string(4, self.genre)
+        msg.add_string(6, self.album)
+        return msg.serialize()
+
+
+class AudioExt:
+    """Audio document extension { audio(1) }."""
+
+    def __init__(self, duration: int = 0, title: Optional[str] = None, performer: Optional[str] = None):
+        self.duration = duration
+        self.title = title
+        self.performer = performer
+
+    def serialize(self) -> bytes:
+        msg = ProtobufMessage()
+        msg.add_message(1, AudioMeta(self.duration, self.title, self.performer))
+        return msg.serialize()
+
+
 class DocumentMessage:
     """Document message for media attachments.
 
@@ -181,6 +269,8 @@ class DocumentMessage:
         name: str,
         mime_type: str,
         caption: Optional[str] = None,
+        thumb: Optional[FastThumb] = None,
+        ext: Optional[Union[ImageExt, AudioExt]] = None,
     ):
         self.file_id = file_id
         self.access_hash = access_hash
@@ -188,6 +278,8 @@ class DocumentMessage:
         self.name = name
         self.mime_type = mime_type
         self.caption = caption
+        self.thumb = thumb
+        self.ext = ext
 
     def serialize(self) -> bytes:
         msg = ProtobufMessage()
@@ -196,6 +288,10 @@ class DocumentMessage:
         msg.add_int32(3, self.file_size)
         msg.add_string(4, self.name)
         msg.add_string(5, self.mime_type)
+        if self.thumb is not None:
+            msg.add_message(6, self.thumb)
+        if self.ext is not None:
+            msg.add_message(7, self.ext)
         if self.caption is not None:
             msg.add_message(8, TextMessage(self.caption))
         return msg.serialize()
@@ -280,6 +376,7 @@ class SendMessageRequest:
         document: Optional[bytes] = None,
         random_id: Optional[int] = None,
         reply_to_message_id: Optional[int] = None,
+        access_hash: Optional[int] = None,
     ):
         self.peer_id = peer_id
         self.text = text
@@ -287,9 +384,14 @@ class SendMessageRequest:
         # Use a large random int64 if not provided
         self.random_id = random_id or random.randint(1, 2**63 - 1)
         self.reply_to_message_id = reply_to_message_id
+        self.access_hash = access_hash
 
     def serialize(self) -> bytes:
-        peer = Peer(self.peer_id)
+        # Use ExPeer when access_hash is available; required for non-contacts.
+        if self.access_hash:
+            peer = ExPeer(self.peer_id, access_hash=self.access_hash)
+        else:
+            peer = Peer(self.peer_id)
         msg = ProtobufMessage()
         msg.add_message(1, peer)
         msg.add_int64(2, self.random_id)
@@ -625,4 +727,79 @@ class LoadUsersRequest:
         msg = ProtobufMessage()
         for up in self.user_peers:
             msg.add_message(1, UserOutPeer(up["uid"], up.get("access_hash", 0)))
+        return msg.serialize()
+
+
+class SearchContactsRequest:
+    """Request for bale.users.v1.Users/SearchContacts.
+
+    Fields:
+      1: request (string)
+      2: optimizations (repeated int32)
+    """
+
+    def __init__(self, request: str, optimizations: Optional[List[int]] = None):
+        self.request = request
+        self.optimizations = optimizations or []
+
+    def serialize(self) -> bytes:
+        msg = ProtobufMessage()
+        msg.add_string(1, self.request)
+        for opt in self.optimizations:
+            msg.add_int32(2, opt)
+        return msg.serialize()
+
+class PhoneContact:
+    """Single phone contact entry for ImportContacts."""
+
+    def __init__(self, phone_number: int, name: Optional[str] = None):
+        self.phone_number = phone_number
+        self.name = name
+
+    def serialize(self) -> bytes:
+        msg = ProtobufMessage()
+        if self.phone_number:
+            msg.add_int64(1, self.phone_number)
+        if self.name:
+            msg.add_message(2, ProtobufMessage().add_string(1, self.name))
+        return msg.serialize()
+
+
+class ImportContactsRequest:
+    """Request for bale.users.v1.Users/ImportContacts.
+
+    Fields:
+      1: phones (repeated PhoneContact)
+      3: optimizations (repeated int32, packed)
+    """
+
+    def __init__(self, phones: List[PhoneContact], optimizations: Optional[List[int]] = None):
+        self.phones = phones
+        self.optimizations = optimizations or []
+
+    def serialize(self) -> bytes:
+        msg = ProtobufMessage()
+        for phone in self.phones:
+            msg.add_message(1, phone)
+        if self.optimizations:
+            msg.add_packed_int32(3, self.optimizations)
+        return msg.serialize()
+
+class GetContactsRequest:
+    """Request for bale.users.v1.Users/GetContacts.
+
+    Fields:
+      1: contactsHash (string)
+      2: optimizations (repeated int32, packed)
+    """
+
+    def __init__(self, contacts_hash: str = "", optimizations: Optional[List[int]] = None):
+        self.contacts_hash = contacts_hash
+        self.optimizations = optimizations or []
+
+    def serialize(self) -> bytes:
+        msg = ProtobufMessage()
+        msg.add_string(1, self.contacts_hash)
+        if self.optimizations:
+            msg.add_packed_int32(2, self.optimizations)
         return msg.serialize()

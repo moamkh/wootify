@@ -114,6 +114,15 @@ class ProtobufMessage:
             self._fields.append((field_number, 2, bytes(packed)))
         return self
 
+    def add_packed_int32(self, field_number: int, values: List[int]) -> "ProtobufMessage":
+        """Add a packed repeated int32 field (wire type 2 with packed varints)."""
+        if values:
+            packed = bytearray()
+            for v in values:
+                packed.extend(encode_varint(v))
+            self._fields.append((field_number, 2, bytes(packed)))
+        return self
+
     def serialize(self) -> bytes:
         result = bytearray()
         for field_number, wire_type, value in self._fields:

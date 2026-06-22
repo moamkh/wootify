@@ -60,13 +60,17 @@ def _parse_int64_value(data: bytes) -> Optional[int]:
 
 
 def parse_peer(data: bytes) -> Optional[Dict[str, Any]]:
-    """Parse Peer { type(1): int32, id(2): int64 }."""
+    """Parse Peer { type(1): int32, id(2): int64, access_hash(3): int64 }."""
     try:
         fields = ProtobufParser(data).parse()
-        return {
+        result: Dict[str, Any] = {
             "type": fields.get(1, [None])[0],
             "id": fields.get(2, [None])[0],
         }
+        access_hash = fields.get(3, [None])[0]
+        if isinstance(access_hash, int):
+            result["access_hash"] = access_hash
+        return result
     except Exception:
         return None
 
@@ -329,4 +333,106 @@ def parse_load_history_response(data: bytes) -> Dict[str, Any]:
                 result["history"].append(parsed)
     except Exception as exc:
         logger.warning("parse_load_history_response failed: %s", exc)
+    return result
+
+
+def parse_search_contacts_response(data: bytes) -> Dict[str, Any]:
+    """Parse SearchContacts response.
+
+    Response fields:
+      1: users (repeated User)
+      2: user_peers (repeated UserOutPeer)
+      4: groups (repeated Group)
+      5: group_peers (repeated GroupOutPeer)
+    """
+    result: Dict[str, Any] = {
+        "users": [],
+        "user_peers": [],
+        "groups": [],
+        "group_peers": [],
+    }
+    try:
+        fields = ProtobufParser(data).parse()
+        for raw in fields.get(1, []):
+            parsed = parse_user(raw) if isinstance(raw, bytes) else None
+            if parsed:
+                result["users"].append(parsed)
+        for raw in fields.get(2, []):
+            peer = parse_peer(raw) if isinstance(raw, bytes) else None
+            if peer:
+                result["user_peers"].append(peer)
+        for raw in fields.get(4, []):
+            parsed = parse_group(raw) if isinstance(raw, bytes) else None
+            if parsed:
+                result["groups"].append(parsed)
+        for raw in fields.get(5, []):
+            peer = parse_peer(raw) if isinstance(raw, bytes) else None
+            if peer:
+                result["group_peers"].append(peer)
+    except Exception as exc:
+        logger.warning("parse_search_contacts_response failed: %s", exc)
+    return result
+
+
+def parse_import_contacts_response(data: bytes) -> Dict[str, Any]:
+    """Parse ImportContacts response.
+
+    Response fields (from bale.users.v1.Users/ImportContacts):
+      1: users (repeated User)
+      2: seq (int32)
+      3: state (bytes)
+      4: user_peers (repeated UserOutPeer)
+    """
+    result: Dict[str, Any] = {
+        "users": [],
+        "seq": 0,
+        "state": b"",
+        "user_peers": [],
+    }
+    try:
+        fields = ProtobufParser(data).parse()
+        for raw in fields.get(1, []):
+            parsed = parse_user(raw) if isinstance(raw, bytes) else None
+            if parsed:
+                result["users"].append(parsed)
+        if 2 in fields:
+            result["seq"] = int(fields[2][0])
+        if 3 in fields:
+            result["state"] = fields[3][0]
+        for raw in fields.get(4, []):
+            peer = parse_peer(raw) if isinstance(raw, bytes) else None
+            if peer:
+                result["user_peers"].append(peer)
+    except Exception as exc:
+        logger.warning("parse_import_contacts_response failed: %s", exc)
+    return result
+
+
+def parse_get_contacts_response(data: bytes) -> Dict[str, Any]:
+    """Parse GetContacts response.
+
+    Response fields:
+      1: users (repeated User)
+      2: isNotChanged (bool)
+      3: user_peers (repeated UserOutPeer)
+    """
+    result: Dict[str, Any] = {
+        "users": [],
+        "is_not_changed": False,
+        "user_peers": [],
+    }
+    try:
+        fields = ProtobufParser(data).parse()
+        for raw in fields.get(1, []):
+            parsed = parse_user(raw) if isinstance(raw, bytes) else None
+            if parsed:
+                result["users"].append(parsed)
+        if 2 in fields:
+            result["is_not_changed"] = bool(fields[2][0])
+        for raw in fields.get(3, []):
+            peer = parse_peer(raw) if isinstance(raw, bytes) else None
+            if peer:
+                result["user_peers"].append(peer)
+    except Exception as exc:
+        logger.warning("parse_get_contacts_response failed: %s", exc)
     return result

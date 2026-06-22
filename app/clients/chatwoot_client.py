@@ -114,6 +114,7 @@ class ChatwootClient:
         data: Optional[Dict[str, Any]] = None,
         files: Any = None,
         log_http_error: bool = True,
+        retry_on_read_errors: bool = True,
     ) -> Any:
         """Internal helper to request with retry on transient errors."""
         import asyncio
@@ -195,7 +196,7 @@ class ChatwootClient:
                 return payload
 
             except httpx.ReadTimeout:
-                if attempt < 2:
+                if retry_on_read_errors and attempt < 2:
                     wait = 2 ** attempt
                     logger.warning(
                         "chatwoot.request retry timeout attempt=%s wait=%ss",
@@ -205,14 +206,15 @@ class ChatwootClient:
                     await asyncio.sleep(wait)
                     continue
                 logger.error(
-                    "chatwoot.request READ TIMEOUT target=%s elapsed=%ss",
+                    "chatwoot.request READ TIMEOUT target=%s elapsed=%ss retry=%s",
                     target,
                     round(time.monotonic() - start, 3),
+                    retry_on_read_errors,
                 )
                 raise
 
             except httpx.ReadError:
-                if attempt < 2:
+                if retry_on_read_errors and attempt < 2:
                     wait = 2 ** attempt
                     logger.warning(
                         "chatwoot.request retry read_error attempt=%s wait=%ss",
@@ -222,9 +224,10 @@ class ChatwootClient:
                     await asyncio.sleep(wait)
                     continue
                 logger.error(
-                    "chatwoot.request READ ERROR target=%s elapsed=%ss",
+                    "chatwoot.request READ ERROR target=%s elapsed=%ss retry=%s",
                     target,
                     round(time.monotonic() - start, 3),
+                    retry_on_read_errors,
                 )
                 raise
 
@@ -262,11 +265,16 @@ class ChatwootClient:
         conversation_id: int,
         data: Dict[str, Any],
     ) -> Any:
-        """Post message."""
+        """Post message.
+
+        Read timeouts are not retried because the request may have already
+        been processed by Chatwoot, which would create a duplicate message.
+        """
         return await self._request(
             "POST",
             f"/api/v1/accounts/{account_id}/conversations/{conversation_id}/messages",
             json_data=data,
+            retry_on_read_errors=False,
         )
 
     async def post_message_with_attachments(
@@ -276,7 +284,12 @@ class ChatwootClient:
         data: Dict[str, Any],
         attachments: list[tuple[str, bytes, Optional[str]]],
     ) -> Any:
-        """Post message with attachments."""
+        """Post message with attachments.
+
+        Read timeouts are not retried because the request body may have
+        already been accepted by Chatwoot, which would create a duplicate
+        message (especially visible for media/stickers/GIFs).
+        """
         files = [
             (
                 "attachments[]",
@@ -297,6 +310,7 @@ class ChatwootClient:
             f"/api/v1/accounts/{account_id}/conversations/{conversation_id}/messages",
             data=data,
             files=files,
+            retry_on_read_errors=False,
         )
 
     async def create_conversation(
@@ -392,12 +406,38 @@ class ChatwootClient:
         self,
         account_id: int,
         q: str,
+        page: int = 1,
     ) -> Any:
         """Search contacts."""
         return await self._request(
             "GET",
-            f"/api/v1/accounts/{account_id}/contacts/search?q={q}",
+            f"/api/v1/accounts/{account_id}/contacts/search?q={q}&page={page}",
         )
+
+    async def delete_contact(
+        self,
+        account_id: int,
+        contact_id: int,
+    ) -> Any:
+        """Delete a contact.
+
+        Treats 404 as success: the contact may have already been removed or
+        never existed on this Chatwoot account.
+        """
+        try:
+            return await self._request(
+                "DELETE",
+                f"/api/v1/accounts/{account_id}/contacts/{contact_id}",
+            )
+        except httpx.HTTPStatusError as exc:
+            if exc.response.status_code == 404:
+                logger.debug(
+                    "chatwoot.delete_contact_not_found account_id=%s contact_id=%s",
+                    account_id,
+                    contact_id,
+                )
+                return {"ok": True, "deleted": False, "reason": "not_found"}
+            raise
 
     async def list_contact_conversations(
         self,

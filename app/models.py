@@ -208,6 +208,11 @@ class Instance(Base):
         back_populates="instance",
         cascade="all, delete-orphan",
     )
+    bale_pv_phone_resolved_users = relationship(
+        "BalePvPhoneResolvedUser",
+        back_populates="instance",
+        cascade="all, delete-orphan",
+    )
 
 
 class InstanceFeatureOverride(Base):
@@ -270,6 +275,41 @@ class InstanceRuntimeState(Base):
     )
 
     instance = relationship("Instance", back_populates="runtime_state")
+
+
+class BalePvPhoneResolvedUser(Base):
+    """Cache of phone numbers resolved to Bale user_id/access_hash for outbound messaging."""
+
+    __tablename__ = "bale_pv_phone_resolved_users"
+    __table_args__ = (
+        UniqueConstraint(
+            "instance_id", "phone_number", name="uq_bale_pv_resolved_phone"
+        ),
+    )
+
+    id = Column(String(36), primary_key=True, default=_uuid)
+    instance_id = Column(
+        String(36),
+        ForeignKey("instances.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    phone_number = Column(String(32), nullable=False, index=True)
+    bale_user_id = Column(Integer, nullable=False)
+    access_hash = Column(String(128), nullable=True)
+    name = Column(String(256), nullable=True)
+    nick = Column(String(256), nullable=True)
+    created_at = Column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    updated_at = Column(
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=func.now(),
+        onupdate=func.now(),
+    )
+
+    instance = relationship("Instance", back_populates="bale_pv_phone_resolved_users")
 
 
 class Conversation(Base):
@@ -830,3 +870,44 @@ class EnterpriseTelegramPendingMessage(Base):
     )
 
     session = relationship("EnterpriseTelegramSession", back_populates="pending_messages")
+
+
+class BalePvPhoneMapping(Base):
+    """Maps a phone number to a Bale PV user_id/access_hash for outbound messaging."""
+
+    __tablename__ = "bale_pv_phone_mappings"
+    __table_args__ = (
+        UniqueConstraint(
+            "instance_id",
+            "phone_number",
+            name="uq_bale_pv_phone_mapping_instance_phone",
+        ),
+        UniqueConstraint(
+            "instance_id",
+            "bale_user_id",
+            name="uq_bale_pv_phone_mapping_instance_user",
+        ),
+    )
+
+    id = Column(String(36), primary_key=True, default=_uuid)
+    instance_id = Column(
+        String(36),
+        ForeignKey("instances.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    phone_number = Column(String(64), nullable=False, index=True)
+    bale_user_id = Column(String(64), nullable=False, index=True)
+    access_hash = Column(String(64), nullable=True)
+    display_name = Column(String(255), nullable=True)
+    created_at = Column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    updated_at = Column(
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=func.now(),
+        onupdate=func.now(),
+    )
+
+    instance = relationship("Instance", backref="bale_pv_phone_mappings")

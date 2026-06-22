@@ -12,6 +12,7 @@ export default function InstancesPage({
   onCreateEnterpriseInbox,
   onBalePvSyncContacts,
   onBalePvSyncDialogs,
+  onBalePvRemoveChatwootContacts,
   onDelete,
   PLATFORM_TELEGRAM,
   PLATFORM_BALE_ENTERPRISE,
@@ -198,6 +199,18 @@ export default function InstancesPage({
                       }}
                     >
                       Sync Dialogs
+                    </button>
+                  ) : null}
+                  {isBalePv && onBalePvRemoveChatwootContacts ? (
+                    <button
+                      className="btn danger"
+                      disabled={busy}
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        onBalePvRemoveChatwootContacts(item.instance_key);
+                      }}
+                    >
+                      Remove Chatwoot
                     </button>
                   ) : null}
                   <button

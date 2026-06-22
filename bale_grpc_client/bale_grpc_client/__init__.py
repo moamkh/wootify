@@ -45,10 +45,13 @@ __version__ = "0.1.0"
 
 from .auth_client import BaleAuthClient
 from .exceptions import BaleRpcError, BaleAuthError, BaleNotImplementedError
+from .update_parser import BaleUpdateType, parse_ws_update
 
 __all__ = [
     "BaleAuthClient",
     "BaleRpcError",
     "BaleAuthError",
     "BaleNotImplementedError",
+    "BaleUpdateType",
+    "parse_ws_update",
 ]

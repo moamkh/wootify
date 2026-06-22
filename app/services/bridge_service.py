@@ -6,6 +6,7 @@ Documentation Standard: module/class/public-method docstrings.
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 import mimetypes
 import re
@@ -18,7 +19,13 @@ from sqlalchemy.orm import Session
 from app.clients.chatwoot_client import ChatwootClient
 from app.config import settings
 from app.connectors.registry import connector_registry
-from app.models import MessageDirection, MessageKind, MessageStatus
+from app.models import (
+    BalePvPhoneResolvedUser,
+    Instance,
+    MessageDirection,
+    MessageKind,
+    MessageStatus,
+)
 from app.repositories.conversation_runtime_state_repository import ConversationRuntimeStateRepository
 from app.services.chatwoot_db_service import ChatwootDatabaseService
 from app.services.conversation_mapping_service import ConversationMappingService
@@ -356,6 +363,23 @@ class BridgeService:
             db.commit()
 
         await connector.connect(instance_key, runtime.platform_metadata, runtime.proxy)
+
+        phone_access_hash: Optional[int] = None
+        if platform_key == 'bale_pv_enterprise' and self._is_phone_number_destination(str(destination_chat_id)):
+            resolved_user = await self._resolve_bale_pv_phone(
+                db, runtime, connector, instance_key, str(destination_chat_id)
+            )
+            await self._update_chatwoot_contact_for_bale_pv_phone(
+                runtime, contact_id, resolved_user, str(destination_chat_id)
+            )
+            resolved_chat_id = str(resolved_user['id'])
+            if conversation.platform_conversation_id != resolved_chat_id:
+                conversation.platform_conversation_id = resolved_chat_id
+                db.commit()
+            destination_chat_id = resolved_chat_id
+            if resolved_user.get('access_hash'):
+                phone_access_hash = int(resolved_user['access_hash'])
+
         operator_name = self._extract_chatwoot_operator_name(payload)
         operator_note_text, operator_state_row, operator_state_value = self._resolve_operator_notification(
             db,
@@ -398,6 +422,7 @@ class BridgeService:
                         filename,
                         caption=content or None,
                         quoted=quoted,
+                        access_hash=phone_access_hash,
                     )
                     if index == 0:
                         platform_response = result if isinstance(result, dict) else {}
@@ -407,6 +432,7 @@ class BridgeService:
                     str(destination_chat_id),
                     content,
                     quoted=quoted,
+                    access_hash=phone_access_hash,
                 )
                 platform_response = result if isinstance(result, dict) else {}
 
@@ -513,6 +539,7 @@ class BridgeService:
                 first_name=shared_first_name,
                 last_name=shared_last_name,
                 additional_attributes=additional_attributes if additional_attributes else None,
+                chat_type=event.get('chat_type'),
             )
             remote_contact_conversations = await self._list_contact_conversations(
                 client,
@@ -599,6 +626,7 @@ class BridgeService:
                     first_name=shared_first_name,
                     last_name=shared_last_name,
                     additional_attributes=additional_attributes if additional_attributes else None,
+                    chat_type=event.get('chat_type'),
                 )
                 existing_contact_id = str(resolved_contact_id)
                 conversation = self._conversations.upsert(
@@ -609,6 +637,26 @@ class BridgeService:
                     chatwoot_contact_id=existing_contact_id,
                     chatwoot_inbox_id=str(inbox_id),
                 )
+            if existing_contact_id.isdigit():
+                # Re-sync contact name in case it changed on the platform side.
+                try:
+                    fetched_contact = await client.get_contact(account_id, int(existing_contact_id))
+                    fetched_payload = self._extract_contact_payload(fetched_contact) or {}
+                    await self._sync_contact_name_if_needed(
+                        client,
+                        account_id=account_id,
+                        contact_id=int(existing_contact_id),
+                        current_contact=fetched_payload,
+                        new_name=self._resolve_contact_name_from_event(event, platform_key, chat_id),
+                        additional_attributes=additional_attributes if additional_attributes else None,
+                    )
+                except Exception as exc:
+                    logger.debug(
+                        'failed to sync existing contact name instance=%s contact_id=%s error=%s',
+                        instance_key,
+                        existing_contact_id,
+                        exc,
+                    )
             if shared_phone_number and existing_contact_id.isdigit():
                 await self._sync_contact_phone_if_needed(
                     client,
@@ -794,6 +842,7 @@ class BridgeService:
             shared_last_name=shared_last_name,
             additional_attributes=additional_attributes if additional_attributes else None,
             chatwoot_parent_message_id=chatwoot_parent_message_id,
+            chat_type=event.get("chat_type"),
             data=data,
             attachments=attachments,
         )
@@ -942,6 +991,7 @@ class BridgeService:
         shared_last_name: Optional[str],
         additional_attributes: Optional[dict[str, Any]] = None,
         chatwoot_parent_message_id: Optional[str],
+        chat_type: Optional[str] = None,
         data: dict[str, Any],
         attachments: list[Any],
     ) -> tuple[Any, str, Any, Optional[str]]:
@@ -976,6 +1026,7 @@ class BridgeService:
             shared_first_name=shared_first_name,
             shared_last_name=shared_last_name,
             additional_attributes=additional_attributes if additional_attributes else None,
+            chat_type=chat_type,
         )
         recovered_conversation_id = str(recovered_conversation.chatwoot_conversation_id or '').strip()
         retry_data = dict(data)
@@ -1044,6 +1095,7 @@ class BridgeService:
         shared_first_name: Optional[str],
         shared_last_name: Optional[str],
         additional_attributes: Optional[dict[str, Any]] = None,
+        chat_type: Optional[str] = None,
     ):
         """Internal helper to recover when a mapped Chatwoot conversation has been deleted."""
         previous_chatwoot_conversation_id = str(conversation.chatwoot_conversation_id or '').strip()
@@ -1072,6 +1124,7 @@ class BridgeService:
                 first_name=shared_first_name,
                 last_name=shared_last_name,
                 additional_attributes=additional_attributes,
+                chat_type=chat_type,
             )
 
         remote_contact_conversations = await self._list_contact_conversations(
@@ -1208,6 +1261,155 @@ class BridgeService:
             'updated': updated,
             'failed': failed,
             'total': len(contacts),
+        }
+
+    async def remove_bale_pv_contacts_from_chatwoot(
+        self,
+        db: Session,
+        instance_key: str,
+        runtime: Any,
+        *,
+        dry_run: bool = False,
+    ) -> dict[str, Any]:
+        """Delete Chatwoot contacts whose identifier matches a Bale PV contact.
+
+        Fetches the current Bale PV contact list and the set of Chatwoot contacts
+        created from Bale PV (identifier prefix ``BALE_PV:``). Any Chatwoot contact
+        whose UID is still present in the Bale contact list is deleted.
+
+        Args:
+            db: SQLAlchemy session.
+            instance_key: Instance key.
+            runtime: Runtime instance.
+            dry_run: If True, report what would be deleted without deleting.
+
+        Returns:
+            Summary dict with ``deleted``, ``failed``, ``skipped``, ``total_bale``,
+            ``total_chatwoot``, and ``dry_run`` flags.
+        """
+        from app.connectors.bale_pv_connector import bale_pv
+
+        platform_key = self._platform_key(runtime)
+        if platform_key != 'bale_pv_enterprise':
+            return {'ok': False, 'detail': 'not_bale_pv_instance'}
+
+        account_id = int(runtime.chatwoot.get('account_id', 0))
+        inbox_id = int(runtime.chatwoot.get('inbox_id', 0))
+        if not account_id or not inbox_id:
+            return {'ok': False, 'detail': 'missing_account_or_inbox_id'}
+
+        await bale_pv.connect(instance_key, runtime.platform_metadata)
+        bale_result = await bale_pv.get_contacts(instance_key)
+        if not bale_result.get('ok'):
+            return {'ok': False, 'detail': bale_result.get('description', 'fetch_failed')}
+
+        bale_uids = {
+            str(contact.get('id')).strip()
+            for contact in bale_result.get('contacts', [])
+            if contact.get('id') is not None
+        }
+        if not bale_uids:
+            return {
+                'ok': True,
+                'deleted': 0,
+                'failed': 0,
+                'skipped': 0,
+                'total_bale': 0,
+                'total_chatwoot': 0,
+                'dry_run': dry_run,
+                'detail': 'no_bale_contacts',
+            }
+
+        client = self._get_chatwoot_client(runtime.chatwoot)
+        prefix = connector_registry.prefix(platform_key)
+        deleted = 0
+        failed = 0
+        skipped = 0
+        chatwoot_checked = 0
+        page = 1
+
+        import asyncio
+
+        while True:
+            try:
+                search_result = await client.search_contacts(account_id, prefix, page=page)
+            except Exception as exc:
+                logger.warning(
+                    'remove_bale_pv_contacts_search_failed instance=%s page=%s error=%s',
+                    instance_key,
+                    page,
+                    exc,
+                )
+                return {
+                    'ok': False,
+                    'detail': f'search_failed_page_{page}',
+                    'deleted': deleted,
+                    'failed': failed,
+                    'skipped': skipped,
+                }
+
+            payload = search_result.get('payload') if isinstance(search_result, dict) else None
+            if not isinstance(payload, list):
+                break
+
+            for contact in payload:
+                chatwoot_checked += 1
+                if not isinstance(contact, dict):
+                    continue
+                identifier = str(contact.get('identifier') or '').strip()
+                contact_id = self._extract_id(contact)
+                if not identifier or not contact_id:
+                    continue
+
+                # Only consider contacts with our prefix
+                if not identifier.startswith(f'{prefix}:'):
+                    continue
+
+                uid = identifier.split(':', 1)[1]
+                if uid not in bale_uids:
+                    skipped += 1
+                    continue
+
+                if dry_run:
+                    deleted += 1
+                    continue
+
+                try:
+                    await client.delete_contact(account_id, int(contact_id))
+                    deleted += 1
+                    logger.info(
+                        'remove_bale_pv_contact_deleted instance=%s contact_id=%s uid=%s',
+                        instance_key,
+                        contact_id,
+                        uid,
+                    )
+                except Exception as exc:
+                    failed += 1
+                    logger.warning(
+                        'remove_bale_pv_contact_failed instance=%s contact_id=%s uid=%s error=%s',
+                        instance_key,
+                        contact_id,
+                        uid,
+                        exc,
+                    )
+                await asyncio.sleep(0.5)
+
+            meta = search_result.get('meta') if isinstance(search_result, dict) else None
+            total_pages = meta.get('total_pages') if isinstance(meta, dict) else None
+            if total_pages and page >= int(total_pages):
+                break
+            if len(payload) == 0:
+                break
+            page += 1
+
+        return {
+            'ok': True,
+            'deleted': deleted,
+            'failed': failed,
+            'skipped': skipped,
+            'total_bale': len(bale_uids),
+            'total_chatwoot': chatwoot_checked,
+            'dry_run': dry_run,
         }
 
     async def sync_bale_dialogs_to_chatwoot(
@@ -1435,14 +1637,35 @@ class BridgeService:
         first_name: Optional[str] = None,
         last_name: Optional[str] = None,
         additional_attributes: Optional[dict[str, Any]] = None,
+        chat_type: Optional[str] = None,
     ) -> int:
         """Internal helper to get or create contact."""
         identifier = self._prefixed_identifier(platform_key, chat_id)
         normalized_phone = self._normalize_phone_number(phone_number)
-        resolved_name = str(first_name or from_name or chat_id).strip() or str(chat_id)
-        # Avoid using a raw numeric ID as the display name
-        if resolved_name == str(chat_id) and str(chat_id).isdigit():
-            resolved_name = f'{self._source_prefix(platform_key).title()} User {chat_id}'
+
+        chat_kind = str(chat_type or 'user').strip().lower()
+        if chat_kind in ('group', 'channel'):
+            label = 'Group' if chat_kind == 'group' else 'Channel'
+            title = str(first_name or from_name or '').strip()
+            # Avoid using a raw numeric ID as the display name.
+            if not title or title == str(chat_id):
+                source = self._source_prefix(platform_key).title()
+                resolved_name = f'{source} {label} {chat_id}'
+            elif (
+                f'({chat_kind})' in title
+                or f'({label.lower()})' in title
+                or title.lower().startswith(label.lower())
+            ):
+                # Already carries a group/channel label (e.g. sync_bale_dialogs format)
+                resolved_name = title
+            else:
+                resolved_name = f'({label.lower()}) {title}'
+        else:
+            resolved_name = str(first_name or from_name or chat_id).strip() or str(chat_id)
+            # Avoid using a raw numeric ID as the display name.
+            if resolved_name == str(chat_id) and str(chat_id).isdigit():
+                source = self._source_prefix(platform_key).title()
+                resolved_name = f'{source} User {chat_id}'
         try:
             found = await client.search_contacts(account_id, identifier)
             payload = found.get('payload') if isinstance(found, dict) else None
@@ -1529,20 +1752,46 @@ class BridgeService:
         new_name: str,
         additional_attributes: Optional[dict[str, Any]] = None,
     ) -> None:
-        """Update contact name if current name is just a numeric ID and we now have a real name."""
+        """Update contact name when it has changed on the platform side.
+
+        Updates in two cases:
+        1. Current Chatwoot name is generic (raw ID, "Bale User 123", etc.).
+        2. Current name differs from the new resolved name and the new name is
+           not generic (i.e. a real name/username was discovered).
+
+        This keeps Chatwoot contacts in sync with Bale display-name changes
+        without overwriting manually-set names with generic fallbacks.
+        """
         current_name = str(current_contact.get('name') or '').strip()
-        # Skip if we don't have a better name
         if not new_name or new_name == current_name:
             return
-        # Update if current name is empty, a raw numeric ID, or a generic fallback
-        is_generic = (
-            not current_name
-            or current_name.isdigit()
-            or 'User' in current_name
-            or 'Contact' in current_name
+
+        generic_pattern = re.compile(r'^(Bale\s+)?(User|Group|Channel)\s+\d+$', re.IGNORECASE)
+        is_generic_name = lambda value: (
+            not value
+            or value.isdigit()
+            or bool(generic_pattern.match(value))
+            or re.fullmatch(r'\(group\)\s+\d+|\(channel\)\s+\d+', value, re.IGNORECASE) is not None
+            or re.fullmatch(r'User\s+\d+', value, re.IGNORECASE) is not None
         )
-        if not is_generic:
+
+        is_current_generic = is_generic_name(current_name)
+        is_new_generic = is_generic_name(new_name)
+
+        # Never overwrite with a generic fallback.
+        if is_new_generic:
             return
+
+        # Update if current is generic or if the platform name actually changed.
+        if not is_current_generic and current_name:
+            logger.info(
+                'chatwoot contact name changed account_id=%s contact_id=%s old_name=%s new_name=%s',
+                account_id,
+                contact_id,
+                current_name,
+                new_name,
+            )
+
         update_payload: dict[str, Any] = {'name': new_name}
         if additional_attributes:
             update_payload['additional_attributes'] = additional_attributes
@@ -2477,6 +2726,34 @@ class BridgeService:
 
         return None
 
+    def _resolve_contact_name_from_event(
+        self,
+        event: dict[str, Any],
+        platform_key: str,
+        chat_id: str,
+    ) -> str:
+        """Resolve the best contact name for a Chatwoot contact from an incoming event."""
+        chat_type = str(event.get('chat_type') or 'user').strip().lower()
+        from_name = str(event.get('from_name') or '').strip()
+        source_prefix = self._source_prefix(platform_key).title()
+
+        if chat_type in ('group', 'channel'):
+            label = 'Group' if chat_type == 'group' else 'Channel'
+            if not from_name or from_name == str(chat_id):
+                return f'{source_prefix} {label} {chat_id}'
+            if (
+                f'({chat_type})' in from_name
+                or f'({label.lower()})' in from_name
+                or from_name.lower().startswith(label.lower())
+            ):
+                return from_name
+            return f'({label.lower()}) {from_name}'
+
+        resolved_name = from_name or str(chat_id)
+        if resolved_name == str(chat_id) and str(chat_id).isdigit():
+            return f'{source_prefix} User {chat_id}'
+        return resolved_name
+
     @staticmethod
     def _platform_key(runtime: Any) -> str:
         """Internal helper to platform key."""
@@ -2579,6 +2856,105 @@ class BridgeService:
                     continue
                 return candidate
         return None
+
+    @staticmethod
+    def _is_phone_number_destination(value: Optional[str]) -> bool:
+        """Return True if the destination looks like a raw phone number."""
+        if not value:
+            return False
+        digits = re.sub(r"\D", "", str(value))
+        # Iranian mobile numbers, possibly international
+        return bool(re.match(r"^\+?98\d{10}$", str(value).strip())) or bool(
+            re.match(r"^98\d{10}$", digits)
+        )
+
+    def _normalize_bale_pv_phone(self, phone: str) -> str:
+        """Normalize phone number to 98XXXXXXXXXX digits."""
+        digits = re.sub(r"\D", "", str(phone or "").strip())
+        if digits.startswith("0") and len(digits) == 11:
+            digits = "98" + digits[1:]
+        return digits
+
+    async def _resolve_bale_pv_phone(
+        self,
+        db: Session,
+        runtime: Any,
+        connector: Any,
+        instance_key: str,
+        phone_number: str,
+    ) -> Dict[str, Any]:
+        """Resolve a phone number to a Bale user, caching the result locally."""
+        from bale_grpc_client.dialog_parser import parse_import_contacts_response
+
+        normalized = self._normalize_bale_pv_phone(phone_number)
+        cached = (
+            db.query(BalePvPhoneResolvedUser)
+            .filter_by(instance_id=runtime.instance.id, phone_number=normalized)
+            .first()
+        )
+        if cached:
+            return {
+                "id": cached.bale_user_id,
+                "access_hash": cached.access_hash,
+                "name": cached.name,
+                "nick": cached.nick,
+            }
+
+        user = await connector.resolve_phone_to_user(instance_key, normalized)
+        if not user or not user.get("id"):
+            raise RuntimeError(f"Could not resolve Bale user for phone {normalized}")
+
+        access_hash = user.get("access_hash")
+        access_hash_str = str(access_hash) if access_hash is not None else None
+        cached = BalePvPhoneResolvedUser(
+            instance_id=runtime.instance.id,
+            phone_number=normalized,
+            bale_user_id=int(user["id"]),
+            access_hash=access_hash_str,
+            name=user.get("name"),
+            nick=user.get("nick"),
+        )
+        db.add(cached)
+        db.commit()
+        return {
+            "id": int(user["id"]),
+            "access_hash": access_hash_str,
+            "name": user.get("name"),
+            "nick": user.get("nick"),
+        }
+
+    async def _update_chatwoot_contact_for_bale_pv_phone(
+        self,
+        runtime: Any,
+        chatwoot_contact_id: Optional[str],
+        resolved_user: Dict[str, Any],
+        phone_number: str,
+    ) -> None:
+        """Update the Chatwoot contact with the resolved Bale identifier and name."""
+        if not chatwoot_contact_id:
+            return
+        try:
+            client = self._get_chatwoot_client(runtime.chatwoot)
+            account_id = int(runtime.chatwoot.get("account_id"))
+            contact_id = int(chatwoot_contact_id)
+            name = resolved_user.get("name") or resolved_user.get("nick") or f"User {resolved_user['id']}"
+            identifier = connector_registry.prefixed_source_id("bale_pv_enterprise", str(resolved_user["id"]))
+            await client.update_contact(
+                account_id,
+                contact_id,
+                {
+                    "name": name,
+                    "identifier": identifier,
+                    "phone_number": self._normalize_bale_pv_phone(phone_number),
+                },
+            )
+        except Exception as exc:
+            logger.warning(
+                "failed to update chatwoot contact for bale pv phone instance=%s contact_id=%s error=%s",
+                runtime.instance.instance_key,
+                chatwoot_contact_id,
+                exc,
+            )
 
     def _find_existing_contact_conversation(
         self,

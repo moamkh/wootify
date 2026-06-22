@@ -23,6 +23,7 @@ export default function InstanceWorkspacePage({
   enterpriseManualsCount,
   onBalePvSyncContacts,
   onBalePvSyncDialogs,
+  onBalePvRemoveChatwootContacts,
 }) {
   const tabs = isEnterprisePlatform
     ? [
@@ -38,7 +39,7 @@ export default function InstanceWorkspacePage({
 
   return (
     <div className="workspace-layout">
-      <InstanceDetailHero {...heroProps} onBalePvSyncContacts={onBalePvSyncContacts} onBalePvSyncDialogs={onBalePvSyncDialogs} />
+      <InstanceDetailHero {...heroProps} onBalePvSyncContacts={onBalePvSyncContacts} onBalePvSyncDialogs={onBalePvSyncDialogs} onBalePvRemoveChatwootContacts={onBalePvRemoveChatwootContacts} />
 
       <section className="card workspace-switcher">
         <div className="section-heading compact-heading">

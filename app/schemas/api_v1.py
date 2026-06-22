@@ -384,3 +384,15 @@ class BalePvSyncDialogsResponse(BaseModel):
     failed: int = 0
     dialogs: int = 0
     messages_imported: int = 0
+
+
+class BalePvRemoveChatwootContactsResponse(BaseModel):
+    """Response schema for removing Bale PV contacts from Chatwoot."""
+    message: str
+    detail: Optional[str] = None
+    deleted: int = 0
+    failed: int = 0
+    skipped: int = 0
+    total_bale: int = 0
+    total_chatwoot: int = 0
+    dry_run: bool = False

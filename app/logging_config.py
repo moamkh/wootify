@@ -7,10 +7,12 @@ Documentation Standard: module/class/public-method docstrings.
 from __future__ import annotations
 
 import logging
+import logging.handlers
 import sys
+from pathlib import Path
 from typing import Optional
 
-from app.config import settings
+from app.config import repo_root, settings
 
 
 def _parse_log_level(level: str) -> int:
@@ -72,7 +74,12 @@ def _stream_supports_color(stream: Optional[object]) -> bool:
 
 
 def configure_logging() -> None:
-    """Configure logging."""
+    """Configure logging.
+
+    Logs are emitted to stderr (with optional color) and appended to the file
+    configured by ``LOG_FILE_PATH``. The file handler rotates when it reaches
+    ``LOG_FILE_MAX_BYTES`` and keeps ``LOG_FILE_BACKUP_COUNT`` backups.
+    """
     level = _parse_log_level(settings.LOG_LEVEL)
 
     root = logging.getLogger()
@@ -95,6 +102,26 @@ def configure_logging() -> None:
             bool(settings.LOG_COLOR_FORCE) or _stream_supports_color(getattr(handler, "stream", None))
         )
         handler.setFormatter(ColorFormatter(fmt=fmt, datefmt=datefmt, use_color=use_color))
+
+    # Add a rotating file handler so backend logs persist across restarts.
+    log_file_path = str(settings.LOG_FILE_PATH or "").strip()
+    if log_file_path:
+        log_file = Path(log_file_path)
+        if not log_file.is_absolute():
+            log_file = repo_root / log_file
+        try:
+            log_file.parent.mkdir(parents=True, exist_ok=True)
+            file_handler = logging.handlers.RotatingFileHandler(
+                filename=str(log_file),
+                mode="a",
+                maxBytes=int(settings.LOG_FILE_MAX_BYTES or 0) or 10 * 1024 * 1024,
+                backupCount=int(settings.LOG_FILE_BACKUP_COUNT or 0),
+                encoding="utf-8",
+            )
+            file_handler.setFormatter(logging.Formatter(fmt=fmt, datefmt=datefmt))
+            root.addHandler(file_handler)
+        except Exception as exc:
+            logging.warning("Failed to configure file logging at %s: %s", log_file_path, exc)
 
     # Keep noisy deps quieter. When redacting secrets, never enable verbose HTTP/SQL
     # logs (they may include full URLs with tokens or SQL params).
