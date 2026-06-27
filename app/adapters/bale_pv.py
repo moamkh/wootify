@@ -252,6 +252,22 @@ class BalePvAdapter(BasePlatformAdapter):
             "outgoing": is_outgoing,
             "raw": raw_update,
         }
+
+        # For groups/channels, also expose the actual sender as a separate contact
+        # so Chatwoot agents can open a private 1-on-1 conversation with them.
+        if chat_type in ("group", "channel") and sender_id is not None:
+            sender_access_hash = None
+            if str(sender_id) in self._access_hash_cache:
+                sender_access_hash = self._access_hash_cache[str(sender_id)]
+            sender_contact_name = sender_name or sender_username or f"Bale User {sender_id}"
+            event["sender_contact"] = {
+                "identifier": f"BALE_PV:{sender_id}",
+                "name": sender_contact_name,
+                "phone_number": (contact or {}).get("phone_number"),
+                "username": sender_username or None,
+                "access_hash": sender_access_hash,
+            }
+
         return event
 
     def get_self_id(self) -> Optional[str]:

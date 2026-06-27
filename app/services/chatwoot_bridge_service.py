@@ -74,7 +74,7 @@ class ChatwootBridgeService:
         )
 
         # 1. Get or create contact
-        contact_id = await self._get_or_create_contact(
+        contact_id, _ = await self._get_or_create_contact(
             client,
             account_id=account_id,
             inbox_id=inbox_id,
@@ -84,6 +84,53 @@ class ChatwootBridgeService:
             chat_type=chat_type,
             platform_key=platform_key,
         )
+
+        # 1b. For group/channel messages, also create/update a contact for the
+        # actual sender so agents can start private conversations with members.
+        sender_contact = event.get("sender_contact")
+        if sender_contact and chat_type in ("group", "channel"):
+            sender_chat_id = str(sender_contact.get("identifier") or "").split(":")[-1]
+            if sender_chat_id:
+                try:
+                    sender_avatar_bytes: Optional[bytes] = None
+                    sender_avatar_filename = "avatar.jpg"
+                    runtime = get_runtime(instance_key)
+                    if runtime and runtime.platform_type.key == platform_key:
+                        from app.connectors.bale_pv_connector import bale_pv
+                        sender_avatar_bytes, sender_avatar_ct = await bale_pv.get_user_avatar_bytes(
+                            instance_key, int(sender_chat_id)
+                        )
+                        if sender_avatar_ct and "/" in sender_avatar_ct:
+                            ext = sender_avatar_ct.split("/")[-1].split("+")[0]
+                            if ext in ("jpeg", "jpg", "png", "gif", "webp"):
+                                sender_avatar_filename = f"avatar.{ext}"
+
+                    sender_contact_id, sender_created = await self._get_or_create_contact(
+                        client,
+                        account_id=account_id,
+                        inbox_id=inbox_id,
+                        chat_id=sender_chat_id,
+                        from_name=str(sender_contact.get("name") or "").strip() or f"Bale User {sender_chat_id}",
+                        phone_number=sender_contact.get("phone_number"),
+                        chat_type="private",
+                        platform_key=platform_key,
+                        avatar_bytes=sender_avatar_bytes if sender_created else None,
+                        avatar_filename=sender_avatar_filename,
+                    )
+                    logger.info(
+                        "chatwoot_bridge.sender_contact_ready instance=%s sender_id=%s chatwoot_contact_id=%s created=%s",
+                        instance_key,
+                        sender_chat_id,
+                        sender_contact_id,
+                        sender_created,
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        "chatwoot_bridge.sender_contact_failed instance=%s sender_id=%s error=%s",
+                        instance_key,
+                        sender_chat_id,
+                        exc,
+                    )
 
         # 2. Get or create conversation
         conversation = await self._get_or_create_conversation(
@@ -245,21 +292,26 @@ class ChatwootBridgeService:
         chatwoot_contact_id = sender.get("id")
 
         peer_id: Optional[str] = None
+        identifier_is_phone = False
         if identifier:
-            peer_id = self._strip_source_prefix(str(identifier))
+            stripped_identifier = self._strip_source_prefix(str(identifier))
+            if self._is_phone_number_destination(stripped_identifier):
+                # The contact identifier itself is a raw phone number; resolve it.
+                peer_id = stripped_identifier
+                identifier_is_phone = True
+            else:
+                peer_id = stripped_identifier
         elif phone_number:
             peer_id = str(phone_number).lstrip("+")
 
         if not peer_id:
             return {"ok": False, "detail": "peer_id_not_found"}
 
-        # For Bale PV, a contact with only a phone number must be resolved to
-        # its Bale user id before we can send. The resolved id is also written
-        # back to the Chatwoot contact identifier for future messages.
+        # For Bale PV, a phone-number destination must be resolved to its Bale
+        # user id before we can send. The resolved id is also written back to the
+        # Chatwoot contact identifier for future messages.
         if (
             runtime.platform_type == "bale_pv_enterprise"
-            and not identifier
-            and phone_number
             and self._is_phone_number_destination(peer_id)
         ):
             original_peer_id = peer_id
@@ -351,8 +403,17 @@ class ChatwootBridgeService:
         phone_number: Optional[str] = None,
         chat_type: str = "private",
         platform_key: str = "bale_pv_enterprise",
-    ) -> int:
-        """Find or create a Chatwoot contact for this chat."""
+        avatar_bytes: Optional[bytes] = None,
+        avatar_filename: str = "avatar.jpg",
+    ) -> tuple[int, bool]:
+        """Find or create a Chatwoot contact for this chat.
+
+        If ``avatar_bytes`` is provided and a new contact is created, the avatar
+        is uploaded immediately. For existing contacts the avatar is left alone
+        to avoid overwriting user-changed photos on every message.
+
+        Returns ``(contact_id, created)``.
+        """
         prefixed_identifier = connector_registry.prefixed_source_id(platform_key, chat_id)
         try:
             found = await client.search_contacts(account_id, prefixed_identifier)
@@ -361,7 +422,7 @@ class ChatwootBridgeService:
                 first = payload[0] if isinstance(payload[0], dict) else {}
                 cid = self._extract_id(first)
                 if cid:
-                    return int(cid)
+                    return int(cid), False
         except Exception:
             pass
 
@@ -377,7 +438,21 @@ class ChatwootBridgeService:
         cid = self._extract_id(created) or self._extract_id((created or {}).get("payload"))
         if not cid:
             raise RuntimeError("Failed to create Chatwoot contact")
-        return int(cid)
+
+        if avatar_bytes:
+            try:
+                await client.update_contact_avatar(
+                    account_id, int(cid), avatar_bytes, filename=avatar_filename
+                )
+            except Exception as exc:
+                logger.warning(
+                    "chatwoot_bridge.avatar_upload_failed account_id=%s contact_id=%s error=%s",
+                    account_id,
+                    cid,
+                    exc,
+                )
+
+        return int(cid), True
 
     async def _get_or_create_conversation(
         self,

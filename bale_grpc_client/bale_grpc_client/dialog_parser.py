@@ -59,6 +59,54 @@ def _parse_int64_value(data: bytes) -> Optional[int]:
         return None
 
 
+def _parse_avatar(data: bytes) -> Optional[Dict[str, Any]]:
+    """Parse Avatar message (best-effort).
+
+    Common observed layout:
+      1: id/photo_id (int64)
+      2: access_hash (int64)
+      3: volume_id (int64)
+      4: local_id (int32)
+      5: dc_id (int32)
+    The exact field numbers may vary; log raw bytes for unknown layouts.
+    """
+    try:
+        fields = ProtobufParser(data).parse()
+    except Exception as exc:
+        logger.debug("parse_avatar parse_failed: %s", exc)
+        return None
+
+    # Collect all int64 candidates; commonly photo_id is field 1 and
+    # access_hash is field 2.
+    candidates: Dict[str, Any] = {}
+    for field_num in (1, 2, 3, 4, 5):
+        vals = fields.get(field_num)
+        if vals:
+            val = vals[0]
+            if isinstance(val, int):
+                candidates[f"field_{field_num}"] = val
+            elif isinstance(val, bytes):
+                candidates[f"field_{field_num}_hex"] = val.hex()
+
+    if not candidates:
+        logger.debug("parse_avatar unknown_layout hex=%s", data.hex())
+        return None
+
+    # Best-effort semantic mapping based on observed Bale schemas.
+    result: Dict[str, Any] = {"raw": data.hex()}
+    if 1 in fields:
+        result["photo_id"] = fields[1][0]
+    if 2 in fields:
+        result["access_hash"] = fields[2][0]
+    if 3 in fields:
+        result["volume_id"] = fields[3][0]
+    if 4 in fields:
+        result["local_id"] = fields[4][0]
+    if 5 in fields:
+        result["dc_id"] = fields[5][0]
+    return result
+
+
 def parse_peer(data: bytes) -> Optional[Dict[str, Any]]:
     """Parse Peer { type(1): int32, id(2): int64, access_hash(3): int64 }."""
     try:
@@ -94,7 +142,7 @@ def parse_user(data: bytes) -> Optional[Dict[str, Any]]:
     """
     try:
         fields = ProtobufParser(data).parse()
-        return {
+        result = {
             "id": fields.get(1, [None])[0],
             "access_hash": fields.get(2, [None])[0],
             "name": _decode_str(fields.get(3, [None])[0]),
@@ -105,6 +153,11 @@ def parse_user(data: bytes) -> Optional[Dict[str, Any]]:
             "is_deleted": _parse_bool_value(fields.get(16, [None])[0]) if 16 in fields else None,
             "created_at": _parse_int64_value(fields.get(19, [None])[0]) if 19 in fields else None,
         }
+        if 6 in fields:
+            avatar = _parse_avatar(fields[6][0])
+            if avatar:
+                result["avatar"] = avatar
+        return result
     except Exception as exc:
         logger.debug("parse_user failed: %s", exc)
         return None

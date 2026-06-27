@@ -1144,16 +1144,44 @@ class BalePvConnector:
         except asyncio.TimeoutError:
             pass
 
-        # First-pass parse to discover unknown senders.
+        # First-pass parse to discover unknown senders and missing group titles.
         for raw in raw_updates:
             parsed = self._parse_raw_update(raw, runtime.user_cache, runtime.self_user_id, runtime.chat_title_cache)
             if parsed:
                 updates.append(parsed)
 
+        # Resolve missing group/channel titles on demand so Chatwoot contacts
+        # show real names instead of "Group {id}" / "Channel {id}".
+        missing_group_peers: Dict[int, int] = {}
+        for up in updates:
+            message = up.get("message") or {}
+            chat = message.get("chat") or {}
+            chat_type = str(chat.get("type") or "").lower()
+            title = str(chat.get("title") or "").strip()
+            chat_id = chat.get("id")
+            if chat_type in ("group", "channel") and chat_id is not None:
+                try:
+                    peer_id = int(chat_id)
+                except (ValueError, TypeError):
+                    continue
+                if title.startswith("Group ") or title.startswith("Channel "):
+                    peer_type = 3 if chat_type == "channel" else 2
+                    missing_group_peers[peer_id] = peer_type
+
+        if missing_group_peers:
+            self._logger.info(
+                "bale_pv resolving_missing_group_titles instance=%s peers=%s",
+                instance,
+                sorted(missing_group_peers.keys()),
+            )
+            for peer_id, peer_type in missing_group_peers.items():
+                await self._resolve_group_title(instance, peer_id, peer_type)
+
         # Resolve names for senders not in the contact cache.
         user_info_map = await self._resolve_unknown_sender_info(runtime, updates)
-        if user_info_map:
-            # Re-parse with resolved user info so names/usernames are accurate.
+        if user_info_map or missing_group_peers:
+            # Re-parse with resolved user info and updated title cache so
+            # names and group titles are accurate.
             updates = []
             for raw in raw_updates:
                 parsed = self._parse_raw_update(
@@ -1895,6 +1923,171 @@ class BalePvConnector:
         if not runtime:
             return None
         return runtime.user_cache.get(user_id)
+
+    async def get_user_avatar_bytes(
+        self,
+        instance: str,
+        user_id: int,
+    ) -> Tuple[Optional[bytes], Optional[str]]:
+        """Fetch a user's profile avatar bytes and content type, if available.
+
+        Loads the user profile via ``LoadUsers``, parses the ``Avatar`` field,
+        then downloads the photo through the Nasim file URL endpoint.
+        Returns ``(bytes, content_type)`` or ``(None, None)`` when no avatar
+        is available or the download fails.
+        """
+        from bale_grpc_client.dialog_parser import parse_load_users_response
+
+        runtime = self._get_runtime(instance)
+        if runtime.auth_state != "authenticated" or runtime.client is None:
+            return None, None
+
+        try:
+            raw = await runtime.client.load_users([{"uid": int(user_id)}])
+        except Exception as exc:
+            self._logger.warning(
+                "bale_pv get_user_avatar load_users_failed instance=%s user_id=%s error=%s",
+                instance,
+                user_id,
+                exc,
+            )
+            return None, None
+
+        try:
+            parsed = parse_load_users_response(raw)
+        except Exception as exc:
+            self._logger.warning(
+                "bale_pv get_user_avatar parse_failed instance=%s user_id=%s error=%s",
+                instance,
+                user_id,
+                exc,
+            )
+            return None, None
+
+        user = None
+        for u in parsed.get("users", []):
+            if u.get("id") == user_id:
+                user = u
+                break
+
+        if not user:
+            return None, None
+
+        avatar = user.get("avatar")
+        if not avatar:
+            self._logger.debug(
+                "bale_pv get_user_avatar no_avatar instance=%s user_id=%s",
+                instance,
+                user_id,
+            )
+            return None, None
+
+        photo_id = avatar.get("photo_id")
+        access_hash = avatar.get("access_hash")
+        if photo_id is None:
+            self._logger.debug(
+                "bale_pv get_user_avatar no_photo_id instance=%s user_id=%s avatar=%s",
+                instance,
+                user_id,
+                avatar,
+            )
+            return None, None
+
+        file_id_payload = json.dumps({
+            "file_id": int(photo_id),
+            "access_hash": int(access_hash) if access_hash is not None else 0,
+            "peer_id": int(user_id),
+            "file_storage_version": 1,
+        })
+        try:
+            content, content_type, _ = await self.download_file_by_id(
+                instance, file_id_payload
+            )
+        except Exception as exc:
+            self._logger.warning(
+                "bale_pv get_user_avatar download_failed instance=%s user_id=%s error=%s",
+                instance,
+                user_id,
+                exc,
+            )
+            return None, None
+
+        if content:
+            self._logger.info(
+                "bale_pv get_user_avatar ok instance=%s user_id=%s size=%s ctype=%s",
+                instance,
+                user_id,
+                len(content),
+                content_type,
+            )
+        return content, content_type
+
+    async def _resolve_group_title(
+        self,
+        instance: str,
+        peer_id: int,
+        peer_type: int,
+    ) -> Optional[str]:
+        """Fetch a group/channel title on demand when it is not cached.
+
+        Calls ``LoadDialogs`` and searches the response for the requested
+        peer. If found, the title is stored in ``runtime.chat_title_cache``
+        and the raw title (without the ``(group)`` / ``(channel)`` label) is
+        returned. Returns ``None`` when the dialog cannot be fetched or the
+        peer is not present.
+        """
+        from bale_grpc_client.dialog_parser import parse_load_dialogs_response
+        from bale_grpc_client.messaging_messages import Peer
+
+        runtime = self._get_runtime(instance)
+        if runtime.auth_state != "authenticated" or runtime.client is None:
+            return None
+
+        try:
+            raw = await runtime.client.load_dialogs(limit=200)
+        except Exception as exc:
+            self._logger.warning(
+                "bale_pv resolve_group_title load_dialogs_failed instance=%s peer_id=%s error=%s",
+                instance,
+                peer_id,
+                exc,
+            )
+            return None
+
+        try:
+            parsed = parse_load_dialogs_response(raw)
+        except Exception as exc:
+            self._logger.warning(
+                "bale_pv resolve_group_title parse_failed instance=%s peer_id=%s error=%s",
+                instance,
+                peer_id,
+                exc,
+            )
+            return None
+
+        groups = parsed.get("groups", [])
+        for g in groups:
+            gid = g.get("id")
+            if gid is not None and int(gid) == peer_id:
+                title = g.get("title") or ""
+                if title:
+                    label = "channel" if peer_type == Peer.PEER_TYPE_CHANNEL else "group"
+                    runtime.chat_title_cache[peer_id] = f"({label}) {title}"
+                    self._logger.info(
+                        "bale_pv resolve_group_title ok instance=%s peer_id=%s title=%s",
+                        instance,
+                        peer_id,
+                        title,
+                    )
+                    return title
+                break
+
+        self._logger.debug(
+            "bale_pv resolve_group_title not_found instance=%s peer_id=%s",
+            instance,
+            peer_id,
+        )
+        return None
 
     # ------------------------------------------------------------------
     # Internal WebSocket listener

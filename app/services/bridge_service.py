@@ -1188,9 +1188,17 @@ class BridgeService:
     ) -> dict[str, Any]:
         """Fetch all Bale PV contacts and ensure each exists in Chatwoot.
 
+        On the first run (``contacts_first_synced_at`` is null), names, phones
+        and avatars are synced. On later runs only missing contacts are created
+        and phones are reconciled; names/avatars are left alone so manual edits
+        in Chatwoot are preserved.
+
         Returns a summary dict with counts of created, updated, and failed contacts.
         """
+        import datetime as _dt
+
         from app.connectors.bale_pv_connector import bale_pv
+        from app.repositories.runtime_state_repository import RuntimeStateRepository
 
         platform_key = self._platform_key(runtime)
         if platform_key != 'bale_pv_enterprise':
@@ -1200,6 +1208,11 @@ class BridgeService:
         inbox_id = int(runtime.chatwoot.get('inbox_id', 0))
         if not account_id or not inbox_id:
             return {'ok': False, 'detail': 'missing_account_or_inbox_id'}
+
+        state_repo = RuntimeStateRepository(db)
+        runtime_state = state_repo.get_or_create(str(runtime.instance.id))
+        is_first_sync = runtime_state.contacts_first_synced_at is None
+        skip_profile_sync = not is_first_sync
 
         # Ensure connector is initialized
         await bale_pv.connect(instance_key, runtime.platform_metadata)
@@ -1230,7 +1243,26 @@ class BridgeService:
                 payload = found.get('payload') if isinstance(found, dict) else None
                 was_existing = isinstance(payload, list) and payload and self._extract_id(payload[0])
 
-                await self._get_or_create_contact(
+                avatar_bytes: Optional[bytes] = None
+                avatar_filename = 'avatar.jpg'
+                if is_first_sync and not was_existing:
+                    try:
+                        avatar_bytes, avatar_ct = await bale_pv.get_user_avatar_bytes(
+                            instance_key, int(uid)
+                        )
+                        if avatar_ct and '/' in avatar_ct:
+                            ext = avatar_ct.split('/')[-1].split('+')[0]
+                            if ext in ('jpeg', 'jpg', 'png', 'gif', 'webp'):
+                                avatar_filename = f"avatar.{ext}"
+                    except Exception as exc:
+                        logger.debug(
+                            'sync_bale_pv_contact_avatar_failed instance=%s uid=%s error=%s',
+                            instance_key,
+                            uid,
+                            exc,
+                        )
+
+                contact_id = await self._get_or_create_contact(
                     client,
                     account_id=account_id,
                     inbox_id=inbox_id,
@@ -1238,7 +1270,24 @@ class BridgeService:
                     platform_key=platform_key,
                     from_name=name or None,
                     first_name=name or None,
+                    skip_profile_sync=skip_profile_sync,
                 )
+
+                # On first sync, upload the Bale avatar for both new and existing
+                # contacts. On later runs we skip avatars to preserve edits.
+                if is_first_sync and avatar_bytes and contact_id:
+                    try:
+                        await client.update_contact_avatar(
+                            account_id, int(contact_id), avatar_bytes, filename=avatar_filename
+                        )
+                    except Exception as exc:
+                        logger.debug(
+                            'sync_bale_pv_contact_avatar_update_failed instance=%s uid=%s error=%s',
+                            instance_key,
+                            uid,
+                            exc,
+                        )
+
                 if was_existing:
                     updated += 1
                 else:
@@ -1254,6 +1303,18 @@ class BridgeService:
                 failed += 1
             # Rate-limit: pause 2.0s between contacts to avoid hammering Chatwoot
             await asyncio.sleep(2.0)
+
+        if is_first_sync:
+            runtime_state.contacts_first_synced_at = _dt.datetime.now(_dt.timezone.utc)
+            state_repo.save(runtime_state)
+            db.commit()
+            logger.info(
+                'sync_bale_pv_contacts_first_sync_complete instance=%s total=%s created=%s updated=%s',
+                instance_key,
+                len(contacts),
+                created,
+                updated,
+            )
 
         return {
             'ok': True,
@@ -1638,8 +1699,14 @@ class BridgeService:
         last_name: Optional[str] = None,
         additional_attributes: Optional[dict[str, Any]] = None,
         chat_type: Optional[str] = None,
+        skip_profile_sync: bool = False,
     ) -> int:
-        """Internal helper to get or create contact."""
+        """Internal helper to get or create contact.
+
+        When ``skip_profile_sync`` is True, existing contacts are not renamed
+        and additional attributes are not refreshed; only phone sync and
+        missing-contact creation are performed.
+        """
         identifier = self._prefixed_identifier(platform_key, chat_id)
         normalized_phone = self._normalize_phone_number(phone_number)
 
@@ -1673,14 +1740,15 @@ class BridgeService:
                 first = payload[0] if isinstance(payload[0], dict) else {}
                 cid = self._extract_id(first)
                 if cid:
-                    await self._sync_contact_name_if_needed(
-                        client,
-                        account_id=account_id,
-                        contact_id=int(cid),
-                        current_contact=first,
-                        new_name=resolved_name,
-                        additional_attributes=additional_attributes,
-                    )
+                    if not skip_profile_sync:
+                        await self._sync_contact_name_if_needed(
+                            client,
+                            account_id=account_id,
+                            contact_id=int(cid),
+                            current_contact=first,
+                            new_name=resolved_name,
+                            additional_attributes=additional_attributes,
+                        )
                     await self._sync_contact_phone_if_needed(
                         client,
                         account_id=account_id,

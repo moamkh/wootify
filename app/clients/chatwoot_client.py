@@ -391,6 +391,46 @@ class ChatwootClient:
                 )
             raise
 
+    async def update_contact_avatar(
+        self,
+        account_id: int,
+        contact_id: int,
+        image_bytes: bytes,
+        filename: str = "avatar.jpg",
+    ) -> Any:
+        """Upload a binary avatar image for a contact.
+
+        Chatwoot expects a multipart/form-data PUT/PATCH with field name ``avatar``.
+        """
+        path = f"/api/v1/accounts/{account_id}/contacts/{contact_id}"
+        files = {
+            "avatar": (filename, image_bytes, "image/jpeg"),
+        }
+        try:
+            return await self._request(
+                "PUT",
+                path,
+                files=files,
+                log_http_error=False,
+            )
+        except httpx.HTTPStatusError as exc:
+            response = exc.response
+            status = response.status_code if response is not None else None
+            if status in {404, 405, 422}:
+                logger.warning(
+                    "chatwoot.update_contact_avatar put_failed account_id=%s contact_id=%s status=%s retry=PATCH",
+                    account_id,
+                    contact_id,
+                    status,
+                )
+                return await self._request(
+                    "PATCH",
+                    path,
+                    files=files,
+                    log_http_error=False,
+                )
+            raise
+
     async def get_contact(
         self,
         account_id: int,
