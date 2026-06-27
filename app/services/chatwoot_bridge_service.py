@@ -68,13 +68,43 @@ class ChatwootBridgeService:
         chat_type = str(event.get("chat_type") or "private").lower()
         from_name = str(event.get("from_name") or "").strip() or chat_id
         platform_key = "bale_pv_enterprise"
+
+        # Proactively resolve group/channel titles if the name still looks generic.
+        # This handles cases where the connector's title cache missed and the
+        # on-demand resolution in get_updates also failed or was skipped.
+        if (
+            chat_type in ("group", "channel")
+            and chat_id.isdigit()
+            and (from_name.startswith("Group ") or from_name.startswith("Channel "))
+        ):
+            try:
+                from app.connectors.bale_pv_connector import bale_pv
+                peer_type = 3 if chat_type == "channel" else 2
+                resolved_title = await bale_pv.resolve_group_title(
+                    instance_key, int(chat_id), peer_type
+                )
+                if resolved_title:
+                    from_name = resolved_title
+                    logger.info(
+                        "chatwoot_bridge.resolved_group_title instance=%s chat_id=%s title=%s",
+                        instance_key,
+                        chat_id,
+                        resolved_title,
+                    )
+            except Exception as exc:
+                logger.debug(
+                    "chatwoot_bridge.resolve_group_title_failed instance=%s chat_id=%s error=%s",
+                    instance_key,
+                    chat_id,
+                    exc,
+                )
         source_id = connector_registry.prefixed_source_id(
             platform_key,
             str(event.get("platform_message_id") or event.get("message_id") or ""),
         )
 
         # 1. Get or create contact
-        contact_id, _ = await self._get_or_create_contact(
+        contact_id, contact_created = await self._get_or_create_contact(
             client,
             account_id=account_id,
             inbox_id=inbox_id,
@@ -84,6 +114,38 @@ class ChatwootBridgeService:
             chat_type=chat_type,
             platform_key=platform_key,
         )
+
+        # If we resolved a better group/channel title, update an existing generic
+        # contact name so old "Group {id}" contacts are renamed automatically.
+        if (
+            not contact_created
+            and chat_type in ("group", "channel")
+            and not self._is_generic_contact_name(from_name)
+        ):
+            try:
+                current = await client.get_contact(account_id, contact_id)
+                current_name = ""
+                if isinstance(current, dict):
+                    payload = current.get("payload") or current
+                    current_name = str(payload.get("name") or "").strip()
+                if self._is_generic_contact_name(current_name):
+                    await client.update_contact(
+                        account_id, contact_id, {"name": from_name}
+                    )
+                    logger.info(
+                        "chatwoot_bridge.renamed_generic_group_contact instance=%s chat_id=%s contact_id=%s new_name=%s",
+                        instance_key,
+                        chat_id,
+                        contact_id,
+                        from_name,
+                    )
+            except Exception as exc:
+                logger.debug(
+                    "chatwoot_bridge.rename_group_contact_failed instance=%s chat_id=%s error=%s",
+                    instance_key,
+                    chat_id,
+                    exc,
+                )
 
         # 1b. For group/channel messages, also create/update a contact for the
         # actual sender so agents can start private conversations with members.
@@ -95,7 +157,7 @@ class ChatwootBridgeService:
                     sender_avatar_bytes: Optional[bytes] = None
                     sender_avatar_filename = "avatar.jpg"
                     runtime = get_runtime(instance_key)
-                    if runtime and runtime.platform_type.key == platform_key:
+                    if runtime and str(runtime.platform_type) == platform_key:
                         from app.connectors.bale_pv_connector import bale_pv
                         sender_avatar_bytes, sender_avatar_ct = await bale_pv.get_user_avatar_bytes(
                             instance_key, int(sender_chat_id)
@@ -792,6 +854,25 @@ class ChatwootBridgeService:
         conv = payload.get("conversation") or {}
         meta = conv.get("meta") or {}
         return meta.get("sender") or {}
+
+    @staticmethod
+    def _is_generic_contact_name(value: Optional[str]) -> bool:
+        """Return True if the Chatwoot contact name is a generated placeholder."""
+        if not value:
+            return True
+        name = str(value).strip()
+        generic_prefixes = (
+            "Group ",
+            "Channel ",
+            "Bale Group ",
+            "Bale Channel ",
+            "Bale User ",
+            "User ",
+        )
+        for prefix in generic_prefixes:
+            if name.startswith(prefix):
+                return True
+        return False
 
     @staticmethod
     def _is_phone_number_destination(value: Optional[str]) -> bool:

@@ -2022,7 +2022,7 @@ class BalePvConnector:
             )
         return content, content_type
 
-    async def _resolve_group_title(
+    async def resolve_group_title(
         self,
         instance: str,
         peer_id: int,
@@ -2030,8 +2030,8 @@ class BalePvConnector:
     ) -> Optional[str]:
         """Fetch a group/channel title on demand when it is not cached.
 
-        Calls ``LoadDialogs`` and searches the response for the requested
-        peer. If found, the title is stored in ``runtime.chat_title_cache``
+        Tries ``LoadDialogs`` with increasing limits and filters until the peer
+        is found. If found, the title is stored in ``runtime.chat_title_cache``
         and the raw title (without the ``(group)`` / ``(channel)`` label) is
         returned. Returns ``None`` when the dialog cannot be fetched or the
         peer is not present.
@@ -2041,53 +2041,110 @@ class BalePvConnector:
 
         runtime = self._get_runtime(instance)
         if runtime.auth_state != "authenticated" or runtime.client is None:
-            return None
-
-        try:
-            raw = await runtime.client.load_dialogs(limit=200)
-        except Exception as exc:
-            self._logger.warning(
-                "bale_pv resolve_group_title load_dialogs_failed instance=%s peer_id=%s error=%s",
+            self._logger.debug(
+                "bale_pv resolve_group_title not_authenticated instance=%s peer_id=%s",
                 instance,
                 peer_id,
-                exc,
             )
             return None
 
-        try:
-            parsed = parse_load_dialogs_response(raw)
-        except Exception as exc:
-            self._logger.warning(
-                "bale_pv resolve_group_title parse_failed instance=%s peer_id=%s error=%s",
+        cached = runtime.chat_title_cache.get(peer_id)
+        if cached:
+            for label in ("(group)", "(channel)"):
+                if cached.startswith(label):
+                    title = cached[len(label):].strip()
+                    if title and not title.isdigit():
+                        return title
+            if cached and not cached.isdigit():
+                return cached
+
+        async def _try_load(limit: int, dialog_type: int = 0) -> Optional[str]:
+            try:
+                raw = await runtime.client.load_dialogs(limit=limit, dialog_type=dialog_type)
+            except Exception as exc:
+                self._logger.warning(
+                    "bale_pv resolve_group_title load_dialogs_failed instance=%s peer_id=%s limit=%s dialog_type=%s error=%s",
+                    instance,
+                    peer_id,
+                    limit,
+                    dialog_type,
+                    exc,
+                )
+                return None
+
+            try:
+                parsed = parse_load_dialogs_response(raw)
+            except Exception as exc:
+                self._logger.warning(
+                    "bale_pv resolve_group_title parse_failed instance=%s peer_id=%s error=%s",
+                    instance,
+                    peer_id,
+                    exc,
+                )
+                return None
+
+            self._logger.debug(
+                "bale_pv resolve_group_title load_dialogs_result instance=%s peer_id=%s limit=%s dialog_type=%s dialogs=%s groups=%s",
                 instance,
                 peer_id,
-                exc,
+                limit,
+                dialog_type,
+                len(parsed.get("dialogs", [])),
+                len(parsed.get("groups", [])),
             )
+
+            # Search groups list first.
+            for g in parsed.get("groups", []):
+                gid = g.get("id")
+                if gid is not None and int(gid) == peer_id:
+                    title = g.get("title") or ""
+                    if title:
+                        return title
+                    break
+
+            # Some servers put the title only in the dialog entry; search there too.
+            for d in parsed.get("dialogs", []):
+                peer = (d.get("peer") or {})
+                if int(peer.get("id") or 0) == peer_id and int(peer.get("type") or 0) == peer_type:
+                    title = d.get("title") or d.get("raw_name") or ""
+                    if title:
+                        return title
+
             return None
 
-        groups = parsed.get("groups", [])
-        for g in groups:
-            gid = g.get("id")
-            if gid is not None and int(gid) == peer_id:
-                title = g.get("title") or ""
-                if title:
-                    label = "channel" if peer_type == Peer.PEER_TYPE_CHANNEL else "group"
-                    runtime.chat_title_cache[peer_id] = f"({label}) {title}"
-                    self._logger.info(
-                        "bale_pv resolve_group_title ok instance=%s peer_id=%s title=%s",
-                        instance,
-                        peer_id,
-                        title,
-                    )
-                    return title
+        title = None
+        for limit in (200, 500, 1000):
+            title = await _try_load(limit)
+            if title:
                 break
 
-        self._logger.debug(
+        # Last resort: try dialog_type-specific queries.
+        if not title:
+            for dtype in (peer_type, 0):
+                title = await _try_load(500, dialog_type=dtype)
+                if title:
+                    break
+
+        if title:
+            label = "channel" if peer_type == Peer.PEER_TYPE_CHANNEL else "group"
+            runtime.chat_title_cache[peer_id] = f"({label}) {title}"
+            self._logger.info(
+                "bale_pv resolve_group_title ok instance=%s peer_id=%s title=%s",
+                instance,
+                peer_id,
+                title,
+            )
+            return title
+
+        self._logger.warning(
             "bale_pv resolve_group_title not_found instance=%s peer_id=%s",
             instance,
             peer_id,
         )
         return None
+
+    # Backwards-compatible alias for internal callers.
+    _resolve_group_title = resolve_group_title
 
     # ------------------------------------------------------------------
     # Internal WebSocket listener
