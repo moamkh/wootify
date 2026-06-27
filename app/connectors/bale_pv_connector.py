@@ -1241,10 +1241,19 @@ class BalePvConnector:
         if peer_type in (2, 3) and isinstance(sender_peer_uid, int):
             sender_uid = sender_peer_uid
 
-        is_outgoing = self_user_id is not None and (
-            sender_uid == self_user_id
-            or parsed.get("sender_peer_uid") == self_user_id
-        )
+        # Detect whether this is an outgoing echo (a message sent from another
+        # Bale client that the server mirrors back to keep all sessions in sync).
+        # For group messages, sender_uid was already overridden to sender_peer_uid
+        # above, so a plain equality check covers both private and group cases.
+        #
+        # IMPORTANT: Do NOT use "sender_peer_uid == self_user_id" here.  For
+        # incoming private messages, Bale populates field 9 with the RECIPIENT's
+        # peer info (i.e. the authenticated account), so sender_peer_uid equals
+        # self_user_id even for genuinely incoming messages.  Including that
+        # condition in the OR would wrongly flag every incoming 1-on-1 message as
+        # outgoing, causing the contact to be named after the authenticated
+        # account instead of the actual sender.
+        is_outgoing = self_user_id is not None and sender_uid == self_user_id
 
         # Determine chat_id based on peer type
         if is_outgoing:

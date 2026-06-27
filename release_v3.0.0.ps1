@@ -19,7 +19,7 @@ Write-Host "Staged OK" -ForegroundColor Green
 
 Write-Host "`n=== Step 3: Commit ===" -ForegroundColor Cyan
 $msg = @"
-feat(release): v3.0.0 — bale_pv connector, sticker support, docs cleanup
+feat(release): v3.0.0 — bale_pv connector, sticker support, contact name fix
 
 BREAKING CHANGES
 - bale_pv_enterprise connector is now feature-complete with full media
@@ -30,14 +30,32 @@ BREAKING CHANGES
   field 12) and legacy DocumentMessage stickers (sticker*.png with
   image/jpeg MIME) through filename-prefix fallback detection.
 
+BUG FIXES
+- Fixed: first incoming Bale message created a Chatwoot contact named
+  after the authenticated instance (the bot account) instead of the
+  actual sender.
+  Root cause: in _parse_raw_update, the is_outgoing flag incorrectly
+  included "or sender_peer_uid == self_user_id". For incoming private
+  messages, Bale populates UpdateMessage field 9 with the RECIPIENT's
+  peer info (the authenticated account), so sender_peer_uid equals
+  self_user_id even for truly incoming messages. This caused is_outgoing
+  to be True, which then used peer_id (== self_user_id) as chat_id, and
+  get_user_name(self_user_id) returned the bot's own name.
+  Fix 1 (bale_pv_connector.py): removed the or-clause; for group
+  messages sender_uid is already overridden to sender_peer_uid before
+  the check, so a plain sender_uid == self_user_id is sufficient.
+  Fix 2 (bale_pv.py): added a defensive guard in normalize_incoming_update
+  that drops any outgoing-branch update where chat_id == self_uid to
+  prevent the authenticated account's name ever appearing as a contact.
+
 IMPROVEMENTS
 - bale_grpc_client: parse_ws_update handles StickerMessage (field 12),
   forward headers (field 7), reply-to refs (field 13), channel messages
   (field 162), and all known wrapper event types.
 - BalePvAdapter.resolve_attachments: WEBP detection via magic bytes;
-  WEBP→JPEG conversion with alpha-channel compositing; filename
+  WEBP->JPEG conversion with alpha-channel compositing; filename
   extension normalisation to match actual content type.
-- EnterpriseBaleService._extract_attachments: WEBP→JPEG conversion
+- EnterpriseBaleService._extract_attachments: WEBP->JPEG conversion
   added to mirror the bale_pv adapter pipeline.
 - ws_client.py: BALE_WS_DEBUG_LOG now defaults to empty string
   (disabled) — was previously "bale_ws_debug.log", which generated
@@ -63,7 +81,7 @@ if ($LASTEXITCODE -ne 0) { Write-Host "git commit failed" -ForegroundColor Red; 
 Write-Host "Committed OK" -ForegroundColor Green
 
 Write-Host "`n=== Step 4: Create annotated tag v3.0.0 ===" -ForegroundColor Cyan
-git tag -a v3.0.0 -m "Release v3.0.0 — bale_pv connector with full sticker/media support"
+git tag -a v3.0.0 -m "Release v3.0.0 — bale_pv connector, sticker support, contact name fix"
 if ($LASTEXITCODE -ne 0) { Write-Host "git tag failed" -ForegroundColor Red; exit 1 }
 Write-Host "Tagged OK" -ForegroundColor Green
 

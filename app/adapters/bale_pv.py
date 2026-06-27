@@ -194,6 +194,20 @@ class BalePvAdapter(BasePlatformAdapter):
         elif is_outgoing:
             # Outgoing private message echo: the Chatwoot contact is the recipient,
             # not the sender (us). Prefer the cached contact name from Bale.
+            #
+            # Safety guard: if chat_id resolves to the authenticated account's own
+            # UID (which would happen if is_outgoing was incorrectly set for an
+            # incoming message whose peer field points to self), skip the update
+            # entirely.  Creating a contact named after the authenticated instance
+            # is always wrong; "Saved Messages" echoes should not appear in Chatwoot.
+            self_uid = bale_pv.get_self_user_id(self.instance_key)
+            if self_uid is not None and chat_id == str(self_uid):
+                logger.debug(
+                    "bale_pv_adapter_skip_self_echo instance=%s chat_id=%s",
+                    self.instance_key,
+                    chat_id,
+                )
+                return None
             recipient_name = bale_pv.get_user_name(self.instance_key, int(chat_id)) if chat_id.isdigit() else None
             from_name = recipient_name or f"Bale User {chat_id}"
         else:
