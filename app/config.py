@@ -45,6 +45,7 @@ class Settings(BaseSettings):
     BALE_FILE_BASE_URL: str = 'https://tapi.bale.ai/file'
     BALE_POLL_INTERVAL_SECONDS: int = 5
     BALE_LONG_POLL_TIMEOUT_SECONDS: int = 25
+    BALE_PV_MEDIA_UPLOAD_TIMEOUT_SECONDS: int = 60
     BALE_SHARE_PHONE_BUTTON: bool = True
     BALE_SHARE_PHONE_BUTTON_TEXT: str = 'Share phone number'
     BALE_START_MESSAGE_TEXT: str = 'Send message and wait for our operators to respond pls'

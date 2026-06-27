@@ -758,39 +758,83 @@ class BalePvConnector:
         else:
             jwt = jwt_raw[4:] if jwt_raw.startswith("jwt:") else jwt_raw
 
-        async with httpx.AsyncClient(follow_redirects=True) as client:
-            # Establish cookie session
-            cookie_resp = await client.post(
-                "https://next-ws.bale.ai/set-cookie/",
-                headers={
-                    "Authorization": f"Bearer {jwt}",
-                    "Origin": "https://web.bale.ai",
-                },
-            )
+        upload_timeout = settings.BALE_PV_MEDIA_UPLOAD_TIMEOUT_SECONDS
+        async with httpx.AsyncClient(
+            follow_redirects=True,
+            timeout=upload_timeout,
+        ) as client:
+            # Establish cookie session with retries on transient network errors.
+            cookie_resp = None
+            last_cookie_err = None
+            for attempt in range(1, 4):
+                try:
+                    cookie_resp = await client.post(
+                        "https://next-ws.bale.ai/set-cookie/",
+                        headers={
+                            "Authorization": f"Bearer {jwt}",
+                            "Origin": "https://web.bale.ai",
+                        },
+                    )
+                    break
+                except (httpx.ConnectTimeout, httpx.ConnectError, httpx.ReadTimeout) as exc:
+                    last_cookie_err = exc
+                    self._logger.warning(
+                        "bale_pv set_cookie_retry instance=%s attempt=%s/%s error=%s",
+                        instance,
+                        attempt,
+                        3,
+                        exc,
+                    )
+                    if attempt < 3:
+                        await asyncio.sleep(2 ** attempt)
+            if cookie_resp is None:
+                raise RuntimeError(
+                    f"Bale set-cookie failed after retries: {last_cookie_err}"
+                )
             if cookie_resp.status_code != 200:
                 raise RuntimeError(
                     f"Bale set-cookie failed: HTTP {cookie_resp.status_code}"
                 )
 
-            # Call GetNasimFileUploadUrl
-            resp = await client.post(
-                "https://next-ws.bale.ai/ai.bale.server.Files/GetNasimFileUploadUrl",
-                content=grpc_web_frame(req.serialize()),
-                headers={
-                    "content-type": "application/grpc-web+proto",
-                    "x-grpc-web": "1",
-                    "mt_app_version": "157595",
-                    "app_version": "157595",
-                    "browser_type": "1",
-                    "mt_browser_type": "1",
-                    "browser_version": "148.0.0.0",
-                    "mt_browser_version": "148.0.0.0",
-                    "os_type": "3",
-                    "mt_os_type": "3",
-                    "session_id": str(int(time.time() * 1000)),
-                    "mt_session_id": str(int(time.time() * 1000)),
-                },
-            )
+            # Call GetNasimFileUploadUrl with retries on transient network errors.
+            resp = None
+            last_upload_url_err = None
+            for attempt in range(1, 4):
+                try:
+                    resp = await client.post(
+                        "https://next-ws.bale.ai/ai.bale.server.Files/GetNasimFileUploadUrl",
+                        content=grpc_web_frame(req.serialize()),
+                        headers={
+                            "content-type": "application/grpc-web+proto",
+                            "x-grpc-web": "1",
+                            "mt_app_version": "157595",
+                            "app_version": "157595",
+                            "browser_type": "1",
+                            "mt_browser_type": "1",
+                            "browser_version": "148.0.0.0",
+                            "mt_browser_version": "148.0.0.0",
+                            "os_type": "3",
+                            "mt_os_type": "3",
+                            "session_id": str(int(time.time() * 1000)),
+                            "mt_session_id": str(int(time.time() * 1000)),
+                        },
+                    )
+                    break
+                except (httpx.ConnectTimeout, httpx.ConnectError, httpx.ReadTimeout) as exc:
+                    last_upload_url_err = exc
+                    self._logger.warning(
+                        "bale_pv get_upload_url_retry instance=%s attempt=%s/%s error=%s",
+                        instance,
+                        attempt,
+                        3,
+                        exc,
+                    )
+                    if attempt < 3:
+                        await asyncio.sleep(2 ** attempt)
+            if resp is None:
+                raise RuntimeError(
+                    f"GetNasimFileUploadUrl failed after retries: {last_upload_url_err}"
+                )
 
             msg, status, grpc_msg = parse_grpc_web_response(resp.content)
             self._logger.info(
@@ -868,14 +912,21 @@ class BalePvConnector:
             # Upload file bytes via PUT (matching Balethon behaviour).
             # The signed URL was requested for a specific Content-Type, so we
             # must include it (and Content-Length) in the PUT.
-            upload_resp = await client.put(
-                upload_url,
-                content=file_bytes,
-                headers={
-                    "content-type": mime_type,
-                    "content-length": str(len(file_bytes)),
-                },
-            )
+            try:
+                upload_resp = await client.put(
+                    upload_url,
+                    content=file_bytes,
+                    headers={
+                        "content-type": mime_type,
+                        "content-length": str(len(file_bytes)),
+                    },
+                )
+            except (httpx.ConnectTimeout, httpx.ConnectError, httpx.ReadTimeout, httpx.WriteTimeout) as exc:
+                raise RuntimeError(
+                    f"File upload to Nasim timed out (size={len(file_bytes)} bytes, "
+                    f"timeout={upload_timeout}s). Consider increasing "
+                    f"BALE_PV_MEDIA_UPLOAD_TIMEOUT_SECONDS: {exc}"
+                ) from exc
             if upload_resp.status_code not in (200, 201, 204):
                 raise RuntimeError(
                     f"File upload to Nasim failed: HTTP {upload_resp.status_code} - {upload_resp.text[:200]}"
