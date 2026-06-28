@@ -677,6 +677,38 @@ def _parse_contact_status_update(data: bytes) -> Optional[Dict[str, Any]]:
         return None
 
 
+def _parse_peer_info(data: bytes) -> Optional[Dict[str, Any]]:
+    """Parse UpdateMessage field 14 (peer info) looking for chat title/name.
+
+    Observed structure varies; common fields include:
+      1: title or name (string)
+      2: peer id (int64)
+      3: peer type (int32)
+      4..n: unknown flags/access_hash/etc.
+    We return any string fields we can decode so callers can pick the best title.
+    """
+    try:
+        fields = ProtobufParser(data).parse()
+        result: Dict[str, Any] = {"raw_fields": {k: v for k, v in fields.items()}}
+        strings: List[str] = []
+        for k, vals in fields.items():
+            for v in vals:
+                if isinstance(v, bytes):
+                    try:
+                        s = v.decode("utf-8", errors="replace")
+                        if s:
+                            strings.append(s)
+                    except Exception:
+                        pass
+        if strings:
+            result["strings"] = strings
+            result["title"] = strings[0]
+        return result
+    except Exception as exc:
+        logger.debug("parse_peer_info failed: %s", exc)
+        return None
+
+
 def _parse_read_receipt_update(data: bytes) -> Optional[Dict[str, Any]]:
     """Parse wrapper field 50 read-receipt frames.
 
@@ -832,6 +864,13 @@ def parse_ws_update(data: bytes) -> Optional[Dict[str, Any]]:
             # Field 13 appears to be a reply-to reference message:
             #   {1: reply_to_msg_id (int64), 2: access_hash or peer_id (int64)}
             reply_ref_bytes = update.get(13, [None])[0]
+
+            # Field 14 carries peer info (chat/group title, access hash, etc.).
+            peer_info_bytes = update.get(14, [None])[0]
+            if isinstance(peer_info_bytes, bytes) and peer_info_bytes:
+                peer_info = _parse_peer_info(peer_info_bytes)
+                if peer_info:
+                    result["peer_info"] = peer_info
 
             # Log any unknown fields in UpdateMessage (could signal edits/deletes)
             known_update_fields = {1, 2, 3, 4, 5, 7, 9, 13, 14}

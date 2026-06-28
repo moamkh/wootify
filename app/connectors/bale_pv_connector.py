@@ -1372,6 +1372,19 @@ class BalePvConnector:
         # Build a chat title so the Chatwoot contact name can be labeled correctly.
         # For groups/channels this is the group/channel title; for PV it is the peer's name.
         _chat_title_cache = chat_title_cache or {}
+
+        # Updates sometimes carry the authoritative peer info (title, etc.) in
+        # field 14. Extract and cache it immediately so we don't need later RPCs.
+        peer_info_title = ""
+        peer_info = parsed.get("peer_info") or {}
+        if isinstance(peer_info, dict):
+            info_title = peer_info.get("title") or ""
+            if info_title and isinstance(info_title, str):
+                peer_info_title = info_title.strip()
+        if peer_info_title and peer_type in (1, 2, 3):
+            label = "channel" if peer_type == 3 else ("group" if peer_type == 2 else "private")
+            _chat_title_cache[int(chat_id)] = f"({label}) {peer_info_title}"
+
         if peer_type == 1:
             title_peer_id = int(peer_id) if is_outgoing else sender_uid
             chat_title = _chat_title_cache.get(int(title_peer_id), "")
@@ -2022,24 +2035,6 @@ class BalePvConnector:
             )
         return content, content_type
 
-    def _configured_group_title(self, peer_id: int) -> Optional[str]:
-        """Return a hard-coded group title from settings, if present.
-
-        ``BALE_PV_GROUP_TITLES_JSON`` should be a JSON object mapping
-        numeric group IDs to titles, e.g.:
-        ``{"395054013": "testprivategroup", "1678156035": "testpublicgroup"}``
-        """
-        raw = str(settings.BALE_PV_GROUP_TITLES_JSON or "").strip()
-        if not raw:
-            return None
-        try:
-            mapping = json.loads(raw)
-            if isinstance(mapping, dict):
-                return str(mapping.get(str(peer_id), "")).strip() or None
-        except Exception:
-            pass
-        return None
-
     async def resolve_group_title(
         self,
         instance: str,
@@ -2048,38 +2043,19 @@ class BalePvConnector:
     ) -> Optional[str]:
         """Fetch a group/channel title on demand when it is not cached.
 
-        Tries ``LoadDialogs`` with increasing limits and filters until the peer
-        is found. If found, the title is stored in ``runtime.chat_title_cache``
-        and the raw title (without the ``(group)`` / ``(channel)`` label) is
-        returned. Returns ``None`` when the dialog cannot be fetched or the
-        peer is not present.
+        Probes several Bale RPCs and parameter combinations because different
+        account types / sessions require different calls to retrieve chat
+        metadata. Logs every attempt so we can identify what works for a given
+        deployment.
         """
-        from bale_grpc_client.dialog_parser import parse_load_dialogs_response
+        from bale_grpc_client.dialog_parser import (
+            parse_load_dialogs_response,
+            parse_load_history_response,
+        )
         from bale_grpc_client.messaging_messages import Peer
-
-        # Allow operators to hard-code group titles via env/config. This is the
-        # most reliable source when Bale's dialog/history APIs return empty.
-        configured_title = self._configured_group_title(peer_id)
-        if configured_title:
-            self._logger.info(
-                "bale_pv resolve_group_title configured instance=%s peer_id=%s title=%s",
-                instance,
-                peer_id,
-                configured_title,
-            )
-            runtime = self._get_runtime(instance)
-            if runtime:
-                label = "channel" if peer_type == Peer.PEER_TYPE_CHANNEL else "group"
-                runtime.chat_title_cache[peer_id] = f"({label}) {configured_title}"
-            return configured_title
 
         runtime = self._get_runtime(instance)
         if runtime.auth_state != "authenticated" or runtime.client is None:
-            self._logger.debug(
-                "bale_pv resolve_group_title not_authenticated instance=%s peer_id=%s",
-                instance,
-                peer_id,
-            )
             return None
 
         cached = runtime.chat_title_cache.get(peer_id)
@@ -2092,115 +2068,141 @@ class BalePvConnector:
             if cached and not cached.isdigit():
                 return cached
 
-        async def _try_load(limit: int, dialog_type: int = 0, optimizations: Optional[List[int]] = None) -> Optional[str]:
-            try:
-                raw = await runtime.client.load_dialogs(limit=limit, dialog_type=dialog_type, optimizations=optimizations)
-            except Exception as exc:
-                self._logger.warning(
-                    "bale_pv resolve_group_title load_dialogs_failed instance=%s peer_id=%s limit=%s dialog_type=%s error=%s",
-                    instance,
-                    peer_id,
-                    limit,
-                    dialog_type,
-                    exc,
-                )
-                return None
-
+        def _extract_title_from_dialogs(raw: bytes) -> Optional[str]:
             try:
                 parsed = parse_load_dialogs_response(raw)
-            except Exception as exc:
-                self._logger.warning(
-                    "bale_pv resolve_group_title parse_failed instance=%s peer_id=%s error=%s",
-                    instance,
-                    peer_id,
-                    exc,
-                )
+            except Exception:
                 return None
-
-            self._logger.debug(
-                "bale_pv resolve_group_title load_dialogs_result instance=%s peer_id=%s limit=%s dialog_type=%s optimizations=%s dialogs=%s groups=%s",
-                instance,
-                peer_id,
-                limit,
-                dialog_type,
-                optimizations,
-                len(parsed.get("dialogs", [])),
-                len(parsed.get("groups", [])),
-            )
-
-            # Search groups list first.
             for g in parsed.get("groups", []):
                 gid = g.get("id")
                 if gid is not None and int(gid) == peer_id:
                     title = g.get("title") or ""
                     if title:
                         return title
-                    break
-
-            # Some servers put the title only in the dialog entry; search there too.
             for d in parsed.get("dialogs", []):
-                peer = (d.get("peer") or {})
-                if int(peer.get("id") or 0) == peer_id and int(peer.get("type") or 0) == peer_type:
+                peer = d.get("peer") or {}
+                if int(peer.get("id") or 0) == peer_id:
                     title = d.get("title") or d.get("raw_name") or ""
                     if title:
                         return title
-
             return None
 
-        title = None
-        for limit in (200, 500, 1000):
-            title = await _try_load(limit)
-            if title:
-                break
-
-        # Some servers require an optimizations flag to return any dialogs.
-        if not title:
-            for opt in (1, 0):
-                title = await _try_load(500, optimizations=[opt])
-                if title:
-                    break
-
-        # Last resort: try dialog_type-specific queries.
-        if not title:
-            for dtype in (peer_type, 0):
-                title = await _try_load(500, dialog_type=dtype)
-                if title:
-                    break
-
-        # Fallback: LoadHistory sometimes returns the chat/group metadata
-        # alongside the message history even when LoadDialogs is empty.
-        if not title:
+        def _extract_title_from_history(raw: bytes) -> Optional[str]:
             try:
-                from bale_grpc_client.dialog_parser import parse_load_history_response
-                hist_raw = await runtime.client.load_history(
-                    peer_id=peer_id,
-                    peer_type=peer_type,
-                    limit=1,
-                )
-                hist = parse_load_history_response(hist_raw)
+                parsed = parse_load_history_response(raw)
+            except Exception:
+                return None
+            for g in parsed.get("groups", []):
+                gid = g.get("id")
+                if gid is not None and int(gid) == peer_id:
+                    title = g.get("title") or ""
+                    if title:
+                        return title
+            return None
+
+        now_ms = int(time.time() * 1000)
+        title: Optional[str] = None
+
+        # Probe 1: LoadDialogs with many parameter combinations.
+        dialogs_params = []
+        for limit in (200, 500, 1000):
+            dialogs_params.append({"limit": limit})
+        for opt in (0, 1, 2, 3):
+            dialogs_params.append({"limit": 500, "optimizations": [opt]})
+        for dtype in (0, 1, 2, 3):
+            dialogs_params.append({"limit": 500, "dialog_type": dtype})
+        for min_date in (0, now_ms):
+            dialogs_params.append({"limit": 500, "min_date": min_date})
+        for archive_filter in (0, 1, 2):
+            dialogs_params.append({"limit": 500, "archive_filter": archive_filter})
+        for exclude_pinned in (True, False):
+            dialogs_params.append({"limit": 500, "exclude_pinned": exclude_pinned})
+
+        for params in dialogs_params:
+            try:
+                raw = await runtime.client.load_dialogs(**params)
+                title = _extract_title_from_dialogs(raw)
                 self._logger.debug(
-                    "bale_pv resolve_group_title history_fallback instance=%s peer_id=%s groups=%s users=%s history=%s",
+                    "bale_pv resolve_group_title probe_load_dialogs instance=%s peer_id=%s params=%s found=%s",
                     instance,
                     peer_id,
-                    len(hist.get("groups", [])),
-                    len(hist.get("users", [])),
-                    len(hist.get("history", [])),
+                    params,
+                    bool(title),
                 )
-                for g in hist.get("groups", []):
+                if title:
+                    break
+            except Exception as exc:
+                self._logger.debug(
+                    "bale_pv resolve_group_title probe_load_dialogs_error instance=%s peer_id=%s params=%s error=%s",
+                    instance,
+                    peer_id,
+                    params,
+                    exc,
+                )
+
+        # Probe 2: LoadHistory with peer_type and load_mode variations.
+        if not title:
+            history_params = []
+            for ptype in (peer_type, 3 if peer_type == 2 else 2):
+                for lmode in (0, 1, 2, 3):
+                    for date in (0, now_ms):
+                        history_params.append({
+                            "peer_id": peer_id,
+                            "peer_type": ptype,
+                            "load_mode": lmode,
+                            "date": date,
+                            "limit": 1,
+                        })
+            for params in history_params:
+                try:
+                    raw = await runtime.client.load_history(**params)
+                    title = _extract_title_from_history(raw)
+                    self._logger.debug(
+                        "bale_pv resolve_group_title probe_load_history instance=%s peer_id=%s params=%s found=%s",
+                        instance,
+                        peer_id,
+                        params,
+                        bool(title),
+                    )
+                    if title:
+                        break
+                except Exception as exc:
+                    self._logger.debug(
+                        "bale_pv resolve_group_title probe_load_history_error instance=%s peer_id=%s params=%s error=%s",
+                        instance,
+                        peer_id,
+                        params,
+                        exc,
+                    )
+
+        # Probe 3: SearchContacts with the numeric group id (some backends
+        # index groups/channels and return them alongside users).
+        if not title:
+            try:
+                from bale_grpc_client.dialog_parser import parse_search_contacts_response
+                from bale_grpc_client.messaging_messages import SearchContactsRequest
+                req = SearchContactsRequest(request=str(peer_id))
+                raw = await runtime.client.ws.send_request(
+                    service_name="bale.users.v1.Users",
+                    method="SearchContacts",
+                    payload=req.serialize(),
+                )
+                parsed = parse_search_contacts_response(raw)
+                self._logger.debug(
+                    "bale_pv resolve_group_title probe_search_contacts instance=%s peer_id=%s groups=%s",
+                    instance,
+                    peer_id,
+                    len(parsed.get("groups", [])),
+                )
+                for g in parsed.get("groups", []):
                     gid = g.get("id")
                     if gid is not None and int(gid) == peer_id:
                         title = g.get("title") or ""
                         if title:
-                            self._logger.info(
-                                "bale_pv resolve_group_title history_ok instance=%s peer_id=%s title=%s",
-                                instance,
-                                peer_id,
-                                title,
-                            )
                             break
             except Exception as exc:
                 self._logger.debug(
-                    "bale_pv resolve_group_title history_failed instance=%s peer_id=%s error=%s",
+                    "bale_pv resolve_group_title probe_search_contacts_error instance=%s peer_id=%s error=%s",
                     instance,
                     peer_id,
                     exc,
