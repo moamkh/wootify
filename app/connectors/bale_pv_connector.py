@@ -2022,6 +2022,24 @@ class BalePvConnector:
             )
         return content, content_type
 
+    def _configured_group_title(self, peer_id: int) -> Optional[str]:
+        """Return a hard-coded group title from settings, if present.
+
+        ``BALE_PV_GROUP_TITLES_JSON`` should be a JSON object mapping
+        numeric group IDs to titles, e.g.:
+        ``{"395054013": "testprivategroup", "1678156035": "testpublicgroup"}``
+        """
+        raw = str(settings.BALE_PV_GROUP_TITLES_JSON or "").strip()
+        if not raw:
+            return None
+        try:
+            mapping = json.loads(raw)
+            if isinstance(mapping, dict):
+                return str(mapping.get(str(peer_id), "")).strip() or None
+        except Exception:
+            pass
+        return None
+
     async def resolve_group_title(
         self,
         instance: str,
@@ -2038,6 +2056,22 @@ class BalePvConnector:
         """
         from bale_grpc_client.dialog_parser import parse_load_dialogs_response
         from bale_grpc_client.messaging_messages import Peer
+
+        # Allow operators to hard-code group titles via env/config. This is the
+        # most reliable source when Bale's dialog/history APIs return empty.
+        configured_title = self._configured_group_title(peer_id)
+        if configured_title:
+            self._logger.info(
+                "bale_pv resolve_group_title configured instance=%s peer_id=%s title=%s",
+                instance,
+                peer_id,
+                configured_title,
+            )
+            runtime = self._get_runtime(instance)
+            if runtime:
+                label = "channel" if peer_type == Peer.PEER_TYPE_CHANNEL else "group"
+                runtime.chat_title_cache[peer_id] = f"({label}) {configured_title}"
+            return configured_title
 
         runtime = self._get_runtime(instance)
         if runtime.auth_state != "authenticated" or runtime.client is None:
