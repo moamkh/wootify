@@ -662,17 +662,22 @@ class LoadDialogsRequest:
         dialog_type: int = 0,
         exclude_pinned: bool = False,
         archive_filter: int = 0,
+        optimizations: Optional[List[int]] = None,
     ):
         self.limit = limit
         self.min_date = min_date
         self.dialog_type = dialog_type
         self.exclude_pinned = exclude_pinned
         self.archive_filter = archive_filter
+        self.optimizations = optimizations
 
     def serialize(self) -> bytes:
         msg = ProtobufMessage()
         msg.add_int64(1, self.min_date)
         msg.add_int32(2, self.limit)
+        if self.optimizations is not None:
+            for opt in self.optimizations:
+                msg.add_int32(3, opt)
         msg.add_int32(4, self.dialog_type)
         msg.add_bool(5, self.exclude_pinned)
         msg.add_int32(6, self.archive_filter)

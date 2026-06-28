@@ -376,14 +376,27 @@ def parse_load_history_response(data: bytes) -> Dict[str, Any]:
 
     Response fields:
       1: history (repeated MessageContainer)
+      2: users (repeated User)
+      3: groups (repeated Group)
     """
-    result: Dict[str, Any] = {"history": []}
+    result: Dict[str, Any] = {"history": [], "users": [], "groups": []}
     try:
         fields = ProtobufParser(data).parse()
         for raw in fields.get(1, []):
             parsed = parse_message_container(raw) if isinstance(raw, bytes) else None
             if parsed:
                 result["history"].append(parsed)
+        for raw in fields.get(2, []):
+            parsed = parse_user(raw) if isinstance(raw, bytes) else None
+            if parsed:
+                result["users"].append(parsed)
+        for raw in fields.get(3, []):
+            parsed = parse_group(raw) if isinstance(raw, bytes) else None
+            if parsed:
+                result["groups"].append(parsed)
+        unknown = [k for k in fields.keys() if k not in {1, 2, 3}]
+        if unknown:
+            logger.debug("parse_load_history_response unknown_fields=%s", unknown)
     except Exception as exc:
         logger.warning("parse_load_history_response failed: %s", exc)
     return result

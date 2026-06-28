@@ -176,6 +176,7 @@ class BaleMessagingClient:
         min_date: int = 0,
         dialog_type: int = 0,
         exclude_pinned: bool = False,
+        optimizations: Optional[List[int]] = None,
     ) -> bytes:
         """Fetch dialogs list (response bytes)."""
         req = LoadDialogsRequest(
@@ -183,6 +184,7 @@ class BaleMessagingClient:
             min_date=min_date,
             dialog_type=dialog_type,
             exclude_pinned=exclude_pinned,
+            optimizations=optimizations,
         )
         return await self.ws.send_request(
             service_name=self.SERVICE,

@@ -2058,9 +2058,9 @@ class BalePvConnector:
             if cached and not cached.isdigit():
                 return cached
 
-        async def _try_load(limit: int, dialog_type: int = 0) -> Optional[str]:
+        async def _try_load(limit: int, dialog_type: int = 0, optimizations: Optional[List[int]] = None) -> Optional[str]:
             try:
-                raw = await runtime.client.load_dialogs(limit=limit, dialog_type=dialog_type)
+                raw = await runtime.client.load_dialogs(limit=limit, dialog_type=dialog_type, optimizations=optimizations)
             except Exception as exc:
                 self._logger.warning(
                     "bale_pv resolve_group_title load_dialogs_failed instance=%s peer_id=%s limit=%s dialog_type=%s error=%s",
@@ -2084,11 +2084,12 @@ class BalePvConnector:
                 return None
 
             self._logger.debug(
-                "bale_pv resolve_group_title load_dialogs_result instance=%s peer_id=%s limit=%s dialog_type=%s dialogs=%s groups=%s",
+                "bale_pv resolve_group_title load_dialogs_result instance=%s peer_id=%s limit=%s dialog_type=%s optimizations=%s dialogs=%s groups=%s",
                 instance,
                 peer_id,
                 limit,
                 dialog_type,
+                optimizations,
                 len(parsed.get("dialogs", [])),
                 len(parsed.get("groups", [])),
             )
@@ -2118,12 +2119,58 @@ class BalePvConnector:
             if title:
                 break
 
+        # Some servers require an optimizations flag to return any dialogs.
+        if not title:
+            for opt in (1, 0):
+                title = await _try_load(500, optimizations=[opt])
+                if title:
+                    break
+
         # Last resort: try dialog_type-specific queries.
         if not title:
             for dtype in (peer_type, 0):
                 title = await _try_load(500, dialog_type=dtype)
                 if title:
                     break
+
+        # Fallback: LoadHistory sometimes returns the chat/group metadata
+        # alongside the message history even when LoadDialogs is empty.
+        if not title:
+            try:
+                from bale_grpc_client.dialog_parser import parse_load_history_response
+                hist_raw = await runtime.client.load_history(
+                    peer_id=peer_id,
+                    peer_type=peer_type,
+                    limit=1,
+                )
+                hist = parse_load_history_response(hist_raw)
+                self._logger.debug(
+                    "bale_pv resolve_group_title history_fallback instance=%s peer_id=%s groups=%s users=%s history=%s",
+                    instance,
+                    peer_id,
+                    len(hist.get("groups", [])),
+                    len(hist.get("users", [])),
+                    len(hist.get("history", [])),
+                )
+                for g in hist.get("groups", []):
+                    gid = g.get("id")
+                    if gid is not None and int(gid) == peer_id:
+                        title = g.get("title") or ""
+                        if title:
+                            self._logger.info(
+                                "bale_pv resolve_group_title history_ok instance=%s peer_id=%s title=%s",
+                                instance,
+                                peer_id,
+                                title,
+                            )
+                            break
+            except Exception as exc:
+                self._logger.debug(
+                    "bale_pv resolve_group_title history_failed instance=%s peer_id=%s error=%s",
+                    instance,
+                    peer_id,
+                    exc,
+                )
 
         if title:
             label = "channel" if peer_type == Peer.PEER_TYPE_CHANNEL else "group"
