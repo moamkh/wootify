@@ -447,6 +447,201 @@ async def test_webhook_does_not_resolve_when_identifier_present(db_session):
 
 
 @pytest.mark.anyio
+async def test_webhook_forwards_template_automation_message(db_session):
+    """Chatwoot automation/template messages (welcome, working-hours) must be
+    forwarded to the customer as if sent by the authenticated user."""
+    platform = PlatformType(
+        key="bale_pv_enterprise",
+        display_name="Bale PV Enterprise",
+        capabilities_json={},
+        metadata_schema_json={},
+    )
+    db_session.add(platform)
+    db_session.flush()
+
+    instance = Instance(
+        instance_key="bale-pv-template",
+        platform_type_id=platform.id,
+        is_enabled=True,
+        platform_metadata_encrypted="",
+        chatwoot_config_encrypted='{"account_id": 1, "base_url": "http://chatwoot", "api_access_token": "token"}',
+        proxy_config_encrypted="",
+    )
+    db_session.add(instance)
+    db_session.commit()
+
+    adapter = AsyncMock()
+    adapter.send_text = AsyncMock(return_value={"ok": True})
+
+    runtime = MagicMock()
+    runtime.platform_type = "bale_pv_enterprise"
+    runtime.status = "open"
+    runtime.adapter = adapter
+
+    client = AsyncMock()
+
+    payload = {
+        "event": "message_created",
+        "message_type": "template",
+        "content": "Welcome! How can we help?",
+        "conversation": {
+            "meta": {
+                "sender": {
+                    "id": 42,
+                    "identifier": "BALE_PV:770408072",
+                }
+            },
+        },
+    }
+
+    with patch("app.services.chatwoot_bridge_service.get_runtime", return_value=runtime):
+        with patch.object(
+            chatwoot_bridge,
+            "_chatwoot_client_for_instance",
+            return_value=(instance, {"account_id": 1}, client),
+        ):
+            result = await chatwoot_bridge.handle_chatwoot_webhook(
+                db_session, "bale-pv-template", payload
+            )
+
+    assert result["ok"] is True
+    assert result["peer_id"] == "770408072"
+    adapter.send_text.assert_awaited_once_with(
+        "770408072", "Welcome! How can we help?", reply_to=None
+    )
+
+
+@pytest.mark.anyio
+async def test_webhook_forwards_bot_sender_message(db_session):
+    """Messages sent by a Chatwoot bot (sender type agent_bot) must be forwarded
+    to the customer even when message_type is incoming."""
+    platform = PlatformType(
+        key="bale_pv_enterprise",
+        display_name="Bale PV Enterprise",
+        capabilities_json={},
+        metadata_schema_json={},
+    )
+    db_session.add(platform)
+    db_session.flush()
+
+    instance = Instance(
+        instance_key="bale-pv-botsender",
+        platform_type_id=platform.id,
+        is_enabled=True,
+        platform_metadata_encrypted="",
+        chatwoot_config_encrypted='{"account_id": 1, "base_url": "http://chatwoot", "api_access_token": "token"}',
+        proxy_config_encrypted="",
+    )
+    db_session.add(instance)
+    db_session.commit()
+
+    adapter = AsyncMock()
+    adapter.send_text = AsyncMock(return_value={"ok": True})
+
+    runtime = MagicMock()
+    runtime.platform_type = "bale_pv_enterprise"
+    runtime.status = "open"
+    runtime.adapter = adapter
+
+    client = AsyncMock()
+
+    payload = {
+        "event": "message_created",
+        "message_type": "incoming",
+        "content": "Bot auto-reply",
+        "sender": {
+            "id": 99,
+            "name": "Automation Bot",
+            "type": "agent_bot",
+        },
+        "conversation": {
+            "meta": {
+                "sender": {
+                    "id": 42,
+                    "identifier": "BALE_PV:770408072",
+                }
+            },
+        },
+    }
+
+    with patch("app.services.chatwoot_bridge_service.get_runtime", return_value=runtime):
+        with patch.object(
+            chatwoot_bridge,
+            "_chatwoot_client_for_instance",
+            return_value=(instance, {"account_id": 1}, client),
+        ):
+            result = await chatwoot_bridge.handle_chatwoot_webhook(
+                db_session, "bale-pv-botsender", payload
+            )
+
+    assert result["ok"] is True
+    assert result["peer_id"] == "770408072"
+    adapter.send_text.assert_awaited_once_with(
+        "770408072", "Bot auto-reply", reply_to=None
+    )
+
+
+@pytest.mark.anyio
+async def test_webhook_ignores_incoming_customer_message(db_session):
+    """Genuine incoming customer messages must not be echoed back."""
+    platform = PlatformType(
+        key="bale_pv_enterprise",
+        display_name="Bale PV Enterprise",
+        capabilities_json={},
+        metadata_schema_json={},
+    )
+    db_session.add(platform)
+    db_session.flush()
+
+    instance = Instance(
+        instance_key="bale-pv-incoming",
+        platform_type_id=platform.id,
+        is_enabled=True,
+        platform_metadata_encrypted="",
+        chatwoot_config_encrypted='{"account_id": 1, "base_url": "http://chatwoot", "api_access_token": "token"}',
+        proxy_config_encrypted="",
+    )
+    db_session.add(instance)
+    db_session.commit()
+
+    adapter = AsyncMock()
+    runtime = MagicMock()
+    runtime.platform_type = "bale_pv_enterprise"
+    runtime.status = "open"
+    runtime.adapter = adapter
+
+    client = AsyncMock()
+
+    payload = {
+        "event": "message_created",
+        "message_type": "incoming",
+        "content": "Hello from customer",
+        "conversation": {
+            "meta": {
+                "sender": {
+                    "id": 42,
+                    "identifier": "BALE_PV:770408072",
+                }
+            },
+        },
+    }
+
+    with patch("app.services.chatwoot_bridge_service.get_runtime", return_value=runtime):
+        with patch.object(
+            chatwoot_bridge,
+            "_chatwoot_client_for_instance",
+            return_value=(instance, {"account_id": 1}, client),
+        ):
+            result = await chatwoot_bridge.handle_chatwoot_webhook(
+                db_session, "bale-pv-incoming", payload
+            )
+
+    assert result["ok"] is True
+    assert result["ignored"] is True
+    adapter.send_text.assert_not_awaited()
+
+
+@pytest.mark.anyio
 async def test_ingest_recovers_from_missing_conversation(db_session):
     """If posting to a mapped conversation returns 404, create a new one and retry."""
     platform = PlatformType(

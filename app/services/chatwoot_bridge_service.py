@@ -330,11 +330,34 @@ class ChatwootBridgeService:
         if payload.get("private") is True:
             return {"ok": True, "ignored": True, "reason": "private_message", "detail": "private_message"}
 
-        # Only forward agent/outgoing replies. Incoming messages are already
-        # delivered into Chatwoot by the polling loop; forwarding them back
-        # would echo them to the user.
-        if str(payload.get("message_type") or "").lower() != "outgoing":
+        # Forward agent/outgoing replies, automation/template messages, and
+        # messages sent by a Chatwoot bot/automation. Bot/template messages are
+        # pushed to the customer as if sent by the authenticated platform user.
+        message_type = self._normalize_chatwoot_message_type(
+            payload.get("message_type")
+        )
+        message_obj = payload.get("message") if isinstance(payload.get("message"), dict) else {}
+        nested_type = self._normalize_chatwoot_message_type(
+            message_obj.get("message_type")
+        )
+        is_bot_sender = self._is_chatwoot_bot_sender(payload)
+
+        if not (
+            message_type == "outgoing"
+            or nested_type == "outgoing"
+            or message_type == "template"
+            or nested_type == "template"
+            or is_bot_sender
+        ):
             return {"ok": True, "ignored": True, "reason": "not_outgoing_message", "detail": "not_outgoing_message"}
+
+        if is_bot_sender or message_type == "template" or nested_type == "template":
+            logger.info(
+                "chatwoot_bridge.forwarding_bot_or_template_message instance=%s message_type=%s is_bot_sender=%s",
+                instance_key,
+                message_type or nested_type,
+                is_bot_sender,
+            )
 
         source_id = self._extract_source_id(payload)
         if source_id:
@@ -854,6 +877,50 @@ class ChatwootBridgeService:
         conv = payload.get("conversation") or {}
         meta = conv.get("meta") or {}
         return meta.get("sender") or {}
+
+    @staticmethod
+    def _normalize_chatwoot_message_type(value: Any) -> str:
+        """Normalize Chatwoot message_type values across enum/string shapes."""
+        if isinstance(value, int):
+            return {
+                0: "incoming",
+                1: "outgoing",
+                2: "activity",
+                3: "template",
+            }.get(value, str(value))
+        return str(value or "").strip().lower()
+
+    @staticmethod
+    def _is_chatwoot_bot_sender(payload: Dict[str, Any]) -> bool:
+        """Detect Chatwoot automation/bot senders in webhook payloads.
+
+        Chatwoot exposes bot/automation authors either in the top-level sender
+        object or under ``message.sender``. Accepted type values include
+        ``agent_bot``, ``bot``, and ``automation``.
+        """
+        if not isinstance(payload, dict):
+            return False
+
+        candidates = [
+            payload.get("sender"),
+            (payload.get("message") or {}).get("sender"),
+        ]
+        for candidate in candidates:
+            if isinstance(candidate, dict):
+                sender_type = str(
+                    candidate.get("type") or candidate.get("sender_type") or ""
+                ).strip().lower()
+                if sender_type in ("agent_bot", "bot", "automation"):
+                    return True
+
+        if str(payload.get("sender_type") or "").strip().lower() in (
+            "agent_bot",
+            "bot",
+            "automation",
+        ):
+            return True
+
+        return False
 
     @staticmethod
     def _is_generic_contact_name(value: Optional[str]) -> bool:
