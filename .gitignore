@@ -1,5 +1,6 @@
 __pycache__/
 .venv/
+.venv_corrupted/
 .vscode/
 .env
 *.py[cod]

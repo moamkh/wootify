@@ -1,4 +1,4 @@
-"""Tests for bale_grpc_client.update_parser.
+"""Tests for bale_pv_connector.update_parser.
 
 These tests use synthetic protobuf frames so they do not depend on captured
 WebSocket logs.
@@ -10,9 +10,11 @@ from pathlib import Path
 
 import pytest
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "bale_grpc_client"))
-from bale_grpc_client.protobuf_wire import ProtobufMessage
-from bale_grpc_client.update_parser import BaleUpdateType, parse_ws_update
+_bale_pv_connector_path = str(Path(__file__).resolve().parent.parent / "bale_pv_connector" / "src")
+if _bale_pv_connector_path not in sys.path:
+    sys.path.insert(0, _bale_pv_connector_path)
+from bale_pv_connector.protobuf_wire import ProtobufMessage
+from bale_pv_connector.update_parser import BaleUpdateType, parse_ws_update
 
 
 def _build_update_frame(wrapper_field: int, wrapper_payload: bytes) -> bytes:

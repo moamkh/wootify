@@ -7,6 +7,12 @@ Documentation Standard: module/class/public-method docstrings.
 from __future__ import annotations
 
 import asyncio
+import sys
+from pathlib import Path
+
+_bale_pv_connector_path = str(Path(__file__).resolve().parent.parent.parent / "bale_pv_connector" / "src")
+if _bale_pv_connector_path not in sys.path:
+    sys.path.insert(0, _bale_pv_connector_path)
 import logging
 import mimetypes
 import re
@@ -2952,7 +2958,7 @@ class BridgeService:
         phone_number: str,
     ) -> Dict[str, Any]:
         """Resolve a phone number to a Bale user, caching the result locally."""
-        from bale_grpc_client.dialog_parser import parse_import_contacts_response
+        from bale_pv_connector.dialog_parser import parse_import_contacts_response
 
         normalized = self._normalize_bale_pv_phone(phone_number)
         cached = (

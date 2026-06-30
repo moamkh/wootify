@@ -2,11 +2,22 @@
 
 from __future__ import annotations
 
+import sys
+from pathlib import Path
+
+_bale_pv_connector_path = str(Path(__file__).resolve().parent.parent / "bale_pv_connector" / "src")
+if _bale_pv_connector_path not in sys.path:
+    sys.path.insert(0, _bale_pv_connector_path)
+
 import httpx
 import pytest
 from unittest.mock import AsyncMock, MagicMock, patch
 
-from app.connectors.bale_pv_connector import bale_pv as bale_pv_connector, BalePvConnector
+from app.connectors.bale_pv_connector import (
+    bale_pv as bale_pv_connector,
+    BalePvConnector,
+    BalePvInstanceRuntime,
+)
 
 from app.adapters.bale_pv import BalePvAdapter
 from app.models import BalePvPhoneResolvedUser, Conversation, Instance, PlatformType
@@ -909,7 +920,7 @@ def test_extract_chatwoot_attachments_legacy_conversation():
 
 
 def test_send_type_for_filename_maps_mime_types():
-    from bale_grpc_client.messaging_messages import SendTypeValue
+    from bale_pv_connector.messaging_messages import SendTypeValue
 
     st = BalePvConnector._send_type_for_filename
     assert st("photo.jpg", "image/jpeg") == SendTypeValue.SEND_TYPE_PHOTO
@@ -924,7 +935,7 @@ def test_send_type_for_filename_maps_mime_types():
 def test_media_metadata_for_images_generates_thumb_and_ext():
     from PIL import Image
     from io import BytesIO
-    from bale_grpc_client.messaging_messages import FastThumb, ImageExt
+    from bale_pv_connector.messaging_messages import FastThumb, ImageExt
 
     img = Image.new("RGB", (200, 100), color="red")
     buf = BytesIO()
@@ -949,7 +960,7 @@ def test_media_metadata_for_images_generates_thumb_and_ext():
 
 
 def test_media_metadata_for_audio_returns_audio_ext():
-    from bale_grpc_client.messaging_messages import AudioExt
+    from bale_pv_connector.messaging_messages import AudioExt
 
     connector = BalePvConnector()
     thumb, ext = connector._media_metadata_for_send(
@@ -963,10 +974,10 @@ def test_media_metadata_for_audio_returns_audio_ext():
 
 
 def test_document_message_serializes_thumb_and_ext():
-    from bale_grpc_client.messaging_messages import (
+    from bale_pv_connector.messaging_messages import (
         DocumentMessage, FastThumb, ImageExt, TextMessage
     )
-    from bale_grpc_client.protobuf_wire import ProtobufParser
+    from bale_pv_connector.protobuf_wire import ProtobufParser
 
     doc = DocumentMessage(
         file_id=123,
@@ -1419,3 +1430,77 @@ async def test_get_request_still_retries_on_timeout():
             await client.list_contact_conversations(1, 5)
 
     assert attempts == 3, "GET requests should still retry on ReadTimeout"
+
+
+def _build_load_groups_response_body(groups):
+    """Build a synthetic LoadGroups response body (field 1 = repeated Group)."""
+    from bale_pv_connector.protobuf_wire import ProtobufMessage
+    body = ProtobufMessage()
+    for gid, title, access_hash in groups:
+        group = ProtobufMessage()
+        group.add_int32(1, gid)
+        if access_hash is not None:
+            group.add_int64(2, access_hash)
+        info = ProtobufMessage()
+        info.add_string(1, title)
+        group.add_message(17, info)
+        body.add_message(1, group)
+    return body.serialize()
+
+
+def test_parse_load_groups_response():
+    """LoadGroups parser extracts group ids, titles, and access hashes."""
+    from bale_pv_connector.dialog_parser import parse_load_groups_response
+    body = _build_load_groups_response_body([
+        (1030275959, "beresha_shoes", 12345),
+        (178680737, "novinmed", None),
+    ])
+    parsed = parse_load_groups_response(body)
+    groups = {g["id"]: g for g in parsed["groups"]}
+    assert len(groups) == 2
+    assert groups[1030275959]["title"] == "beresha_shoes"
+    assert groups[1030275959]["access_hash"] == 12345
+    assert groups[178680737]["title"] == "novinmed"
+    assert groups[178680737]["access_hash"] is None
+
+
+@pytest.mark.anyio
+async def test_resolve_group_title_uses_load_groups():
+    """resolve_group_title should call LoadGroups and cache the title."""
+    connector = BalePvConnector()
+    runtime = BalePvInstanceRuntime(
+        instance_key="test-instance",
+        phone_number="989123456789",
+    )
+    runtime.auth_state = "authenticated"
+    connector._instances["test-instance"] = runtime
+
+    client = AsyncMock()
+    client.load_groups = AsyncMock(return_value=_build_load_groups_response_body([
+        (395054013, "testprivategroup", 999),
+    ]))
+    runtime.client = client
+
+    title = await connector.resolve_group_title("test-instance", 395054013, 2)
+    assert title == "testprivategroup"
+    assert runtime.chat_title_cache[395054013] == "(group) testprivategroup"
+    assert runtime.group_access_hash_cache[395054013] == 999
+    client.load_groups.assert_awaited_once()
+
+
+@pytest.mark.anyio
+async def test_resolve_group_title_returns_cached_title():
+    """A cached title should be returned without calling LoadGroups."""
+    connector = BalePvConnector()
+    runtime = BalePvInstanceRuntime(
+        instance_key="test-instance",
+        phone_number="989123456789",
+    )
+    runtime.auth_state = "authenticated"
+    runtime.chat_title_cache[395054013] = "(group) cached_group"
+    connector._instances["test-instance"] = runtime
+    runtime.client = AsyncMock()
+
+    title = await connector.resolve_group_title("test-instance", 395054013, 2)
+    assert title == "cached_group"
+    runtime.client.load_groups.assert_not_awaited()

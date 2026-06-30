@@ -1,0 +1,68 @@
+[build-system]
+requires = ["hatchling>=1.24.0"]
+build-backend = "hatchling.build"
+
+[project]
+name = "bale_pv_connector"
+version = "0.2.0"
+description = "Async-first Python client for Bale Messenger's gRPC-Web + WebSocket API"
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.10"
+authors = [
+    { name = "Amin", email = "amin@example.com" },
+]
+keywords = ["bale", "messenger", "grpc-web", "websocket", "async"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Communications :: Chat",
+    "Typing :: Typed",
+]
+dependencies = [
+    "httpx>=0.27.0",
+    "websockets>=12.0",
+    "protobuf>=5.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.23.0",
+    "pytest-cov>=5.0",
+    "mypy>=1.10",
+    "ruff>=0.5.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/amin/bale_pv_connector"
+Repository = "https://github.com/amin/bale_pv_connector"
+Issues = "https://github.com/amin/bale_pv_connector/issues"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/bale_pv_connector"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+addopts = "-ra -q"
+
+[tool.mypy]
+python_version = "3.10"
+warn_return_any = true
+warn_unused_configs = true
+disallow_untyped_defs = false
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "N", "UP", "B", "C4", "SIM"]
+ignore = ["E501"]

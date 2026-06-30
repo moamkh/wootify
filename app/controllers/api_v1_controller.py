@@ -6,6 +6,13 @@ Documentation Standard: module/class/public-method docstrings.
 """
 from __future__ import annotations
 
+import sys
+from pathlib import Path
+
+_bale_pv_connector_path = str(Path(__file__).resolve().parent.parent.parent / "bale_pv_connector" / "src")
+if _bale_pv_connector_path not in sys.path:
+    sys.path.insert(0, _bale_pv_connector_path)
+
 import base64
 import binascii
 import logging
@@ -1003,7 +1010,7 @@ async def bale_pv_debug_load_users(
             )
         await bale_pv.connect(instance_key, runtime.platform_metadata)
         rt = bale_pv._get_runtime(instance_key)
-        from bale_grpc_client.dialog_parser import parse_load_users_response
+        from bale_pv_connector.dialog_parser import parse_load_users_response
         user_peers = [{"uid": int(uid), "access_hash": 0} for uid in uids]
         raw = await rt.client.load_users(user_peers)
         parsed = parse_load_users_response(raw)

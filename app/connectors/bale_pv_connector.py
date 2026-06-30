@@ -51,11 +51,11 @@ import sys
 from app.config import settings
 from app.utils.logging_utils import redact_secret, truncate_text
 
-# Add the bale_grpc_client package to sys.path so it can be imported without
-# being installed as an editable package in every deployment environment.
-_bale_grpc_client_path = str(Path(__file__).resolve().parent.parent.parent / "bale_grpc_client")
-if _bale_grpc_client_path not in sys.path:
-    sys.path.insert(0, _bale_grpc_client_path)
+# Add the local bale_pv_connector package to sys.path so it can be imported
+# without being installed as an editable package in every deployment environment.
+_bale_pv_connector_path = str(Path(__file__).resolve().parent.parent.parent / "bale_pv_connector" / "src")
+if _bale_pv_connector_path not in sys.path:
+    sys.path.insert(0, _bale_pv_connector_path)
 
 logger = logging.getLogger("app.connectors.bale_pv")
 
@@ -67,20 +67,20 @@ logger = logging.getLogger("app.connectors.bale_pv")
 
 def _get_auth_client():
     """Return ``(BaleAuthClient, BaleAuthError)`` from the grpc package."""
-    from bale_grpc_client.auth_client import BaleAuthClient
-    from bale_grpc_client.exceptions import BaleAuthError
+    from bale_pv_connector.auth_client import BaleAuthClient
+    from bale_pv_connector.exceptions import BaleAuthError
     return BaleAuthClient, BaleAuthError
 
 
 def _get_messaging_client():
     """Return ``BaleMessagingClient`` from the grpc package."""
-    from bale_grpc_client.messaging_client import BaleMessagingClient
+    from bale_pv_connector.messaging_client import BaleMessagingClient
     return BaleMessagingClient
 
 
 def _get_dialog_parser():
     """Return ``parse_import_contacts_response`` from the dialog parser."""
-    from bale_grpc_client.dialog_parser import parse_import_contacts_response
+    from bale_pv_connector.dialog_parser import parse_import_contacts_response
     return parse_import_contacts_response
 
 
@@ -126,6 +126,7 @@ class BalePvInstanceRuntime:
     session_id: Optional[str] = None  # UUID that scopes the on-disk session file
     user_cache: Dict[int, str] = field(default_factory=dict)  # uid -> display name
     chat_title_cache: Dict[int, str] = field(default_factory=dict)  # peer_id -> title
+    group_access_hash_cache: Dict[int, int] = field(default_factory=dict)  # group_id -> access_hash
     self_user_id: Optional[int] = None  # extracted from JWT payload after login
     last_user_cache_refresh: float = 0.0  # unix timestamp of last bulk user refresh
 
@@ -171,7 +172,7 @@ class BalePvConnector:
     @staticmethod
     def _send_type_for_filename(filename: str, mime_type: str) -> int:
         """Map a filename/mime-type to Bale's SendTypeValue category."""
-        from bale_grpc_client.messaging_messages import SendTypeValue
+        from bale_pv_connector.messaging_messages import SendTypeValue
 
         lower_name = str(filename or "").lower()
         lower_mime = str(mime_type or "").lower()
@@ -203,7 +204,7 @@ class BalePvConnector:
         Uses Pillow for images/videos to produce a FastThumb and dimensions.
         Audio duration is not computed here to avoid heavy dependencies.
         """
-        from bale_grpc_client.messaging_messages import FastThumb, ImageExt, AudioExt, SendTypeValue
+        from bale_pv_connector.messaging_messages import FastThumb, ImageExt, AudioExt, SendTypeValue
 
         lower_mime = str(mime_type or "").lower()
 
@@ -718,14 +719,14 @@ class BalePvConnector:
     ) -> Optional[Dict]:
         """Upload file to Bale Nasim storage and send as DocumentMessage."""
         import httpx
-        from bale_grpc_client.messaging_messages import (
+        from bale_pv_connector.messaging_messages import (
             GetNasimFileUploadUrlRequest,
             SendMessageRequest,
             DocumentMessage,
             Peer,
             SendTypeValue,
         )
-        from bale_grpc_client.protobuf_wire import (
+        from bale_pv_connector.protobuf_wire import (
             grpc_web_frame,
             parse_grpc_web_response,
             ProtobufMessage,
@@ -1092,7 +1093,7 @@ class BalePvConnector:
         that the WebSocket listener populates, then parses raw protobuf
         updates into Bot-API-style update dictionaries.
         """
-        from bale_grpc_client.update_parser import parse_ws_update
+        from bale_pv_connector.update_parser import parse_ws_update
 
         runtime = self._get_runtime(instance)
         self._logger.debug(
@@ -1214,7 +1215,7 @@ class BalePvConnector:
         Returns a mapping of uid -> user info dict with keys like name, nick,
         access_hash. Also back-fills the runtime user_cache with display names.
         """
-        from bale_grpc_client.dialog_parser import parse_load_users_response
+        from bale_pv_connector.dialog_parser import parse_load_users_response
 
         result: Dict[int, Dict[str, Any]] = {}
         unknown_uids: set[int] = set()
@@ -1280,7 +1281,7 @@ class BalePvConnector:
             user_info_map: Optional uid -> {name, nick, access_hash, ...} fetched
                 via LoadUsers for senders not present in the contact cache.
         """
-        from bale_grpc_client.update_parser import parse_ws_update
+        from bale_pv_connector.update_parser import parse_ws_update
 
         if isinstance(raw, dict):
             return raw
@@ -1534,7 +1535,7 @@ class BalePvConnector:
         Bale has changed the ``GetNasimFileUrl`` response schema in the past.
         We try the most common layouts and fall back gracefully.
         """
-        from bale_grpc_client.protobuf_wire import ProtobufParser
+        from bale_pv_connector.protobuf_wire import ProtobufParser
 
         fields = ProtobufParser(msg).parse()
 
@@ -1579,7 +1580,7 @@ class BalePvConnector:
         Response layout observed:
           1: repeated fileUrl { 1: fileId, 2: url, 3: duplicate, 4: chunkSize, 5: blockSize }
         """
-        from bale_grpc_client.protobuf_wire import ProtobufParser
+        from bale_pv_connector.protobuf_wire import ProtobufParser
 
         try:
             fields = ProtobufParser(msg).parse()
@@ -1647,11 +1648,11 @@ class BalePvConnector:
 
         try:
             import httpx
-            from bale_grpc_client.messaging_messages import (
+            from bale_pv_connector.messaging_messages import (
                 GetNasimFileUrlRequest,
                 GetNasimFileUrlsRequest,
             )
-            from bale_grpc_client.protobuf_wire import (
+            from bale_pv_connector.protobuf_wire import (
                 grpc_web_frame,
                 parse_grpc_web_response,
                 ProtobufParser,
@@ -1949,7 +1950,7 @@ class BalePvConnector:
         Returns ``(bytes, content_type)`` or ``(None, None)`` when no avatar
         is available or the download fails.
         """
-        from bale_grpc_client.dialog_parser import parse_load_users_response
+        from bale_pv_connector.dialog_parser import parse_load_users_response
 
         runtime = self._get_runtime(instance)
         if runtime.auth_state != "authenticated" or runtime.client is None:
@@ -2043,16 +2044,16 @@ class BalePvConnector:
     ) -> Optional[str]:
         """Fetch a group/channel title on demand when it is not cached.
 
-        Probes several Bale RPCs and parameter combinations because different
-        account types / sessions require different calls to retrieve chat
-        metadata. Logs every attempt so we can identify what works for a given
-        deployment.
+        Uses ``bale.groups.v1.Groups/LoadGroups`` which is the authoritative
+        source for group/channel titles in the Bale web client. Falls back to
+        ``LoadDialogs``/``LoadHistory`` probes if LoadGroups is unavailable.
         """
-        from bale_grpc_client.dialog_parser import (
+        from bale_pv_connector.dialog_parser import (
             parse_load_dialogs_response,
+            parse_load_groups_response,
             parse_load_history_response,
         )
-        from bale_grpc_client.messaging_messages import Peer
+        from bale_pv_connector.messaging_messages import Peer
 
         runtime = self._get_runtime(instance)
         if runtime.auth_state != "authenticated" or runtime.client is None:
@@ -2068,132 +2069,74 @@ class BalePvConnector:
             if cached and not cached.isdigit():
                 return cached
 
-        def _extract_title_from_dialogs(raw: bytes) -> Optional[str]:
-            try:
-                parsed = parse_load_dialogs_response(raw)
-            except Exception:
-                return None
-            for g in parsed.get("groups", []):
-                gid = g.get("id")
-                if gid is not None and int(gid) == peer_id:
-                    title = g.get("title") or ""
-                    if title:
-                        return title
-            for d in parsed.get("dialogs", []):
-                peer = d.get("peer") or {}
-                if int(peer.get("id") or 0) == peer_id:
-                    title = d.get("title") or d.get("raw_name") or ""
-                    if title:
-                        return title
-            return None
-
-        def _extract_title_from_history(raw: bytes) -> Optional[str]:
-            try:
-                parsed = parse_load_history_response(raw)
-            except Exception:
-                return None
-            for g in parsed.get("groups", []):
-                gid = g.get("id")
-                if gid is not None and int(gid) == peer_id:
-                    title = g.get("title") or ""
-                    if title:
-                        return title
-            return None
-
-        now_ms = int(time.time() * 1000)
         title: Optional[str] = None
 
-        # Probe 1: LoadDialogs with many parameter combinations.
-        dialogs_params = []
-        for limit in (200, 500, 1000):
-            dialogs_params.append({"limit": limit})
-        for opt in (0, 1, 2, 3):
-            dialogs_params.append({"limit": 500, "optimizations": [opt]})
-        for dtype in (0, 1, 2, 3):
-            dialogs_params.append({"limit": 500, "dialog_type": dtype})
-        for min_date in (0, now_ms):
-            dialogs_params.append({"limit": 500, "min_date": min_date})
-        for archive_filter in (0, 1, 2):
-            dialogs_params.append({"limit": 500, "archive_filter": archive_filter})
-        for exclude_pinned in (True, False):
-            dialogs_params.append({"limit": 500, "exclude_pinned": exclude_pinned})
+        # Primary: LoadGroups returns authoritative group/channel titles.
+        try:
+            access_hash = runtime.group_access_hash_cache.get(peer_id, 0)
+            raw = await runtime.client.load_groups(
+                [{"group_id": peer_id, "access_hash": access_hash}]
+            )
+            parsed = parse_load_groups_response(raw)
+            self._logger.debug(
+                "bale_pv resolve_group_title load_groups instance=%s peer_id=%s groups=%s",
+                instance,
+                peer_id,
+                len(parsed.get("groups", [])),
+            )
+            for g in parsed.get("groups", []):
+                gid = g.get("id")
+                if gid is not None and int(gid) == peer_id:
+                    title = g.get("title") or ""
+                    # Cache the access hash for future calls.
+                    gh = g.get("access_hash")
+                    if isinstance(gh, int):
+                        runtime.group_access_hash_cache[peer_id] = gh
+                    if title:
+                        break
+        except Exception as exc:
+            self._logger.debug(
+                "bale_pv resolve_group_title load_groups_error instance=%s peer_id=%s error=%s",
+                instance,
+                peer_id,
+                exc,
+            )
 
-        for params in dialogs_params:
+        # Fallback 1: LoadDialogs (legacy / other sessions).
+        if not title:
             try:
-                raw = await runtime.client.load_dialogs(**params)
-                title = _extract_title_from_dialogs(raw)
-                self._logger.debug(
-                    "bale_pv resolve_group_title probe_load_dialogs instance=%s peer_id=%s params=%s found=%s",
-                    instance,
-                    peer_id,
-                    params,
-                    bool(title),
-                )
-                if title:
-                    break
+                raw = await runtime.client.load_dialogs(limit=500)
+                parsed = parse_load_dialogs_response(raw)
+                for g in parsed.get("groups", []):
+                    gid = g.get("id")
+                    if gid is not None and int(gid) == peer_id:
+                        title = g.get("title") or ""
+                        if title:
+                            break
+                if not title:
+                    for d in parsed.get("dialogs", []):
+                        peer = d.get("peer") or {}
+                        if int(peer.get("id") or 0) == peer_id:
+                            title = d.get("title") or d.get("raw_name") or ""
+                            if title:
+                                break
             except Exception as exc:
                 self._logger.debug(
-                    "bale_pv resolve_group_title probe_load_dialogs_error instance=%s peer_id=%s params=%s error=%s",
+                    "bale_pv resolve_group_title load_dialogs_error instance=%s peer_id=%s error=%s",
                     instance,
                     peer_id,
-                    params,
                     exc,
                 )
 
-        # Probe 2: LoadHistory with peer_type and load_mode variations.
-        if not title:
-            history_params = []
-            for ptype in (peer_type, 3 if peer_type == 2 else 2):
-                for lmode in (0, 1, 2, 3):
-                    for date in (0, now_ms):
-                        history_params.append({
-                            "peer_id": peer_id,
-                            "peer_type": ptype,
-                            "load_mode": lmode,
-                            "date": date,
-                            "limit": 1,
-                        })
-            for params in history_params:
-                try:
-                    raw = await runtime.client.load_history(**params)
-                    title = _extract_title_from_history(raw)
-                    self._logger.debug(
-                        "bale_pv resolve_group_title probe_load_history instance=%s peer_id=%s params=%s found=%s",
-                        instance,
-                        peer_id,
-                        params,
-                        bool(title),
-                    )
-                    if title:
-                        break
-                except Exception as exc:
-                    self._logger.debug(
-                        "bale_pv resolve_group_title probe_load_history_error instance=%s peer_id=%s params=%s error=%s",
-                        instance,
-                        peer_id,
-                        params,
-                        exc,
-                    )
-
-        # Probe 3: SearchContacts with the numeric group id (some backends
-        # index groups/channels and return them alongside users).
+        # Fallback 2: LoadHistory.
         if not title:
             try:
-                from bale_grpc_client.dialog_parser import parse_search_contacts_response
-                from bale_grpc_client.messaging_messages import SearchContactsRequest
-                req = SearchContactsRequest(request=str(peer_id))
-                raw = await runtime.client.ws.send_request(
-                    service_name="bale.users.v1.Users",
-                    method="SearchContacts",
-                    payload=req.serialize(),
+                raw = await runtime.client.load_history(
+                    peer_id=peer_id,
+                    peer_type=peer_type,
+                    limit=1,
                 )
-                parsed = parse_search_contacts_response(raw)
-                self._logger.debug(
-                    "bale_pv resolve_group_title probe_search_contacts instance=%s peer_id=%s groups=%s",
-                    instance,
-                    peer_id,
-                    len(parsed.get("groups", [])),
-                )
+                parsed = parse_load_history_response(raw)
                 for g in parsed.get("groups", []):
                     gid = g.get("id")
                     if gid is not None and int(gid) == peer_id:
@@ -2202,7 +2145,7 @@ class BalePvConnector:
                             break
             except Exception as exc:
                 self._logger.debug(
-                    "bale_pv resolve_group_title probe_search_contacts_error instance=%s peer_id=%s error=%s",
+                    "bale_pv resolve_group_title load_history_error instance=%s peer_id=%s error=%s",
                     instance,
                     peer_id,
                     exc,
@@ -2228,6 +2171,7 @@ class BalePvConnector:
 
     # Backwards-compatible alias for internal callers.
     _resolve_group_title = resolve_group_title
+
 
     # ------------------------------------------------------------------
     # Internal WebSocket listener
@@ -2319,7 +2263,7 @@ class BalePvConnector:
         # For now, drain any dialog updates from the queue and return them.
         # Dialogs are pushed by the server after the WS handshake via
         # the dialogs.start() flow.
-        from bale_grpc_client.update_parser import parse_dialog
+        from bale_pv_connector.update_parser import parse_dialog
 
         dialogs: List[Dict[str, Any]] = []
         try:
@@ -2359,12 +2303,12 @@ class BalePvConnector:
           - history_by_peer: map of peer key -> list of messages (if load_history)
         """
         import asyncio
-        from bale_grpc_client.dialog_parser import (
+        from bale_pv_connector.dialog_parser import (
             parse_load_dialogs_response,
             parse_load_users_response,
             parse_load_history_response,
         )
-        from bale_grpc_client.messaging_messages import Peer
+        from bale_pv_connector.messaging_messages import Peer
 
         runtime = self._get_runtime(instance)
         if runtime.auth_state != "authenticated":
@@ -2522,7 +2466,7 @@ class BalePvConnector:
         Uses HTTP gRPC-Web after establishing session cookie.
         """
         import httpx
-        from bale_grpc_client.protobuf_wire import (
+        from bale_pv_connector.protobuf_wire import (
             ProtobufMessage,
             ProtobufParser,
             grpc_web_frame,

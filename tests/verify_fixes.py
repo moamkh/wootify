@@ -5,6 +5,12 @@ Run with: python -m pytest tests/verify_fixes.py -v
 from __future__ import annotations
 
 import asyncio
+import sys
+from pathlib import Path
+
+_bale_pv_connector_path = str(Path(__file__).resolve().parent.parent / "bale_pv_connector" / "src")
+if _bale_pv_connector_path not in sys.path:
+    sys.path.insert(0, _bale_pv_connector_path)
 import time
 from unittest.mock import MagicMock, patch
 
@@ -297,8 +303,8 @@ class TestBalePvImportContacts:
     """Verify ImportContacts protobuf builder round-trips."""
 
     def test_import_contacts_request_serializes(self):
-        from bale_grpc_client.messaging_messages import ImportContactsRequest, PhoneContact
-        from bale_grpc_client.protobuf_wire import ProtobufParser
+        from bale_pv_connector.messaging_messages import ImportContactsRequest, PhoneContact
+        from bale_pv_connector.protobuf_wire import ProtobufParser
 
         req = ImportContactsRequest(
             phones=[PhoneContact(phone_number=989136421196, name="Test")],
@@ -312,8 +318,8 @@ class TestBalePvImportContacts:
         assert 3 not in fields
 
     def test_import_contacts_request_with_optimizations(self):
-        from bale_grpc_client.messaging_messages import ImportContactsRequest, PhoneContact
-        from bale_grpc_client.protobuf_wire import ProtobufParser
+        from bale_pv_connector.messaging_messages import ImportContactsRequest, PhoneContact
+        from bale_pv_connector.protobuf_wire import ProtobufParser
 
         req = ImportContactsRequest(
             phones=[PhoneContact(phone_number=989136421196)],
@@ -327,7 +333,7 @@ class TestBalePvImportContacts:
         assert len(fields[3]) == 1
 
     def test_parse_import_contacts_response_handles_empty(self):
-        from bale_grpc_client.dialog_parser import parse_import_contacts_response
+        from bale_pv_connector.dialog_parser import parse_import_contacts_response
 
         parsed = parse_import_contacts_response(b"")
         assert parsed["users"] == []
