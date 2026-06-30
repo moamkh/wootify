@@ -1,9 +1,0 @@
-httpx>=0.27.0
-websockets>=12.0
-protobuf>=5.0
-
-[dev]
-pytest
-pytest-asyncio
-black
-mypy
