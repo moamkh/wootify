@@ -29,7 +29,7 @@ Quick start::
     asyncio.run(main())
 """
 
-__version__ = "0.2.4"
+__version__ = "0.2.5"
 
 from .auth_client import BaleAuthClient
 from .client import AuthResult, BaleClient
