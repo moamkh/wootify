@@ -1212,14 +1212,21 @@ class BalePvConnector:
     ) -> Dict[int, Dict[str, Any]]:
         """Fetch Bale user details for senders not present in the contact cache.
 
-        Returns a mapping of uid -> user info dict with keys like name, nick,
-        access_hash. Also back-fills the runtime user_cache with display names.
+        Tries LoadUsers first, then falls back to the users list from LoadDialogs
+        and finally to LoadHistory for the relevant groups. This handles both
+        missing access hashes and users that Bale only exposes through dialogs.
         """
-        from bale_pv_connector.dialog_parser import parse_load_users_response
+        from bale_pv_connector.dialog_parser import (
+            parse_load_dialogs_response,
+            parse_load_history_response,
+            parse_load_users_response,
+        )
 
         result: Dict[int, Dict[str, Any]] = {}
         unknown_uids: set[int] = set()
         uid_to_access_hash: Dict[int, int] = {}
+        uid_to_group_peer: Dict[int, Tuple[int, int]] = {}
+
         for update in updates:
             # Updates from _parse_raw_update are wrapped as
             # {"update_id": ..., "message": {...}}.
@@ -1228,38 +1235,121 @@ class BalePvConnector:
             uid = sender.get("id")
             if not isinstance(uid, int):
                 continue
-            if uid not in runtime.user_cache:
-                unknown_uids.add(uid)
-                access_hash = message.get("_sender_access_hash") or message.get("sender_access_hash")
-                if isinstance(access_hash, int):
-                    uid_to_access_hash[uid] = access_hash
+            if uid in runtime.user_cache:
+                continue
+            unknown_uids.add(uid)
+            access_hash = message.get("_sender_access_hash") or message.get("sender_access_hash")
+            if isinstance(access_hash, int):
+                uid_to_access_hash[uid] = access_hash
+
+            chat = message.get("chat") or {}
+            chat_type = str(chat.get("type") or "").lower()
+            chat_id = chat.get("id")
+            if chat_type in ("group", "channel") and isinstance(chat_id, int):
+                uid_to_group_peer[uid] = (chat_id, 3 if chat_type == "channel" else 2)
 
         if not unknown_uids or not runtime.client:
             return result
 
+        def _add_users(users: List[Dict[str, Any]]) -> None:
+            for user in users:
+                uid = user.get("id")
+                if not isinstance(uid, int):
+                    continue
+                result[uid] = user
+                name = user.get("name") or user.get("nick")
+                if name:
+                    runtime.user_cache[uid] = str(name).strip()
+
+        self._logger.info(
+            "bale_pv resolving_unknown_senders instance=%s count=%s",
+            runtime.instance_key,
+            len(unknown_uids),
+        )
+
+        # 1. Primary: LoadUsers (works when we have a valid access_hash).
         try:
             user_peers = [
                 {"uid": uid, "access_hash": uid_to_access_hash.get(uid, 0)}
                 for uid in unknown_uids
             ]
+            self._logger.debug(
+                "bale_pv resolve_unknown_sender_info_request instance=%s peers=%s",
+                runtime.instance_key,
+                user_peers,
+            )
             raw_response = await runtime.client.load_users(user_peers)
             parsed = parse_load_users_response(raw_response)
-            for user in parsed.get("users", []):
-                uid = user.get("id")
-                if not isinstance(uid, int):
-                    continue
-                result[uid] = user
-                # Cache display name for future lookups.
-                name = user.get("name") or user.get("nick")
-                if name:
-                    runtime.user_cache[uid] = str(name).strip()
+            self._logger.debug(
+                "bale_pv resolve_unknown_sender_info_response instance=%s users=%s",
+                runtime.instance_key,
+                len(parsed.get("users", [])),
+            )
+            _add_users(parsed.get("users", []))
         except Exception as exc:
             self._logger.warning(
-                "bale_pv resolve_unknown_sender_info_failed instance=%s uids=%s error=%s",
+                "bale_pv load_users_failed instance=%s error=%s",
                 runtime.instance_key,
-                sorted(unknown_uids),
                 exc,
             )
+
+        unresolved = unknown_uids - set(result.keys())
+        if not unresolved:
+            return result
+
+        # 2. Fallback: LoadDialogs returns a users list for recent conversations.
+        try:
+            raw_dialogs = await runtime.client.load_dialogs(limit=500)
+            parsed_dialogs = parse_load_dialogs_response(raw_dialogs)
+            self._logger.debug(
+                "bale_pv resolve_unknown_sender_dialogs_fallback instance=%s users=%s",
+                runtime.instance_key,
+                len(parsed_dialogs.get("users", [])),
+            )
+            _add_users(parsed_dialogs.get("users", []))
+        except Exception as exc:
+            self._logger.warning(
+                "bale_pv load_dialogs_fallback_failed instance=%s error=%s",
+                runtime.instance_key,
+                exc,
+            )
+
+        unresolved = unknown_uids - set(result.keys())
+        if not unresolved:
+            return result
+
+        # 3. Last resort: LoadHistory for each affected group/channel. The history
+        # response includes a users list with member profiles.
+        group_peers: Dict[int, int] = {}
+        for uid in unresolved:
+            peer = uid_to_group_peer.get(uid)
+            if peer:
+                group_peers[peer[0]] = peer[1]
+
+        for peer_id, peer_type in group_peers.items():
+            try:
+                raw_history = await runtime.client.load_history(
+                    peer_id=peer_id,
+                    peer_type=peer_type,
+                    limit=50,
+                )
+                parsed_history = parse_load_history_response(raw_history)
+                self._logger.debug(
+                    "bale_pv resolve_unknown_sender_history_fallback instance=%s peer_id=%s users=%s",
+                    runtime.instance_key,
+                    peer_id,
+                    len(parsed_history.get("users", [])),
+                )
+                _add_users(parsed_history.get("users", []))
+                if not unknown_uids - set(result.keys()):
+                    break
+            except Exception as exc:
+                self._logger.debug(
+                    "bale_pv load_history_fallback_failed instance=%s peer_id=%s error=%s",
+                    runtime.instance_key,
+                    peer_id,
+                    exc,
+                )
 
         return result
 
@@ -1313,26 +1403,24 @@ class BalePvConnector:
         peer_id = peer.get("id") or sender_uid
         peer_type = peer.get("type", 1)
 
-        # For group/channel messages the real sender user id is often carried in
-        # the field-9 peer (int64) while the legacy senderUid field (2) can be a
-        # truncated/local id. Prefer the peer uid when we have it so names and
-        # contact identifiers are consistent.
-        sender_peer_uid = parsed.get("sender_peer_uid")
-        if peer_type in (2, 3) and isinstance(sender_peer_uid, int):
-            sender_uid = sender_peer_uid
+        # Field 9 contains a peer reference whose subfield meaning depends on the
+        # message direction. For groups/channels it is the sender peer; for 1-on-1
+        # incoming messages it is the recipient (the authenticated account). We do
+        # NOT override sender_uid with a field-9 subfield anymore because in some
+        # captures that subfield is the access_hash, causing a different "user id"
+        # for every message from the same sender. Instead, we use the canonical
+        # UpdateMessage sender_uid (field 2) and derive the access_hash from the
+        # field-9 integer that does NOT match the sender_uid.
+        sp_f1 = parsed.get("sender_peer_field1")
+        sp_f2 = parsed.get("sender_peer_field2")
+        if peer_type in (2, 3) and not isinstance(sender_access_hash, int):
+            if isinstance(sp_f1, int) and sp_f1 != sender_uid:
+                sender_access_hash = sp_f1
+            elif isinstance(sp_f2, int) and sp_f2 != sender_uid:
+                sender_access_hash = sp_f2
 
         # Detect whether this is an outgoing echo (a message sent from another
         # Bale client that the server mirrors back to keep all sessions in sync).
-        # For group messages, sender_uid was already overridden to sender_peer_uid
-        # above, so a plain equality check covers both private and group cases.
-        #
-        # IMPORTANT: Do NOT use "sender_peer_uid == self_user_id" here.  For
-        # incoming private messages, Bale populates field 9 with the RECIPIENT's
-        # peer info (i.e. the authenticated account), so sender_peer_uid equals
-        # self_user_id even for genuinely incoming messages.  Including that
-        # condition in the OR would wrongly flag every incoming 1-on-1 message as
-        # outgoing, causing the contact to be named after the authenticated
-        # account instead of the actual sender.
         is_outgoing = self_user_id is not None and sender_uid == self_user_id
 
         # Determine chat_id based on peer type
@@ -1353,6 +1441,35 @@ class BalePvConnector:
         if event_type == "channel_message" and chat_type == "group":
             chat_type = "channel"
 
+        # Build a chat title so the Chatwoot contact name can be labeled correctly.
+        # For groups/channels this is the group/channel title; for PV it is the peer's name.
+        _chat_title_cache = chat_title_cache or {}
+
+        # Updates sometimes carry the authoritative peer info (title, etc.) in
+        # field 14. Extract and cache it immediately so we don't need later RPCs.
+        peer_info_title = ""
+        peer_info = parsed.get("peer_info") or {}
+        if isinstance(peer_info, dict):
+            info_title = peer_info.get("title") or ""
+            if info_title and isinstance(info_title, str):
+                peer_info_title = info_title.strip()
+        if peer_info_title and peer_type in (1, 2, 3):
+            label = "channel" if peer_type == 3 else ("group" if peer_type == 2 else "private")
+            _chat_title_cache[int(chat_id)] = f"({label}) {peer_info_title}"
+
+        # For private chats, field-14 peer_info is the sender's own peer, so its
+        # title is the sender's display name and any integer field may be the
+        # sender's access_hash. Use both when the update doesn't already provide
+        # them, so 1-on-1 contacts don't show "User {id}".
+        if peer_type == 1:
+            if not isinstance(sender_access_hash, int):
+                pi_access_hash = peer_info.get("access_hash")
+                if isinstance(pi_access_hash, int):
+                    sender_access_hash = pi_access_hash
+            if peer_info_title:
+                if user_cache is not None:
+                    user_cache.setdefault(sender_uid, peer_info_title)
+
         # Look up sender info. Prefer freshly fetched LoadUsers data, then contact cache.
         info = (user_info_map or {}).get(sender_uid, {})
         cached_name = ""
@@ -1369,22 +1486,6 @@ class BalePvConnector:
                 sender_label = username
             else:
                 sender_label = f"User {sender_uid}"
-
-        # Build a chat title so the Chatwoot contact name can be labeled correctly.
-        # For groups/channels this is the group/channel title; for PV it is the peer's name.
-        _chat_title_cache = chat_title_cache or {}
-
-        # Updates sometimes carry the authoritative peer info (title, etc.) in
-        # field 14. Extract and cache it immediately so we don't need later RPCs.
-        peer_info_title = ""
-        peer_info = parsed.get("peer_info") or {}
-        if isinstance(peer_info, dict):
-            info_title = peer_info.get("title") or ""
-            if info_title and isinstance(info_title, str):
-                peer_info_title = info_title.strip()
-        if peer_info_title and peer_type in (1, 2, 3):
-            label = "channel" if peer_type == 3 else ("group" if peer_type == 2 else "private")
-            _chat_title_cache[int(chat_id)] = f"({label}) {peer_info_title}"
 
         if peer_type == 1:
             title_peer_id = int(peer_id) if is_outgoing else sender_uid
@@ -1439,6 +1540,21 @@ class BalePvConnector:
             message["_sender_access_hash"] = sender_access_hash
         if is_outgoing:
             message["_outgoing"] = True
+
+        # Log unresolved senders so we can see why names fall back to IDs.
+        if sender_label.startswith("User ") or not display_name:
+            logger.info(
+                "bale_pv parsed_update_unresolved_sender "
+                "sender_uid=%s peer_type=%s chat_id=%s sender_label=%s "
+                "has_access_hash=%s peer_info_title=%s user_cache_size=%s",
+                sender_uid,
+                peer_type,
+                chat_id,
+                sender_label,
+                isinstance(sender_access_hash, int),
+                bool(peer_info_title),
+                len(user_cache) if user_cache else 0,
+            )
 
         # Pass through reply-to reference so reply threading works
         reply_to_msg_id = parsed.get("reply_to_msg_id")
@@ -2606,27 +2722,29 @@ class BalePvConnector:
 
     async def _refresh_user_cache(self, runtime: BalePvInstanceRuntime) -> None:
         """Fetch contacts and populate the user_cache for name lookups."""
+        before = len(runtime.user_cache)
+
         result = await self.get_contacts(runtime.instance_key)
-        if not result.get("ok"):
+        if result.get("ok"):
+            contacts = result.get("contacts") or []
+            for contact in contacts:
+                uid = contact.get("id")
+                if uid is None:
+                    continue
+                name = contact.get("name") or ""
+                if name:
+                    runtime.user_cache[int(uid)] = str(name).strip()
+                    runtime.chat_title_cache[int(uid)] = str(name).strip()
+        else:
             self._logger.warning(
-                "bale_pv user_cache_refresh_failed instance=%s error=%s",
+                "bale_pv user_cache_contacts_failed instance=%s error=%s",
                 runtime.instance_key,
                 result.get("description"),
             )
-            return
-        contacts = result.get("contacts") or []
-        before = len(runtime.user_cache)
-        for contact in contacts:
-            uid = contact.get("id")
-            if uid is None:
-                continue
-            name = contact.get("name") or ""
-            if name:
-                runtime.user_cache[int(uid)] = str(name).strip()
-                runtime.chat_title_cache[int(uid)] = str(name).strip()
 
         # Also refresh group/channel title cache so group conversations are
-        # named correctly in Chatwoot.
+        # named correctly in Chatwoot. Do this even if GetContacts failed so
+        # we still have names from recent dialogs.
         try:
             dialogs_result = await self.sync_bale_dialogs(
                 runtime.instance_key,

@@ -638,7 +638,7 @@ class UserOutPeer:
 
     def serialize(self) -> bytes:
         msg = ProtobufMessage()
-        msg.add_int32(1, self.uid)
+        msg.add_int64(1, self.uid)
         msg.add_int64(2, self.access_hash)
         return msg.serialize()
 
@@ -652,7 +652,7 @@ class GroupOutPeer:
 
     def serialize(self) -> bytes:
         msg = ProtobufMessage()
-        msg.add_int32(1, self.group_id)
+        msg.add_int64(1, self.group_id)
         msg.add_int64(2, self.access_hash)
         return msg.serialize()
 

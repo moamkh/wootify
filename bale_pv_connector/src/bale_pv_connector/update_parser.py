@@ -685,12 +685,14 @@ def _parse_peer_info(data: bytes) -> Optional[Dict[str, Any]]:
       2: peer id (int64)
       3: peer type (int32)
       4..n: unknown flags/access_hash/etc.
-    We return any string fields we can decode so callers can pick the best title.
+    We return any string fields we can decode so callers can pick the best title,
+    plus any integer fields that may be the peer access_hash.
     """
     try:
         fields = ProtobufParser(data).parse()
         result: Dict[str, Any] = {"raw_fields": {k: v for k, v in fields.items()}}
         strings: List[str] = []
+        ints: List[int] = []
         for k, vals in fields.items():
             for v in vals:
                 if isinstance(v, bytes):
@@ -700,9 +702,23 @@ def _parse_peer_info(data: bytes) -> Optional[Dict[str, Any]]:
                             strings.append(s)
                     except Exception:
                         pass
+                elif isinstance(v, int):
+                    ints.append(v)
         if strings:
             result["strings"] = strings
             result["title"] = strings[0]
+        # Field 2 is the peer id and field 3 the peer type when present.
+        peer_id = fields.get(2, [None])[0]
+        if isinstance(peer_id, int):
+            result["peer_id"] = peer_id
+        peer_type = fields.get(3, [None])[0]
+        if isinstance(peer_type, int):
+            result["peer_type"] = peer_type
+        # The first non-id/type integer is a good candidate for access_hash.
+        for v in ints:
+            if v not in (peer_id, peer_type):
+                result["access_hash"] = v
+                break
         return result
     except Exception as exc:
         logger.debug("parse_peer_info failed: %s", exc)
@@ -867,10 +883,9 @@ def parse_ws_update(data: bytes) -> Optional[Dict[str, Any]]:
 
             # Field 14 carries peer info (chat/group title, access hash, etc.).
             peer_info_bytes = update.get(14, [None])[0]
+            peer_info: Optional[Dict[str, Any]] = None
             if isinstance(peer_info_bytes, bytes) and peer_info_bytes:
                 peer_info = _parse_peer_info(peer_info_bytes)
-                if peer_info:
-                    result["peer_info"] = peer_info
 
             # Log any unknown fields in UpdateMessage (could signal edits/deletes)
             known_update_fields = {1, 2, 3, 4, 5, 7, 9, 13, 14}
@@ -894,6 +909,9 @@ def parse_ws_update(data: bytes) -> Optional[Dict[str, Any]]:
                 "peer": peer,
             }
 
+            if peer_info:
+                result["peer_info"] = peer_info
+
             if forward_info and forward_info.get("from_id") is not None:
                 result["forward_from"] = {
                     "from_id": forward_info.get("from_id"),
@@ -901,19 +919,21 @@ def parse_ws_update(data: bytes) -> Optional[Dict[str, Any]]:
                     "forward_date": forward_info.get("forward_date"),
                 }
 
-            # Field 9 often carries the sender's peer info {1: uid, 2: access_hash}.
-            # Capturing the access_hash lets us resolve non-contact group senders
-            # via LoadUsers, which returns empty profiles when access_hash is 0.
+            # Field 9 often carries a peer reference (sender for groups/channels,
+            # recipient for 1-on-1). It usually contains two integers:
+            #   {1: peer_id_or_access_hash, 2: peer_id_or_access_hash}
+            # The exact meaning varies by message direction, so we preserve both
+            # values and let the consumer pick the correct access_hash.
             sender_peer_bytes = update.get(9, [None])[0]
             if isinstance(sender_peer_bytes, bytes):
                 try:
                     sender_peer = ProtobufParser(sender_peer_bytes).parse()
-                    sp_uid = sender_peer.get(1, [None])[0]
-                    sp_access_hash = sender_peer.get(2, [None])[0]
-                    if isinstance(sp_access_hash, int):
-                        result["sender_access_hash"] = sp_access_hash
-                        if isinstance(sp_uid, int):
-                            result["sender_peer_uid"] = sp_uid
+                    sp_f1 = sender_peer.get(1, [None])[0]
+                    sp_f2 = sender_peer.get(2, [None])[0]
+                    if isinstance(sp_f1, int):
+                        result["sender_peer_field1"] = sp_f1
+                    if isinstance(sp_f2, int):
+                        result["sender_peer_field2"] = sp_f2
                 except Exception:
                     pass
 
