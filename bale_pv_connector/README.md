@@ -31,7 +31,7 @@ pip install bale_pv_connector
 For local development:
 
 ```bash
-git clone https://github.com/amin/bale_pv_connector.git
+git clone https://github.com/moamkh/bale_pv_connector.git
 cd bale_pv_connector
 pip install -e ".[dev]"
 ```

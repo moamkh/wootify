@@ -41,9 +41,9 @@ dev = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/amin/bale_pv_connector"
-Repository = "https://github.com/amin/bale_pv_connector"
-Issues = "https://github.com/amin/bale_pv_connector/issues"
+Homepage = "https://github.com/moamkh/bale_pv_connector"
+Repository = "https://github.com/moamkh/bale_pv_connector"
+Issues = "https://github.com/moamkh/bale_pv_connector/issues"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/bale_pv_connector"]
