@@ -22,6 +22,7 @@ import asyncio
 import json
 import logging
 import mimetypes
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
@@ -59,6 +60,7 @@ class BalePollingService:
         self._enterprise_sms_last_run: dict[str, float] = {}
         self._enterprise_sms_enabled_state: dict[str, bool] = {}
         self._enterprise_sms_sync_tasks: dict[str, asyncio.Task] = {}
+        self._enterprise_sms_sync_started_at: dict[str, float] = {}
         self._share_phone_prompted: set[tuple[str, str]] = set()
         # Temporary debug dump for periodic enterprise SMS sync results.
         self._temp_sms_dump_path = (
@@ -86,6 +88,7 @@ class BalePollingService:
         self._last_update_ids.clear()
         self._enterprise_sms_last_run.clear()
         self._enterprise_sms_enabled_state.clear()
+        self._enterprise_sms_sync_started_at.clear()
         for task in self._enterprise_sms_sync_tasks.values():
             if not task.done():
                 task.cancel()
@@ -113,6 +116,7 @@ class BalePollingService:
                     self._last_update_ids.pop(key, None)
                     self._enterprise_sms_last_run.pop(key, None)
                     self._enterprise_sms_enabled_state.pop(key, None)
+                    self._enterprise_sms_sync_started_at.pop(key, None)
                     sms_task = self._enterprise_sms_sync_tasks.pop(key, None)
                     if sms_task and not sms_task.done():
                         sms_task.cancel()
@@ -150,8 +154,13 @@ class BalePollingService:
 
                 runtime_instance_id = runtime.instance.id
                 # Seed in-memory SMS sync timestamp from DB so restarts respect the interval.
+                # The DB stores a wall-clock datetime, but we use monotonic time for interval
+                # checks. Convert by subtracting the wall-clock elapsed time from the current
+                # monotonic value so that comparisons remain consistent.
                 if runtime.runtime_state_last_sms_sync_at and instance_key not in self._enterprise_sms_last_run:
-                    self._enterprise_sms_last_run[instance_key] = runtime.runtime_state_last_sms_sync_at.timestamp()
+                    db_ts = runtime.runtime_state_last_sms_sync_at.timestamp()
+                    wall_clock_elapsed = time.time() - db_ts
+                    self._enterprise_sms_last_run[instance_key] = time.monotonic() - wall_clock_elapsed
                 platform_key = str(runtime.platform_type.key or '').strip().lower() or 'bale'
                 connector = connector_registry.get(platform_key)
                 cfg = runtime.platform_metadata
@@ -351,7 +360,9 @@ class BalePollingService:
         """Trigger enterprise SMS sync when the configured interval has elapsed.
 
         Runs the actual sync in a background task so that message polling
-        is not blocked by slow SMS API calls.
+        is not blocked by slow SMS API calls.  A stuck or hung task is
+        detected and cancelled so that a single failure cannot block the
+        periodic sync forever.
         """
         if str(platform_key or '').strip().lower() != 'bale_enterprise':
             return
@@ -367,23 +378,57 @@ class BalePollingService:
             return
 
         interval_seconds = self._enterprise.sms_sync_interval_seconds(platform_metadata)
-        now = asyncio.get_running_loop().time()
+        now = time.monotonic()
         last_run = float(self._enterprise_sms_last_run.get(instance_key, 0.0))
         if last_run and (now - last_run) < float(interval_seconds):
+            self._sms_logger.debug(
+                'sync.skip instance=%s reason=interval_not_elapsed elapsed=%ss interval=%ss',
+                instance_key,
+                int(now - last_run),
+                interval_seconds,
+            )
             return
 
-        # If a sync is already running for this instance, skip.
+        # If a sync is already running for this instance, check whether it has
+        # exceeded a reasonable maximum runtime.  A hung task would otherwise
+        # block all future syncs forever.
+        max_sync_runtime_seconds = max(300, interval_seconds * 2)
         existing_task = self._enterprise_sms_sync_tasks.get(instance_key)
         if existing_task and not existing_task.done():
-            return
+            started_at = self._enterprise_sms_sync_started_at.get(instance_key, now)
+            elapsed = now - started_at
+            if elapsed < max_sync_runtime_seconds:
+                self._sms_logger.debug(
+                    'sync.skip instance=%s reason=already_running runtime=%ss max=%ss',
+                    instance_key,
+                    int(elapsed),
+                    max_sync_runtime_seconds,
+                )
+                return
+            self._sms_logger.warning(
+                'sync.cancel_stuck instance=%s runtime=%ss max=%ss',
+                instance_key,
+                int(elapsed),
+                max_sync_runtime_seconds,
+            )
+            existing_task.cancel()
+            self._enterprise_sms_sync_tasks.pop(instance_key, None)
+            self._enterprise_sms_sync_started_at.pop(instance_key, None)
 
         self._enterprise_sms_last_run[instance_key] = now
+        self._enterprise_sms_sync_started_at[instance_key] = now
         self._enterprise_sms_sync_tasks[instance_key] = asyncio.create_task(
             self._run_enterprise_sms_sync(
                 instance_key=instance_key,
                 interval_seconds=interval_seconds,
                 runtime_instance_id=runtime_instance_id,
             )
+        )
+        self._sms_logger.info(
+            'sync.scheduled instance=%s interval=%ss max_runtime=%ss',
+            instance_key,
+            interval_seconds,
+            max_sync_runtime_seconds,
         )
 
     async def _run_enterprise_sms_sync(
@@ -393,23 +438,38 @@ class BalePollingService:
         interval_seconds: int,
         runtime_instance_id: Optional[str] = None,
     ) -> None:
-        """Execute SMS sync and persist timestamp."""
+        """Execute SMS sync and persist timestamp.
+
+        A hard timeout is applied to the whole operation so that a stuck DB
+        session or a hung SMS API call cannot block future syncs indefinitely.
+        """
+        # The overall operation should not run longer than twice the configured
+        # interval; this leaves headroom for slow APIs while still preventing
+        # a runaway task from blocking the scheduler.
+        overall_timeout_seconds = max(300, interval_seconds * 2)
         try:
-            with SessionLocal() as db:
-                result = await self._enterprise.sync_external_sms_messages(db, instance_key)
-            self._sms_logger.info(
-                'sync.result instance=%s fetched=%s delivered=%s dropped=%s failed=%s last_id=%s',
+            async with asyncio.timeout(overall_timeout_seconds):
+                with SessionLocal() as db:
+                    result = await self._enterprise.sync_external_sms_messages(db, instance_key)
+                self._sms_logger.info(
+                    'sync.result instance=%s fetched=%s delivered=%s dropped=%s failed=%s last_id=%s',
+                    instance_key,
+                    result.get('fetched'),
+                    result.get('delivered'),
+                    result.get('dropped'),
+                    result.get('failed'),
+                    result.get('last_id'),
+                )
+                await self._write_temp_sms_result_dump(
+                    instance_key=instance_key,
+                    interval_seconds=interval_seconds,
+                    result=result,
+                )
+        except asyncio.TimeoutError:
+            self._sms_logger.error(
+                'sync.timeout instance=%s timeout_seconds=%s',
                 instance_key,
-                result.get('fetched'),
-                result.get('delivered'),
-                result.get('dropped'),
-                result.get('failed'),
-                result.get('last_id'),
-            )
-            await self._write_temp_sms_result_dump(
-                instance_key=instance_key,
-                interval_seconds=interval_seconds,
-                result=result,
+                overall_timeout_seconds,
             )
         except Exception as exc:
             self._sms_logger.error(

@@ -529,13 +529,21 @@ def _parse_app_settings_update(data: bytes) -> Optional[Dict[str, Any]]:
 def _parse_channel_message_update(data: bytes) -> Optional[Dict[str, Any]]:
     """Parse wrapper field 162 (channel/broadcast message).
 
-    Structure:
-      1: peer (Peer) - usually type 2
+    Structure for real channel/broadcast messages:
+      1: peer (Peer) - usually type 2 or 3
       2: messageId (int64)
       3/8: message (Message G)
       4: senderInfo {1: senderUid}
-      5: status/date? (varint)
+      5: date (varint)
       9: channelPeer (Peer) - usually type 3
+
+    Structure for edited private messages (observed in captures):
+      1: peer (Peer) - type 1
+      2: messageId (int64) - the original message rid
+      3/8: message (Message G) - the new edited content
+      4: originalDate (varint) - NOT a senderInfo message
+      5: editDate? (varint)
+      10: peer (Peer) - duplicate of field 1
     """
     try:
         fields = ProtobufParser(data).parse()
@@ -551,15 +559,50 @@ def _parse_channel_message_update(data: bytes) -> Optional[Dict[str, Any]]:
             _parse_peer(channel_peer_bytes) if isinstance(channel_peer_bytes, bytes) else None
         )
 
+        # Field 5 is usually a varint date, but edited private messages send it as a
+        # nested peer/user reference bytes. Leave it unset so parse_ws_update can
+        # fall back to the container timestamp, which is a reliable event time.
+        if isinstance(date, bytes):
+            date = None
+
         sender_uid: Optional[int] = None
+        original_date: Optional[int] = None
+        edited = False
+        # A byte-typed date field is the tell-tale sign of an edited message:
+        # the wrapper carries the original message date in sender_info instead
+        # of a real sender uid. Real channel/group messages keep date as varint.
+        is_edit_marker = date is None
         if isinstance(sender_info, bytes):
-            try:
-                si = ProtobufParser(sender_info).parse()
-                uid = si.get(1, [None])[0]
-                if isinstance(uid, int):
-                    sender_uid = uid
-            except Exception:
-                pass
+            # Field 4 can be either:
+            #   - senderInfo message {1: senderUid} for real channel messages
+            #   - a bare varint (field 1 wire type 0) containing the original
+            #     message date for edited messages
+            if sender_info.startswith(b"\x08"):
+                try:
+                    si = ProtobufParser(sender_info).parse()
+                    if set(si.keys()) == {1} and isinstance(si.get(1, [None])[0], int):
+                        if is_edit_marker:
+                            original_date = si[1][0]
+                            edited = True
+                            # Edited messages do not carry a real senderInfo; use
+                            # the chat peer id so downstream routing can map the
+                            # edit to the right conversation (PV, group, or channel).
+                            if peer and isinstance(peer.get("id"), int):
+                                sender_uid = peer["id"]
+                        else:
+                            uid = si.get(1, [None])[0]
+                            if isinstance(uid, int):
+                                sender_uid = uid
+                except Exception:
+                    pass
+            else:
+                try:
+                    si = ProtobufParser(sender_info).parse()
+                    uid = si.get(1, [None])[0]
+                    if isinstance(uid, int):
+                        sender_uid = uid
+                except Exception:
+                    pass
 
         result: Dict[str, Any] = {
             "type": "channel_message",
@@ -569,7 +612,10 @@ def _parse_channel_message_update(data: bytes) -> Optional[Dict[str, Any]]:
             "date": date,
             "peer": peer,
             "channel_peer": channel_peer,
+            "edited": edited,
         }
+        if original_date is not None:
+            result["original_date"] = original_date
 
         if msg_bytes and isinstance(msg_bytes, bytes):
             content = _parse_message_content(msg_bytes)

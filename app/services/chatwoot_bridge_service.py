@@ -221,6 +221,21 @@ class ChatwootBridgeService:
                 .first()
             )
             if existing and existing.status == MessageStatus.sent:
+                old_text = (existing.platform_payload_json or {}).get("text") or ""
+                new_text = str(event.get("text") or "").strip()
+                if old_text != new_text:
+                    return await self._handle_platform_message_edit_as_reply(
+                        db=db,
+                        instance=instance,
+                        instance_key=instance_key,
+                        client=client,
+                        account_id=account_id,
+                        conversation_id=conversation_id,
+                        existing_mapping=existing,
+                        new_text=new_text,
+                        event=event,
+                        source_id=source_id,
+                    )
                 logger.info(
                     "chatwoot_bridge.duplicate_platform_message_skip instance=%s conversation_id=%s platform_message_id=%s chatwoot_message_id=%s",
                     instance_key,
@@ -286,6 +301,7 @@ class ChatwootBridgeService:
             message_kind=MessageKind.text if not attachments else MessageKind.media,
             chatwoot_message_id=str(chatwoot_message_id) if chatwoot_message_id else None,
             platform_message_id=platform_message_id,
+            platform_payload_json={"text": text},
         )
 
         return {
@@ -370,6 +386,16 @@ class ChatwootBridgeService:
                         "reason": "platform_echo",
                         "detail": f"platform_echo:{source_id}",
                     }
+            # Edit replies posted by the bridge itself carry a :edit suffix.
+            # They must never be forwarded back to the platform as outgoing
+            # messages, even if Chatwoot reports them as outgoing.
+            if sid.endswith(":EDIT"):
+                return {
+                    "ok": True,
+                    "ignored": True,
+                    "reason": "edit_reply_echo",
+                    "detail": f"edit_reply_echo:{source_id}",
+                }
 
         sender = self._extract_chatwoot_sender(payload)
         identifier = sender.get("identifier")
@@ -738,6 +764,8 @@ class ChatwootBridgeService:
         platform_message_id: Optional[str],
         chatwoot_parent_message_id: Optional[str] = None,
         platform_parent_message_id: Optional[str] = None,
+        platform_payload_json: Optional[Dict[str, Any]] = None,
+        chatwoot_payload_json: Optional[Dict[str, Any]] = None,
         status: MessageStatus = MessageStatus.sent,
     ) -> Optional[MessageMapping]:
         """Persist a message mapping, upserting on unique-key conflicts.
@@ -784,6 +812,10 @@ class ChatwootBridgeService:
             existing.platform_message_id = platform_message_id
             existing.chatwoot_parent_message_id = chatwoot_parent_message_id
             existing.platform_parent_message_id = platform_parent_message_id
+            if platform_payload_json is not None:
+                existing.platform_payload_json = platform_payload_json
+            if chatwoot_payload_json is not None:
+                existing.chatwoot_payload_json = chatwoot_payload_json
             existing.status = status
             db.add(existing)
             db.commit()
@@ -798,12 +830,118 @@ class ChatwootBridgeService:
             platform_message_id=platform_message_id,
             chatwoot_parent_message_id=chatwoot_parent_message_id,
             platform_parent_message_id=platform_parent_message_id,
+            platform_payload_json=platform_payload_json,
+            chatwoot_payload_json=chatwoot_payload_json,
             status=status,
         )
         db.add(mapping)
         db.commit()
         db.refresh(mapping)
         return mapping
+
+    async def _handle_platform_message_edit_as_reply(
+        self,
+        *,
+        db: Session,
+        instance: Instance,
+        instance_key: str,
+        client: ChatwootClient,
+        account_id: int,
+        conversation_id: int,
+        existing_mapping: MessageMapping,
+        new_text: str,
+        event: Dict[str, Any],
+        source_id: str,
+    ) -> Dict[str, Any]:
+        """Post an edited message as a reply to the original Chatwoot message.
+
+        Chatwoot has no public API to update existing message content. When an
+        inbound Bale message is edited we create a new incoming message that is
+        threaded as a reply to the original Chatwoot message.
+        """
+        original_chatwoot_message_id = existing_mapping.chatwoot_message_id
+        if not original_chatwoot_message_id:
+            logger.warning(
+                "chatwoot_bridge.edit_no_chatwoot_id instance=%s platform_message_id=%s",
+                instance_key,
+                existing_mapping.platform_message_id,
+            )
+            return {
+                "ok": False,
+                "detail": "no_original_chatwoot_message_id",
+                "chatwoot_conversation_id": conversation_id,
+            }
+
+        try:
+            original_chatwoot_message_id_int = int(original_chatwoot_message_id)
+        except (ValueError, TypeError):
+            return {
+                "ok": False,
+                "detail": "invalid_original_chatwoot_message_id",
+                "chatwoot_conversation_id": conversation_id,
+            }
+
+        attachments = event.get("attachments") or []
+        reply_data: Dict[str, Any] = {
+            "content": f"edited : {new_text}",
+            "message_type": "incoming",
+            "private": False,
+            "source_id": f"{source_id}:edit",
+            "content_attributes": {
+                "in_reply_to": original_chatwoot_message_id_int,
+            },
+        }
+
+        try:
+            result = await self._post_message_to_chatwoot(
+                client, account_id, conversation_id, reply_data, attachments
+            )
+        except httpx.HTTPStatusError as exc:
+            logger.exception(
+                "chatwoot_bridge.edit_reply_post_failed instance=%s conversation_id=%s error=%s",
+                instance_key,
+                conversation_id,
+                exc,
+            )
+            return {
+                "ok": False,
+                "detail": f"post_failed: {exc}",
+                "chatwoot_conversation_id": conversation_id,
+            }
+
+        edited_chatwoot_message_id = self._extract_id(result)
+
+        # Store a mapping for the edit-reply so it is tracked too.
+        self._persist_mapping(
+            db,
+            instance=instance,
+            conversation_id=str(existing_mapping.conversation_id),
+            direction=MessageDirection.platform_to_chatwoot,
+            message_kind=MessageKind.text if not attachments else MessageKind.media,
+            chatwoot_message_id=str(edited_chatwoot_message_id) if edited_chatwoot_message_id else None,
+            platform_message_id=f"{existing_mapping.platform_message_id}:edit:{event.get('date', '')}",
+            platform_payload_json={"text": new_text, "edit_reply": True},
+        )
+
+        # Refresh the original mapping snapshot so later comparisons use the
+        # latest text and we do not create duplicate edit-replies on retries.
+        existing_mapping.platform_payload_json = {"text": new_text}
+        db.commit()
+
+        logger.info(
+            "chatwoot_bridge.edit_replied instance=%s original_chatwoot_message_id=%s edited_chatwoot_message_id=%s platform_message_id=%s",
+            instance_key,
+            original_chatwoot_message_id,
+            edited_chatwoot_message_id,
+            existing_mapping.platform_message_id,
+        )
+        return {
+            "ok": True,
+            "status": "edit_replied",
+            "original_chatwoot_message_id": str(original_chatwoot_message_id),
+            "edited_chatwoot_message_id": edited_chatwoot_message_id,
+            "chatwoot_conversation_id": conversation_id,
+        }
 
     @staticmethod
     def _extract_peer_id(payload: Dict[str, Any]) -> Optional[str]:

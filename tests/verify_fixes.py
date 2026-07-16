@@ -252,7 +252,7 @@ class TestBalePollingSmsBackground:
         svc = BalePollingService()
         svc._enterprise.sms_sync_enabled = MagicMock(return_value=True)
         svc._enterprise.sms_sync_interval_seconds = MagicMock(return_value=60)
-        svc._enterprise_sms_last_run["test-instance"] = time.time()
+        svc._enterprise_sms_last_run["test-instance"] = time.monotonic()
 
         async def run_test():
             # Create a fake "running" task inside the event loop
@@ -274,6 +274,50 @@ class TestBalePollingSmsBackground:
                 await svc._enterprise_sms_sync_tasks["test-instance"]
             except asyncio.CancelledError:
                 pass
+
+        asyncio.run(run_test())
+
+    def test_sms_sync_cancels_stuck_task_and_reschedules(self):
+        """A sync task that runs longer than the allowed max runtime is cancelled
+        and a new one is scheduled so that a single hung sync cannot stall the
+        periodic sync forever.
+        """
+        from app.services.bale_polling_service import BalePollingService
+
+        svc = BalePollingService()
+        svc._enterprise.sms_sync_enabled = MagicMock(return_value=True)
+        svc._enterprise.sms_sync_interval_seconds = MagicMock(return_value=60)
+        svc._enterprise_sms_last_run["test-instance"] = time.monotonic() - 3600
+
+        new_task_ran = False
+
+        async def fast_run_enterprise_sms_sync(*args, **kwargs):
+            nonlocal new_task_ran
+            new_task_ran = True
+
+        svc._run_enterprise_sms_sync = fast_run_enterprise_sms_sync
+
+        async def run_test():
+            # Simulate a task that has been stuck for a very long time.
+            async def stuck():
+                await asyncio.sleep(3600)
+
+            svc._enterprise_sms_sync_tasks["test-instance"] = asyncio.create_task(stuck())
+            svc._enterprise_sms_sync_started_at["test-instance"] = time.monotonic() - 7200
+
+            await svc._maybe_run_enterprise_sms_sync(
+                "test-instance",
+                platform_key="bale_enterprise",
+                platform_metadata={},
+                runtime_instance_id="inst-123",
+            )
+
+            # The old task should have been replaced by a new one.
+            assert "test-instance" in svc._enterprise_sms_sync_tasks
+            new_task = svc._enterprise_sms_sync_tasks["test-instance"]
+            # Wait briefly for the new task to complete.
+            await asyncio.wait_for(new_task, timeout=2.0)
+            assert new_task_ran is True
 
         asyncio.run(run_test())
 

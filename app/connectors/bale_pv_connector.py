@@ -1393,15 +1393,32 @@ class BalePvConnector:
         sender_access_hash = parsed.get("sender_access_hash")
 
         event_type = parsed.get("type", "message")
+        is_edited = bool(parsed.get("edited"))
 
         # For channel/broadcast messages the authoritative chat peer is channel_peer.
+        # Edited private messages are an exception: field 1 is the actual chat peer,
+        # while field 9 (channel_peer) contains the authenticated account (self).
         channel_peer = parsed.get("channel_peer")
-        if event_type == "channel_message" and isinstance(channel_peer, dict) and channel_peer.get("id"):
+        original_peer = parsed.get("peer") or {}
+        if (
+            event_type == "channel_message"
+            and isinstance(channel_peer, dict)
+            and channel_peer.get("id")
+            and not (is_edited and original_peer.get("type") == 1)
+        ):
             peer = channel_peer
         else:
-            peer = parsed.get("peer") or {}
+            peer = original_peer
         peer_id = peer.get("id") or sender_uid
         peer_type = peer.get("type", 1)
+
+        # Wrapper-level channel messages sent for edited private messages carry the
+        # original message date in sender_info and the chat peer in field 1.
+        # Redirect sender_uid to the peer id so the bridge maps edits to the right
+        # conversation.  For real channel messages peer_type is 2/3 and sender_uid is
+        # the actual sender, so this branch only fires for private edits.
+        if event_type == "channel_message" and peer_type == 1 and is_edited:
+            sender_uid = peer_id
 
         # Field 9 contains a peer reference whose subfield meaning depends on the
         # message direction. For groups/channels it is the sender peer; for 1-on-1
@@ -1540,6 +1557,8 @@ class BalePvConnector:
             message["_sender_access_hash"] = sender_access_hash
         if is_outgoing:
             message["_outgoing"] = True
+        if is_edited:
+            message["_edited"] = True
 
         # Log unresolved senders so we can see why names fall back to IDs.
         if sender_label.startswith("User ") or not display_name:

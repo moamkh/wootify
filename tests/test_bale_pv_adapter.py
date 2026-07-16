@@ -653,6 +653,68 @@ async def test_webhook_ignores_incoming_customer_message(db_session):
 
 
 @pytest.mark.anyio
+async def test_webhook_ignores_edit_reply_echo(db_session):
+    """Edit replies created by the bridge must never be forwarded back to Bale."""
+    platform = PlatformType(
+        key="bale_pv_enterprise",
+        display_name="Bale PV Enterprise",
+        capabilities_json={},
+        metadata_schema_json={},
+    )
+    db_session.add(platform)
+    db_session.flush()
+
+    instance = Instance(
+        instance_key="bale-pv-edit-echo",
+        platform_type_id=platform.id,
+        is_enabled=True,
+        platform_metadata_encrypted="",
+        chatwoot_config_encrypted='{"account_id": 1}',
+        proxy_config_encrypted="",
+    )
+    db_session.add(instance)
+    db_session.commit()
+
+    adapter = AsyncMock()
+    runtime = MagicMock()
+    runtime.platform_type = "bale_pv_enterprise"
+    runtime.status = "open"
+    runtime.adapter = adapter
+
+    client = AsyncMock()
+
+    payload = {
+        "event": "message_created",
+        "message_type": "outgoing",
+        "source_id": "BALE_PV:888:edit",
+        "content": "edited : new text",
+        "conversation": {
+            "meta": {
+                "sender": {
+                    "id": 42,
+                    "identifier": "BALE_PV:770408072",
+                }
+            },
+        },
+    }
+
+    with patch("app.services.chatwoot_bridge_service.get_runtime", return_value=runtime):
+        with patch.object(
+            chatwoot_bridge,
+            "_chatwoot_client_for_instance",
+            return_value=(instance, {"account_id": 1}, client),
+        ):
+            result = await chatwoot_bridge.handle_chatwoot_webhook(
+                db_session, "bale-pv-edit-echo", payload
+            )
+
+    assert result["ok"] is True
+    assert result["ignored"] is True
+    assert result["reason"] in ("platform_echo", "edit_reply_echo")
+    adapter.send_text.assert_not_awaited()
+
+
+@pytest.mark.anyio
 async def test_ingest_recovers_from_missing_conversation(db_session):
     """If posting to a mapped conversation returns 404, create a new one and retry."""
     platform = PlatformType(
@@ -1365,6 +1427,100 @@ async def test_ingest_skips_duplicate_platform_message_before_posting(db_session
     assert result["chatwoot_message_id"] == "999"
     client.post_message.assert_not_awaited()
     client.post_message_with_attachments.assert_not_awaited()
+
+
+@pytest.mark.anyio
+async def test_ingest_posts_edit_as_reply_when_text_changes(db_session):
+    """An inbound message edit must be posted as a reply to the original."""
+    platform = PlatformType(
+        key="bale_pv_enterprise",
+        display_name="Bale PV Enterprise",
+        capabilities_json={},
+        metadata_schema_json={},
+    )
+    db_session.add(platform)
+    db_session.flush()
+
+    instance = Instance(
+        instance_key="bale-pv-edit",
+        platform_type_id=platform.id,
+        is_enabled=True,
+        platform_metadata_encrypted="",
+        chatwoot_config_encrypted='{"account_id": 1, "base_url": "http://chatwoot", "api_access_token": "token", "inbox_id": 5}',
+        proxy_config_encrypted="",
+    )
+    db_session.add(instance)
+    db_session.commit()
+
+    contact_id = 77
+    conv_id = 116
+
+    conversation = Conversation(
+        instance_id=instance.id,
+        platform_conversation_id="770408072",
+        chatwoot_conversation_id=str(conv_id),
+        chatwoot_contact_id=str(contact_id),
+        chatwoot_inbox_id="5",
+        is_active=True,
+    )
+    db_session.add(conversation)
+    db_session.commit()
+
+    from app.models import MessageDirection, MessageKind, MessageMapping, MessageStatus
+
+    existing = MessageMapping(
+        conversation_id=str(conversation.id),
+        direction=MessageDirection.platform_to_chatwoot,
+        message_kind=MessageKind.text,
+        platform_message_id="888",
+        chatwoot_message_id="999",
+        status=MessageStatus.sent,
+        platform_payload_json={"text": "original text"},
+    )
+    db_session.add(existing)
+    db_session.commit()
+
+    client = AsyncMock()
+    client.post_message = AsyncMock(return_value={"id": 1111})
+    client.post_message_with_attachments = AsyncMock(return_value={"id": 1111})
+    client.search_contacts = AsyncMock(return_value={"payload": [{"id": contact_id}]})
+
+    event = {
+        "chat_id": "770408072",
+        "chat_type": "private",
+        "from_name": "Bale User 770408072",
+        "text": "edited text",
+        "message_id": "888",
+        "platform_message_id": "888",
+        "outgoing": False,
+        "attachments": [],
+    }
+
+    with patch.object(
+        chatwoot_bridge,
+        "_chatwoot_client_for_instance",
+        return_value=(instance, {"account_id": 1, "inbox_id": 5}, client),
+    ):
+        result = await chatwoot_bridge.ingest_platform_event(
+            db_session, "bale-pv-edit", event
+        )
+
+    assert result["ok"] is True
+    assert result.get("status") == "edit_replied"
+    assert result["original_chatwoot_message_id"] == "999"
+    assert result["edited_chatwoot_message_id"] == 1111
+
+    client.post_message.assert_awaited_once()
+    call_args = client.post_message.await_args
+    assert call_args.args[0] == 1  # account_id
+    assert call_args.args[1] == conv_id  # conversation_id
+    payload = call_args.args[2]
+    assert payload["content"] == "edited : edited text"
+    assert payload["message_type"] == "incoming"
+    assert payload["content_attributes"]["in_reply_to"] == 999
+
+    db_session.refresh(existing)
+    assert existing.platform_payload_json == {"text": "edited text"}
 
 
 @pytest.mark.anyio

@@ -250,6 +250,7 @@ class BalePvAdapter(BasePlatformAdapter):
             "contact": contact,
             "reply_to": reply_to,
             "outgoing": is_outgoing,
+            "edited": bool(message.get("_edited")),
             "raw": raw_update,
         }
 
