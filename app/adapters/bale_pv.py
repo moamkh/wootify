@@ -85,6 +85,21 @@ class BalePvAdapter(BasePlatformAdapter):
         )
         return {"ok": True, "result": result}
 
+    async def edit_message(
+        self,
+        peer_id: str,
+        message_id: str,
+        text: str,
+    ) -> Dict[str, Any]:
+        """Edit an existing Bale message (only works for messages sent by this account)."""
+        result = await bale_pv.update_message(
+            self.instance_key,
+            peer_id,
+            message_id,
+            text,
+        )
+        return {"ok": True, "result": result}
+
     async def send_media(
         self,
         peer_id: str,

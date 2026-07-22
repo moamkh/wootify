@@ -339,6 +339,10 @@ class ChatwootBridgeService:
         if event in ("conversation_status_changed", "status_changed"):
             return self._handle_conversation_status_change(db, instance, payload)
 
+        # Propagate agent message edits from Chatwoot back to Bale PV.
+        if event == "message_updated":
+            return await self._handle_chatwoot_message_updated(db, instance, payload)
+
         if event and event != "message_created":
             return {"ok": True, "ignored": True, "reason": f"ignored_event:{event}", "detail": f"ignored_event:{event}"}
 
@@ -1330,6 +1334,107 @@ class ChatwootBridgeService:
         return self._ensure_local_conversation(
             db, instance, chat_id, new_conv_id, contact_id, inbox_id
         )
+
+    @staticmethod
+    def _is_chatwoot_message_deleted(payload: Dict[str, Any]) -> bool:
+        """Detect whether a Chatwoot message_updated webhook signals deletion."""
+        content_attributes = payload.get("content_attributes") if isinstance(payload.get("content_attributes"), dict) else {}
+        message_obj = payload.get("message") if isinstance(payload.get("message"), dict) else {}
+        msg_content_attributes = (
+            message_obj.get("content_attributes") if isinstance(message_obj.get("content_attributes"), dict) else {}
+        )
+        return bool(
+            content_attributes.get("deleted")
+            or msg_content_attributes.get("deleted")
+        )
+
+    async def _handle_chatwoot_message_updated(
+        self,
+        db: Session,
+        instance: Instance,
+        payload: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """Propagate a Chatwoot message edit back to Bale PV.
+
+        Only messages that were originally sent by the Bale account can be edited
+        in Bale, so we look up the local mapping by Chatwoot message id and call
+        the platform adapter. Edits to edit-replies are skipped to avoid loops.
+        """
+        if self._is_chatwoot_message_deleted(payload):
+            return {"ok": True, "ignored": True, "reason": "deleted_message", "detail": "deleted_message"}
+
+        content = str(payload.get("content") or "").strip()
+        if not content:
+            return {"ok": True, "ignored": True, "reason": "empty_content", "detail": "empty_content"}
+
+        message_id = payload.get("id") or (payload.get("message") or {}).get("id")
+        if not message_id:
+            return {"ok": True, "ignored": True, "reason": "no_message_id", "detail": "no_message_id"}
+
+        mapping = (
+            db.query(MessageMapping)
+            .filter(MessageMapping.chatwoot_message_id == str(message_id))
+            .first()
+        )
+        if not mapping:
+            return {"ok": True, "ignored": True, "reason": "no_mapping", "detail": "no_mapping"}
+
+        # Skip edit-replies we created ourselves to avoid edit loops.
+        if ":edit:" in str(mapping.platform_message_id or ""):
+            return {"ok": True, "ignored": True, "reason": "edit_reply", "detail": "edit_reply"}
+
+        old_text = (mapping.platform_payload_json or {}).get("text") or ""
+        if old_text == content:
+            return {"ok": True, "ignored": True, "reason": "content_unchanged", "detail": "content_unchanged"}
+
+        conversation = (
+            db.query(Conversation)
+            .filter(Conversation.id == mapping.conversation_id)
+            .first()
+        )
+        if not conversation:
+            return {"ok": False, "detail": "conversation_not_found"}
+
+        peer_id = conversation.platform_conversation_id
+        if not peer_id:
+            return {"ok": False, "detail": "peer_id_not_found"}
+
+        runtime = get_runtime(instance.instance_key)
+        if not runtime or runtime.status != "open":
+            return {"ok": False, "detail": "instance_not_connected"}
+
+        try:
+            result = await runtime.adapter.edit_message(
+                peer_id=str(peer_id),
+                message_id=mapping.platform_message_id,
+                text=content,
+            )
+        except Exception as exc:
+            logger.exception(
+                "chatwoot_bridge.edit_propagation_failed instance=%s chatwoot_message_id=%s platform_message_id=%s error=%s",
+                instance.instance_key,
+                message_id,
+                mapping.platform_message_id,
+                exc,
+            )
+            return {"ok": False, "detail": f"edit_failed: {exc}"}
+
+        mapping.platform_payload_json = {"text": content}
+        db.commit()
+
+        logger.info(
+            "chatwoot_bridge.edit_propagated instance=%s chatwoot_message_id=%s platform_message_id=%s",
+            instance.instance_key,
+            message_id,
+            mapping.platform_message_id,
+        )
+        return {
+            "ok": True,
+            "status": "edit_propagated",
+            "chatwoot_message_id": str(message_id),
+            "platform_message_id": mapping.platform_message_id,
+            "bale_result": result,
+        }
 
     def _handle_conversation_status_change(
         self,

@@ -715,6 +715,333 @@ async def test_webhook_ignores_edit_reply_echo(db_session):
 
 
 @pytest.mark.anyio
+async def test_webhook_propagates_message_updated_to_bale(db_session):
+    """Chatwoot message_updated should be forwarded to Bale as an edit."""
+    platform = PlatformType(
+        key="bale_pv_enterprise",
+        display_name="Bale PV Enterprise",
+        capabilities_json={},
+        metadata_schema_json={},
+    )
+    db_session.add(platform)
+    db_session.flush()
+
+    instance = Instance(
+        instance_key="bale-pv-edit-prop",
+        platform_type_id=platform.id,
+        is_enabled=True,
+        platform_metadata_encrypted="",
+        chatwoot_config_encrypted='{"account_id": 1}',
+        proxy_config_encrypted="",
+    )
+    db_session.add(instance)
+    db_session.commit()
+
+    conversation = Conversation(
+        instance_id=instance.id,
+        platform_conversation_id="770408072",
+        chatwoot_conversation_id="116",
+        chatwoot_contact_id="77",
+        chatwoot_inbox_id="5",
+        is_active=True,
+    )
+    db_session.add(conversation)
+    db_session.commit()
+
+    from app.models import MessageDirection, MessageKind, MessageMapping, MessageStatus
+
+    mapping = MessageMapping(
+        conversation_id=str(conversation.id),
+        direction=MessageDirection.platform_to_chatwoot,
+        message_kind=MessageKind.text,
+        platform_message_id="888",
+        chatwoot_message_id="999",
+        status=MessageStatus.sent,
+        platform_payload_json={"text": "old text"},
+    )
+    db_session.add(mapping)
+    db_session.commit()
+
+    adapter = AsyncMock()
+    adapter.edit_message = AsyncMock(return_value={"ok": True})
+    runtime = MagicMock()
+    runtime.platform_type = "bale_pv_enterprise"
+    runtime.status = "open"
+    runtime.adapter = adapter
+
+    client = AsyncMock()
+
+    payload = {
+        "event": "message_updated",
+        "id": 999,
+        "content": "new edited text",
+        "conversation": {"id": 116},
+    }
+
+    with patch("app.services.chatwoot_bridge_service.get_runtime", return_value=runtime):
+        with patch.object(
+            chatwoot_bridge,
+            "_chatwoot_client_for_instance",
+            return_value=(instance, {"account_id": 1}, client),
+        ):
+            result = await chatwoot_bridge.handle_chatwoot_webhook(
+                db_session, "bale-pv-edit-prop", payload
+            )
+
+    assert result["ok"] is True
+    assert result["status"] == "edit_propagated"
+    adapter.edit_message.assert_awaited_once_with(
+        peer_id="770408072",
+        message_id="888",
+        text="new edited text",
+    )
+
+    db_session.refresh(mapping)
+    assert mapping.platform_payload_json == {"text": "new edited text"}
+
+
+@pytest.mark.anyio
+async def test_webhook_skips_message_updated_when_content_unchanged(db_session):
+    """message_updated with the same content must not be forwarded."""
+    platform = PlatformType(
+        key="bale_pv_enterprise",
+        display_name="Bale PV Enterprise",
+        capabilities_json={},
+        metadata_schema_json={},
+    )
+    db_session.add(platform)
+    db_session.flush()
+
+    instance = Instance(
+        instance_key="bale-pv-edit-skip",
+        platform_type_id=platform.id,
+        is_enabled=True,
+        platform_metadata_encrypted="",
+        chatwoot_config_encrypted='{"account_id": 1}',
+        proxy_config_encrypted="",
+    )
+    db_session.add(instance)
+    db_session.commit()
+
+    conversation = Conversation(
+        instance_id=instance.id,
+        platform_conversation_id="770408072",
+        chatwoot_conversation_id="116",
+        chatwoot_contact_id="77",
+        chatwoot_inbox_id="5",
+        is_active=True,
+    )
+    db_session.add(conversation)
+    db_session.commit()
+
+    from app.models import MessageDirection, MessageKind, MessageMapping, MessageStatus
+
+    mapping = MessageMapping(
+        conversation_id=str(conversation.id),
+        direction=MessageDirection.platform_to_chatwoot,
+        message_kind=MessageKind.text,
+        platform_message_id="888",
+        chatwoot_message_id="999",
+        status=MessageStatus.sent,
+        platform_payload_json={"text": "same text"},
+    )
+    db_session.add(mapping)
+    db_session.commit()
+
+    adapter = AsyncMock()
+    adapter.edit_message = AsyncMock()
+    runtime = MagicMock()
+    runtime.platform_type = "bale_pv_enterprise"
+    runtime.status = "open"
+    runtime.adapter = adapter
+
+    client = AsyncMock()
+
+    payload = {
+        "event": "message_updated",
+        "id": 999,
+        "content": "same text",
+        "conversation": {"id": 116},
+    }
+
+    with patch("app.services.chatwoot_bridge_service.get_runtime", return_value=runtime):
+        with patch.object(
+            chatwoot_bridge,
+            "_chatwoot_client_for_instance",
+            return_value=(instance, {"account_id": 1}, client),
+        ):
+            result = await chatwoot_bridge.handle_chatwoot_webhook(
+                db_session, "bale-pv-edit-skip", payload
+            )
+
+    assert result["ok"] is True
+    assert result["ignored"] is True
+    assert result["reason"] == "content_unchanged"
+    adapter.edit_message.assert_not_awaited()
+
+
+@pytest.mark.anyio
+async def test_webhook_skips_message_updated_for_edit_reply(db_session):
+    """Edits to bridge-created edit replies must not be forwarded."""
+    platform = PlatformType(
+        key="bale_pv_enterprise",
+        display_name="Bale PV Enterprise",
+        capabilities_json={},
+        metadata_schema_json={},
+    )
+    db_session.add(platform)
+    db_session.flush()
+
+    instance = Instance(
+        instance_key="bale-pv-edit-reply",
+        platform_type_id=platform.id,
+        is_enabled=True,
+        platform_metadata_encrypted="",
+        chatwoot_config_encrypted='{"account_id": 1}',
+        proxy_config_encrypted="",
+    )
+    db_session.add(instance)
+    db_session.commit()
+
+    conversation = Conversation(
+        instance_id=instance.id,
+        platform_conversation_id="770408072",
+        chatwoot_conversation_id="116",
+        chatwoot_contact_id="77",
+        chatwoot_inbox_id="5",
+        is_active=True,
+    )
+    db_session.add(conversation)
+    db_session.commit()
+
+    from app.models import MessageDirection, MessageKind, MessageMapping, MessageStatus
+
+    mapping = MessageMapping(
+        conversation_id=str(conversation.id),
+        direction=MessageDirection.platform_to_chatwoot,
+        message_kind=MessageKind.text,
+        platform_message_id="888:edit:123",
+        chatwoot_message_id="1000",
+        status=MessageStatus.sent,
+        platform_payload_json={"text": "edited : old", "edit_reply": True},
+    )
+    db_session.add(mapping)
+    db_session.commit()
+
+    adapter = AsyncMock()
+    adapter.edit_message = AsyncMock()
+    runtime = MagicMock()
+    runtime.platform_type = "bale_pv_enterprise"
+    runtime.status = "open"
+    runtime.adapter = adapter
+
+    client = AsyncMock()
+
+    payload = {
+        "event": "message_updated",
+        "id": 1000,
+        "content": "edited : new",
+        "conversation": {"id": 116},
+    }
+
+    with patch("app.services.chatwoot_bridge_service.get_runtime", return_value=runtime):
+        with patch.object(
+            chatwoot_bridge,
+            "_chatwoot_client_for_instance",
+            return_value=(instance, {"account_id": 1}, client),
+        ):
+            result = await chatwoot_bridge.handle_chatwoot_webhook(
+                db_session, "bale-pv-edit-reply", payload
+            )
+
+    assert result["ok"] is True
+    assert result["ignored"] is True
+    assert result["reason"] == "edit_reply"
+    adapter.edit_message.assert_not_awaited()
+
+
+@pytest.mark.anyio
+async def test_webhook_skips_message_updated_deleted(db_session):
+    """Deleted messages (content_attributes.deleted) must not be edited."""
+    platform = PlatformType(
+        key="bale_pv_enterprise",
+        display_name="Bale PV Enterprise",
+        capabilities_json={},
+        metadata_schema_json={},
+    )
+    db_session.add(platform)
+    db_session.flush()
+
+    instance = Instance(
+        instance_key="bale-pv-edit-del",
+        platform_type_id=platform.id,
+        is_enabled=True,
+        platform_metadata_encrypted="",
+        chatwoot_config_encrypted='{"account_id": 1}',
+        proxy_config_encrypted="",
+    )
+    db_session.add(instance)
+    db_session.commit()
+
+    conversation = Conversation(
+        instance_id=instance.id,
+        platform_conversation_id="770408072",
+        chatwoot_conversation_id="116",
+        chatwoot_contact_id="77",
+        chatwoot_inbox_id="5",
+        is_active=True,
+    )
+    db_session.add(conversation)
+    db_session.commit()
+
+    from app.models import MessageDirection, MessageKind, MessageMapping, MessageStatus
+
+    mapping = MessageMapping(
+        conversation_id=str(conversation.id),
+        direction=MessageDirection.platform_to_chatwoot,
+        message_kind=MessageKind.text,
+        platform_message_id="888",
+        chatwoot_message_id="999",
+        status=MessageStatus.sent,
+        platform_payload_json={"text": "old text"},
+    )
+    db_session.add(mapping)
+    db_session.commit()
+
+    adapter = AsyncMock()
+    adapter.edit_message = AsyncMock()
+    runtime = MagicMock()
+    runtime.platform_type = "bale_pv_enterprise"
+    runtime.status = "open"
+    runtime.adapter = adapter
+
+    client = AsyncMock()
+
+    payload = {
+        "event": "message_updated",
+        "id": 999,
+        "content": "new text",
+        "content_attributes": {"deleted": True},
+        "conversation": {"id": 116},
+    }
+
+    with patch("app.services.chatwoot_bridge_service.get_runtime", return_value=runtime):
+        with patch.object(
+            chatwoot_bridge,
+            "_chatwoot_client_for_instance",
+            return_value=(instance, {"account_id": 1}, client),
+        ):
+            result = await chatwoot_bridge.handle_chatwoot_webhook(
+                db_session, "bale-pv-edit-del", payload
+            )
+
+    assert result["ok"] is True
+    assert result["ignored"] is True
+    assert result["reason"] == "deleted_message"
+    adapter.edit_message.assert_not_awaited()
+
+
+@pytest.mark.anyio
 async def test_ingest_recovers_from_missing_conversation(db_session):
     """If posting to a mapped conversation returns 404, create a new one and retry."""
     platform = PlatformType(
