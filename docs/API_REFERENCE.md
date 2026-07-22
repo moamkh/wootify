@@ -110,6 +110,14 @@ Instance responses include a derived Chatwoot webhook URL in `chatwoot.webhook_u
 }
 ```
 
+### `GET /instances/{instance_key}/health`
+
+Check the health of the instance's platform connection (Telegram bot, Bale bot, or Bale PV).
+
+- Returns HTTP `200` with `{"status": "ok"}` when the instance is enabled and the connector is connected and receiving heartbeats (live `getMe` probe for bot connectors; authenticated WebSocket with keep-alive heartbeat and a live listener for Bale PV).
+- Returns `503` when the instance is disabled or the connection is unhealthy (the `detail` field describes why).
+- Returns `404` when the instance does not exist.
+
 ### `PATCH /instances/{instance_key}`
 
 Partially update an instance. Supports the same auto-create behaviors as `POST /instances`.

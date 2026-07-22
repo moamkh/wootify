@@ -5,6 +5,7 @@ export default function InstancesPage({
   filteredInstances,
   selectedKey,
   busy,
+  healthByKey,
   maskTokenValue,
   openInstanceDetail,
   onToggleEnabled,
@@ -38,6 +39,15 @@ export default function InstancesPage({
           {filteredInstances.map((item) => {
             const isSelected = selectedKey === item.instance_key;
             const statusLabel = item.is_enabled ? 'Enabled' : 'Disabled';
+            const health = healthByKey?.[item.instance_key];
+            const healthLabel = !item.is_enabled
+              ? 'Offline'
+              : health == null
+                ? 'Checking'
+                : health
+                  ? 'Connected'
+                  : 'Unreachable';
+            const healthTone = !item.is_enabled || health == null ? 'warn' : health ? 'good' : 'bad';
             const isTelegram = item.platform_type_key === PLATFORM_TELEGRAM || item.platform_type_key === PLATFORM_TELEGRAM_ENTERPRISE;
             const isBalePv = item.platform_type_key === PLATFORM_BALE_PV_ENTERPRISE;
             const isEnterprise = item.platform_type_key === PLATFORM_BALE_ENTERPRISE || item.platform_type_key === PLATFORM_TELEGRAM_ENTERPRISE;
@@ -71,7 +81,10 @@ export default function InstancesPage({
               >
                 <div className="instance-card-head">
                   <h3>{item.instance_key}</h3>
-                  <span className={`status-pill ${item.is_enabled ? 'good' : 'warn'}`}>{statusLabel}</span>
+                  <div className="instance-card-pills">
+                    <span className={`status-pill ${healthTone}`}>{healthLabel}</span>
+                    <span className={`status-pill ${item.is_enabled ? 'good' : 'warn'}`}>{statusLabel}</span>
+                  </div>
                 </div>
 
                 <div className="instance-token">{maskedToken}</div>

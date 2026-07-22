@@ -39,6 +39,7 @@ import {
   addManualToEnterpriseGroup,
   removeManualFromEnterpriseGroup,
   getVersion,
+  getInstanceHealth,
   balePvSendCode,
   balePvValidateCode,
   balePvAuthStatus,
@@ -445,6 +446,7 @@ export default function App() {
   const [platformTypes, setPlatformTypes] = useState([]);
   const [features, setFeatures] = useState([]);
   const [instances, setInstances] = useState([]);
+  const [healthByKey, setHealthByKey] = useState({});
   const [loading, setLoading] = useState(true);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState('');
@@ -556,6 +558,7 @@ export default function App() {
       setPlatformTypes(platformData || []);
       setFeatures(featureData || []);
       setInstances(instanceData || []);
+      refreshHealth(instanceData || []);
 
       setForm((prev) => {
         if (prev.instance_key) return prev;
@@ -571,6 +574,17 @@ export default function App() {
   async function refreshInstances() {
     const data = await listInstances();
     setInstances(data || []);
+    refreshHealth(data || []);
+  }
+
+  async function refreshHealth(rows) {
+    // Fetch connection health for every instance in parallel and keep the
+    // previous state for instances that disappear mid-refresh.
+    const list = rows || instances;
+    const entries = await Promise.all(
+      (list || []).map(async (item) => [item.instance_key, await getInstanceHealth(item.instance_key)]),
+    );
+    setHealthByKey(Object.fromEntries(entries));
   }
 
   async function loadEnterpriseResources(instanceKey) {
@@ -609,6 +623,14 @@ export default function App() {
   useEffect(() => {
     refreshBootstrap();
   }, []);
+
+  // Poll per-instance connection health so the badges stay fresh.
+  useEffect(() => {
+    const timer = setInterval(() => {
+      refreshHealth();
+    }, 30000);
+    return () => clearInterval(timer);
+  }, [instances]);
 
   useEffect(() => {
     getVersion()
@@ -1621,6 +1643,7 @@ export default function App() {
             filteredInstances={filteredInstances}
             selectedKey={selectedKey}
             busy={busy}
+            healthByKey={healthByKey}
             maskTokenValue={maskTokenValue}
             openInstanceDetail={openInstanceDetail}
             onToggleEnabled={onToggleEnabled}

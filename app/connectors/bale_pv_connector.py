@@ -2059,6 +2059,41 @@ class BalePvConnector:
             "has_session_file": has_session,
         }
 
+    async def get_connection_state(self, instance: str) -> Dict[str, Any]:
+        """Return connection health state for a Bale PV instance.
+
+        An instance is healthy when it is authenticated, the messaging
+        WebSocket is connected (the underlying websocket keep-alive ping/pong
+        heartbeat drops the connection when the peer stops responding), and
+        the background listener task is alive.
+        """
+        runtime = self._instances.get(instance)
+        if not runtime:
+            return {"connected": False, "detail": "instance_not_loaded"}
+        ws_connected = False
+        last_frame_at = 0.0
+        try:
+            ws_connected = runtime.client is not None and runtime.client.ws.is_connected
+            last_frame_at = float(getattr(runtime.client.ws, "last_frame_at", 0.0) or 0.0) if runtime.client else 0.0
+        except Exception:
+            ws_connected = False
+        listener_alive = runtime.ws_task is not None and not runtime.ws_task.done()
+        authenticated = runtime.auth_state == "authenticated"
+        connected = authenticated and ws_connected and listener_alive
+        detail = (
+            "ok"
+            if connected
+            else (
+                f"auth_state={runtime.auth_state} ws_connected={ws_connected} "
+                f"listener_alive={listener_alive}"
+            )
+        )
+        return {
+            "connected": connected,
+            "detail": detail,
+            "last_frame_at": last_frame_at,
+        }
+
     def get_self_user_id(self, instance: str) -> Optional[int]:
         """Return the authenticated user's own Bale ID (from JWT), or None."""
         runtime = self._instances.get(instance)

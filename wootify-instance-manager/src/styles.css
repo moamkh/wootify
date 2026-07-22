@@ -437,6 +437,14 @@ th {
   letter-spacing: 0.2px;
 }
 
+.instance-card-pills {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
 .status-pill {
   display: inline-flex;
   align-items: center;
@@ -459,6 +467,12 @@ th {
   background: rgba(255, 122, 47, 0.2);
   color: #ffd0b4;
   border: 1px solid rgba(255, 122, 47, 0.48);
+}
+
+.status-pill.bad {
+  background: rgba(255, 77, 109, 0.2);
+  color: #ffc2cf;
+  border: 1px solid rgba(255, 77, 109, 0.5);
 }
 
 .instance-token {

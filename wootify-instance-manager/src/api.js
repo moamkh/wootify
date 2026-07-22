@@ -44,6 +44,17 @@ export async function listInstances() {
   return data?.items || [];
 }
 
+export async function getInstanceHealth(instanceKey) {
+  // The health endpoint answers 503 when the connection is unhealthy, so
+  // bypass fetchJSON and map the status code to a boolean instead of throwing.
+  try {
+    const res = await fetch(withBase(`/api/v1/instances/${encodeURIComponent(instanceKey)}/health`));
+    return res.ok;
+  } catch {
+    return false;
+  }
+}
+
 export function createInstance(body) {
   return fetchJSON('/api/v1/instances', {
     method: 'POST',

@@ -455,6 +455,9 @@ class BaleWebSocketClient:
         self._listen_task: Optional[asyncio.Task] = None
         self._req_index = 0
         self._pending_responses: Dict[int, asyncio.Future] = {}
+        # Unix timestamp of the most recently received frame (updates,
+        # heartbeats, pongs, responses). Used for connection health checks.
+        self.last_frame_at: float = 0.0
 
     def _next_index(self) -> int:
         self._req_index += 1
@@ -553,6 +556,7 @@ class BaleWebSocketClient:
 
     async def _handle_message(self, data: bytes) -> None:
         """Handle incoming WebSocket message."""
+        self.last_frame_at = time.time()
         resp = WsResponse.parse(data)
 
         if resp.handshake_response:

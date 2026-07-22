@@ -355,6 +355,26 @@ class BaleBotConnector(BaleConnector):
         await runtime.client.aclose()
         await runtime.file_client.aclose()
 
+    async def get_connection_state(self, instance: str) -> Dict[str, Any]:
+        """Return connection health state for a Bale bot instance.
+
+        Bot API connections are stateless HTTP, so health is verified with a
+        live lightweight ``getMe`` probe against the Bot API.
+        """
+        runtime = self._instances.get(instance)
+        if not runtime:
+            return {"connected": False, "detail": "instance_not_loaded"}
+        try:
+            probe = await self._request(runtime, "getMe", log_error=False)
+        except Exception as exc:
+            return {"connected": False, "detail": f"getMe_failed:{self._error_code(exc)}"}
+        if not probe.get("ok"):
+            return {
+                "connected": False,
+                "detail": str(probe.get("description") or "getMe_failed"),
+            }
+        return {"connected": True, "detail": "ok"}
+
     @staticmethod
     def _is_image(filename: str, content_type: Optional[str]) -> bool:
         """Internal helper to is image."""

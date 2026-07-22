@@ -256,6 +256,21 @@ class TelegramBotConnector:
             return
         await self._shutdown_runtime(runtime)
 
+    async def get_connection_state(self, instance: str) -> dict[str, Any]:
+        """Return connection health state for a Telegram bot instance.
+
+        Bot API connections are stateless HTTP, so health is verified with a
+        live lightweight ``getMe`` probe against the Bot API.
+        """
+        runtime = self._instances.get(instance)
+        if not runtime:
+            return {'connected': False, 'detail': 'instance_not_loaded'}
+        try:
+            await runtime.bot.get_me()
+        except Exception as exc:
+            return {'connected': False, 'detail': f'getMe_failed:{type(exc).__name__}'}
+        return {'connected': True, 'detail': 'ok'}
+
     async def send_text(
         self,
         instance: str,

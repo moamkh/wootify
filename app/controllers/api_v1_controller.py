@@ -74,6 +74,7 @@ from app.services.enterprise_manual_group_service import EnterpriseManualGroupSe
 from app.services.instance_service import InstanceService
 from app.services.message_mapping_service import MessageMappingService
 from app.connectors.bale_pv_connector import bale_pv
+from app.connectors.registry import connector_registry
 from app.services.platform_registry_service import PlatformRegistryService
 
 router = APIRouter(prefix='/api/v1', tags=['api-v1'])
@@ -387,6 +388,46 @@ def get_instance(instance_key: str, db: Session = Depends(get_db)):
             status_code=500,
             detail='internal server error',
             endpoint='get_instance',
+            exc=exc,
+            instance_key=instance_key,
+        )
+
+
+@router.get('/instances/{instance_key}/health')
+async def instance_health(instance_key: str, db: Session = Depends(get_db)):
+    """Check the platform connection health of an instance.
+
+    Returns HTTP 200 with ``{"status": "ok"}`` when the instance is enabled
+    and its connector is connected and receiving heartbeats (live ``getMe``
+    probe for bot connectors; authenticated WebSocket with keep-alive
+    heartbeat for Bale PV). Returns 503 otherwise.
+    """
+    try:
+        runtime = _require_instance_runtime(db, instance_key)
+        if not runtime.instance.is_enabled:
+            _raise_http_error(
+                status_code=503,
+                detail='instance is disabled',
+                endpoint='instance_health',
+                instance_key=instance_key,
+            )
+        connector = connector_registry.get(runtime.platform_type.key)
+        state = await connector.get_connection_state(instance_key)
+        if not state.get('connected'):
+            _raise_http_error(
+                status_code=503,
+                detail=str(state.get('detail') or 'not connected'),
+                endpoint='instance_health',
+                instance_key=instance_key,
+            )
+        return {'status': 'ok'}
+    except HTTPException:
+        raise
+    except Exception as exc:
+        _raise_http_error(
+            status_code=500,
+            detail='internal server error',
+            endpoint='instance_health',
             exc=exc,
             instance_key=instance_key,
         )

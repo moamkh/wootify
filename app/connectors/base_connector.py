@@ -73,5 +73,11 @@ class PlatformConnector(Protocol):
     ) -> tuple[bytes, Optional[str], Optional[str]]:
         """Download a platform file payload by its provider-specific file ID."""
 
+    async def get_connection_state(self, instance: str) -> dict[str, Any]:
+        """Return connection health state for a specific instance.
+
+        Returns a dict with at least ``connected`` (bool) and ``detail`` (str).
+        """
+
     async def close(self) -> None:
         """Release connector resources for all tracked instances."""
