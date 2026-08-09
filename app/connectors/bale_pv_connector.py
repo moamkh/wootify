@@ -2347,8 +2347,13 @@ class BalePvConnector:
     # Internal WebSocket listener
     # ------------------------------------------------------------------
 
-    async def _start_messaging_client(self, runtime: BalePvInstanceRuntime) -> None:
-        """Initialize and connect the messaging WebSocket client."""
+    async def _start_messaging_client(self, runtime: BalePvInstanceRuntime) -> bool:
+        """Initialize and connect the messaging WebSocket client.
+
+        Returns ``True`` when the WebSocket connected successfully, ``False``
+        on any failure (missing session, connect error). Never raises for
+        connection problems so callers can apply their own backoff policy.
+        """
         BaleMessagingClient = _get_messaging_client()
 
         session_file = self._session_path(runtime)
@@ -2365,7 +2370,7 @@ class BalePvConnector:
                 "bale_pv no_session_file instance=%s",
                 runtime.instance_key,
             )
-            return
+            return False
 
         metadata = {
             "app_version": "157595",
@@ -2400,10 +2405,10 @@ class BalePvConnector:
                 "bale_pv messaging_client_connected instance=%s",
                 runtime.instance_key,
             )
-            # Start background listener
-            runtime.ws_task = asyncio.create_task(
-                self._ws_listen(runtime)
-            )
+            # Start the background listener through the guarded helper so a
+            # successful reconnect never spawns a duplicate listener task.
+            self._start_websocket_listener(runtime)
+            return True
         except Exception as exc:
             self._logger.warning(
                 "bale_pv messaging_client_connect_failed instance=%s error=%s",
@@ -2411,6 +2416,7 @@ class BalePvConnector:
                 exc,
             )
             runtime.client = None
+            return False
 
     # ------------------------------------------------------------------
     # Contacts / Dialogs
@@ -2831,6 +2837,7 @@ class BalePvConnector:
             "bale_pv ws_listen_started instance=%s",
             runtime.instance_key,
         )
+        backoff = 2.0
         try:
             while not runtime.stop_event.is_set():
                 try:
@@ -2846,19 +2853,29 @@ class BalePvConnector:
                         )
                     if not connected:
                         self._logger.warning(
-                            "bale_pv ws_reconnecting instance=%s",
+                            "bale_pv ws_reconnecting instance=%s backoff=%.0fs",
                             runtime.instance_key,
+                            backoff,
                         )
                         try:
-                            await self._start_messaging_client(runtime)
+                            reconnected = await self._start_messaging_client(runtime)
                         except Exception as exc:
                             self._logger.warning(
                                 "bale_pv ws_reconnect_failed instance=%s error=%s",
                                 runtime.instance_key,
                                 exc,
                             )
-                            await asyncio.sleep(5)
-                            continue
+                            reconnected = False
+                        if reconnected:
+                            backoff = 2.0
+                        else:
+                            # Exponential backoff (2s..60s) so a dead Bale WS
+                            # endpoint can never spin a tight reconnect loop
+                            # that starves the main HTTP event loop.
+                            await asyncio.sleep(backoff)
+                            backoff = min(backoff * 2, 60.0)
+                        continue
+                    backoff = 2.0
                     await asyncio.sleep(2)
                 except Exception as exc:
                     self._logger.warning(
