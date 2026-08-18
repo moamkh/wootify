@@ -45,11 +45,13 @@ class _FakeAdapter:
         self.send_error = send_error
         self.sent_texts = []
         self.cached_hashes = {}
+        self.resolved_phones = []
 
     def cache_access_hash(self, user_id, access_hash):
         self.cached_hashes[user_id] = access_hash
 
     async def resolve_phone_to_user(self, phone):
+        self.resolved_phones.append(phone)
         return {'id': 555000111, 'access_hash': '998877', 'name': 'Ali Test'}
 
     async def send_text(self, peer_id, content, reply_to=None):
@@ -199,3 +201,41 @@ def test_contact_without_identifier_or_phone_reports_failure(monkeypatch, db):
     assert result['detail'] == 'peer_id_not_found'
     assert len(client.posted_messages) == 1
     assert client.posted_messages[0]['data']['private'] is True
+
+
+def test_prefixed_identifier_is_never_re_resolved_as_phone(monkeypatch, db):
+    """BALE_PV:<id> is a resolved user id, even when its digits look like a phone."""
+    instance = _make_instance(db)
+    adapter = _FakeAdapter()
+    client = _FakeClient()
+    service = _service(monkeypatch, db, adapter, client, instance)
+
+    payload = _payload()
+    # 9123456789 is a Bale user id here, NOT a phone number.
+    payload['conversation']['meta']['sender'] = {
+        'id': 9,
+        'identifier': 'BALE_PV:9123456789',
+        'phone_number': '+989009998877',
+    }
+    result = asyncio.run(service.handle_chatwoot_webhook(db, 'inst-1', payload))
+
+    assert result['ok'] is True
+    assert result['peer_id'] == '9123456789'
+    assert adapter.sent_texts[0]['peer_id'] == '9123456789'
+    assert adapter.resolved_phones == []  # no phone resolution attempted
+    assert client.updated_contacts == []  # contact identifier left untouched
+
+
+def test_unprefixed_phone_like_identifier_is_resolved(monkeypatch, db):
+    instance = _make_instance(db)
+    adapter = _FakeAdapter()
+    client = _FakeClient()
+    service = _service(monkeypatch, db, adapter, client, instance)
+
+    payload = _payload()
+    payload['conversation']['meta']['sender'] = {'id': 9, 'identifier': '9123456789'}
+    result = asyncio.run(service.handle_chatwoot_webhook(db, 'inst-1', payload))
+
+    assert result['ok'] is True
+    assert adapter.resolved_phones == ['989123456789']
+    assert adapter.sent_texts[0]['peer_id'] == '555000111'

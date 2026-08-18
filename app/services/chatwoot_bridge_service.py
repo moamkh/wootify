@@ -443,17 +443,23 @@ class ChatwootBridgeService:
         chatwoot_contact_id = sender.get("id")
 
         peer_id: Optional[str] = None
-        identifier_is_phone = False
+        is_phone_destination = False
         if identifier:
-            stripped_identifier = self._strip_source_prefix(str(identifier))
-            if self._is_phone_number_destination(stripped_identifier):
+            raw_identifier = str(identifier).strip()
+            stripped_identifier = self._strip_source_prefix(raw_identifier)
+            # A prefixed identifier (e.g. BALE_PV:<id>) is an already-resolved
+            # Bale user id and must be used verbatim — its digits can look like
+            # a phone number, and re-resolving them would send to a wrong user.
+            has_platform_prefix = stripped_identifier != raw_identifier
+            if not has_platform_prefix and self._is_phone_number_destination(stripped_identifier):
                 # The contact identifier itself is a raw phone number; resolve it.
-                peer_id = stripped_identifier
-                identifier_is_phone = True
+                peer_id = self._normalize_bale_pv_phone(stripped_identifier)
+                is_phone_destination = True
             else:
                 peer_id = stripped_identifier
         elif phone_number:
-            peer_id = str(phone_number).lstrip("+")
+            peer_id = self._normalize_bale_pv_phone(str(phone_number))
+            is_phone_destination = True
 
         if not peer_id:
             await self._notify_delivery_failure(
@@ -471,7 +477,7 @@ class ChatwootBridgeService:
             # Chatwoot contact identifier for future messages.
             if (
                 runtime.platform_type == "bale_pv_enterprise"
-                and self._is_phone_number_destination(peer_id)
+                and is_phone_destination
             ):
                 original_peer_id = peer_id
                 resolved_user = await self._resolve_bale_pv_phone(
