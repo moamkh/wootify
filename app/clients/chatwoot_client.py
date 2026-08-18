@@ -160,8 +160,14 @@ class ChatwootClient:
                     elapsed,
                 )
 
-                # Retry on transient status codes before raising
-                if resp.status_code in (429, 502, 503, 504) and attempt < 2:
+                # Retry on transient status codes before raising. Only idempotent
+                # calls may be retried: non-idempotent posts (messages) must fail
+                # immediately to avoid duplicate messages / multipart re-sends.
+                if (
+                    resp.status_code in (429, 502, 503, 504)
+                    and retry_on_read_errors
+                    and attempt < 2
+                ):
                     wait = 2 ** attempt
                     logger.warning(
                         "chatwoot.request retry status=%s attempt=%s wait=%ss",

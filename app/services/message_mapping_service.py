@@ -139,7 +139,11 @@ class MessageMappingService:
             row.message_kind = message_kind
             row.status = status
             row.chatwoot_message_id = str(chatwoot_message_id) if chatwoot_message_id else None
-            row.platform_message_id = str(platform_message_id) if platform_message_id else None
+            # Preserve an existing platform_message_id when the caller passes
+            # None (e.g. failure-status upserts) instead of nulling it; a
+            # fresh row keeps the column default of None.
+            if platform_message_id is not None:
+                row.platform_message_id = str(platform_message_id)
             row.chatwoot_parent_message_id = str(chatwoot_parent_message_id) if chatwoot_parent_message_id else None
             row.platform_parent_message_id = str(platform_parent_message_id) if platform_parent_message_id else None
             row.error_code = error_code

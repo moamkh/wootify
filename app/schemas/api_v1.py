@@ -11,6 +11,10 @@ from typing import Any, Optional
 
 from pydantic import BaseModel, Field
 
+#: Instance keys are used in filesystem paths and webhook URLs; keep them
+#: slug-safe to block path traversal (e.g. '../../etc').
+INSTANCE_KEY_PATTERN = r'^[a-zA-Z0-9][a-zA-Z0-9_-]{0,63}$'
+
 
 class PlatformTypeResponse(BaseModel):
     """Response schema for platform type operations."""
@@ -79,7 +83,7 @@ class ProxyConfigResponse(BaseModel):
 
 class InstanceCreateRequest(BaseModel):
     """Request schema for instance create operations."""
-    instance_key: str
+    instance_key: str = Field(pattern=INSTANCE_KEY_PATTERN)
     platform_type_key: str = 'bale'
     is_enabled: bool = True
     platform_metadata: dict[str, Any] = Field(default_factory=dict)

@@ -28,18 +28,29 @@ class ConversationRepository:
         """Initialize the instance."""
         self.db = db
 
-    def list_by_instance(self, instance_id: str) -> list[Conversation]:
+    def list_by_instance(
+        self,
+        instance_id: str,
+        *,
+        limit: Optional[int] = None,
+        offset: Optional[int] = None,
+        include_messages: bool = False,
+    ) -> list[Conversation]:
         """List by instance with eagerly loaded relationships."""
-        return (
+        options = [selectinload(Conversation.runtime_state)]
+        if include_messages:
+            options.append(selectinload(Conversation.message_mappings))
+        query = (
             self.db.query(Conversation)
             .filter(Conversation.instance_id == str(instance_id))
-            .options(
-                selectinload(Conversation.message_mappings),
-                selectinload(Conversation.runtime_state),
-            )
+            .options(*options)
             .order_by(Conversation.is_active.desc(), Conversation.updated_at.desc())
-            .all()
         )
+        if offset:
+            query = query.offset(int(offset))
+        if limit is not None:
+            query = query.limit(int(limit))
+        return query.all()
 
     def get_by_id(self, conversation_id: str) -> Optional[Conversation]:
         """Get by id."""

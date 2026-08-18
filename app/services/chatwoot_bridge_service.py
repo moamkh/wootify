@@ -19,6 +19,7 @@ from typing import Any, Dict, List, Optional
 from urllib.parse import urlparse
 
 import httpx
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.clients.chatwoot_client import ChatwootClient
@@ -33,6 +34,7 @@ from app.models import (
     MessageStatus,
 )
 from app.runtime_registry import get_runtime
+from app.utils.cache_utils import TTLCache
 from app.utils.crypto_utils import encryptor
 
 logger = logging.getLogger("app.services.chatwoot_bridge_service")
@@ -40,6 +42,10 @@ logger = logging.getLogger("app.services.chatwoot_bridge_service")
 
 class ChatwootBridgeService:
     """Bridge normalized platform events to/from Chatwoot."""
+
+    def __init__(self) -> None:
+        """Initialize the instance."""
+        self._clients: TTLCache[ChatwootClient] = TTLCache(maxsize=50, ttl=3600)
 
     async def ingest_platform_event(
         self,
@@ -113,6 +119,8 @@ class ChatwootBridgeService:
             phone_number=(event.get("contact") or {}).get("phone_number"),
             chat_type=chat_type,
             platform_key=platform_key,
+            db=db,
+            instance=instance,
         )
 
         # If we resolved a better group/channel title, update an existing generic
@@ -167,6 +175,10 @@ class ChatwootBridgeService:
                             if ext in ("jpeg", "jpg", "png", "gif", "webp"):
                                 sender_avatar_filename = f"avatar.{ext}"
 
+                    # _get_or_create_contact only uploads the avatar on the
+                    # create path, so passing the bytes here attaches the avatar
+                    # solely for newly created sender contacts.
+                    sender_created = False
                     sender_contact_id, sender_created = await self._get_or_create_contact(
                         client,
                         account_id=account_id,
@@ -176,8 +188,10 @@ class ChatwootBridgeService:
                         phone_number=sender_contact.get("phone_number"),
                         chat_type="private",
                         platform_key=platform_key,
-                        avatar_bytes=sender_avatar_bytes if sender_created else None,
+                        avatar_bytes=sender_avatar_bytes,
                         avatar_filename=sender_avatar_filename,
+                        db=db,
+                        instance=instance,
                     )
                     logger.info(
                         "chatwoot_bridge.sender_contact_ready instance=%s sender_id=%s chatwoot_contact_id=%s created=%s",
@@ -204,7 +218,17 @@ class ChatwootBridgeService:
             contact_id=contact_id,
             chat_id=chat_id,
         )
-        conversation_id = int(conversation.chatwoot_conversation_id) if conversation.chatwoot_conversation_id else 0
+        try:
+            conversation_id = int(conversation.chatwoot_conversation_id) if conversation.chatwoot_conversation_id else 0
+        except (TypeError, ValueError):
+            # Corrupt local mapping: fall back to 0 so the post below 404s and
+            # the recreate path rebuilds the conversation mapping.
+            logger.warning(
+                "chatwoot_bridge.invalid_conversation_id instance=%s value=%s; recreating",
+                instance_key,
+                conversation.chatwoot_conversation_id,
+            )
+            conversation_id = 0
 
         # 3. Detect duplicate inbound messages before posting to Chatwoot.
         # Re-processed platform updates (especially media) must not create a
@@ -283,8 +307,20 @@ class ChatwootBridgeService:
                     contact_id=contact_id,
                     chat_id=chat_id,
                     old_conversation=conversation,
+                    from_name=from_name,
+                    phone_number=(event.get("contact") or {}).get("phone_number"),
+                    chat_type=chat_type,
+                    platform_key=platform_key,
                 )
-                conversation_id = int(conversation.chatwoot_conversation_id) if conversation.chatwoot_conversation_id else 0
+                try:
+                    conversation_id = int(conversation.chatwoot_conversation_id) if conversation.chatwoot_conversation_id else 0
+                except (TypeError, ValueError):
+                    logger.warning(
+                        "chatwoot_bridge.invalid_recreated_conversation_id instance=%s value=%s",
+                        instance_key,
+                        conversation.chatwoot_conversation_id,
+                    )
+                    conversation_id = 0
                 result = await self._post_message_to_chatwoot(
                     client, account_id, conversation_id, post_data, attachments
                 )
@@ -500,12 +536,23 @@ class ChatwootBridgeService:
         if not instance:
             raise RuntimeError(f"Instance '{instance_key}' not found")
         chatwoot_cfg = encryptor.decrypt_json(instance.chatwoot_config_encrypted)
-        client = ChatwootClient(
-            base_url=str(chatwoot_cfg.get("base_url") or "").rstrip("/"),
-            token=str(chatwoot_cfg.get("api_access_token") or chatwoot_cfg.get("token") or ""),
-            timeout=30,
-        )
-        return instance, chatwoot_cfg, client
+        return instance, chatwoot_cfg, self._get_chatwoot_client(chatwoot_cfg)
+
+    def _get_chatwoot_client(self, chatwoot_cfg: Dict[str, Any]) -> ChatwootClient:
+        """Return a cached Chatwoot client per base_url/token.
+
+        Mirrors the TTLCache pattern in BridgeService so the same instance
+        reuses one httpx.AsyncClient (keep-alive) instead of building a new,
+        never-closed client per message.
+        """
+        base_url = str(chatwoot_cfg.get("base_url") or "").rstrip("/")
+        token = str(chatwoot_cfg.get("api_access_token") or chatwoot_cfg.get("token") or "")
+        key = f"{base_url}::{token}"
+        client = self._clients.get(key)
+        if client is None:
+            client = ChatwootClient(base_url=base_url, token=token, timeout=30)
+            self._clients.set(key, client)
+        return client
 
     async def _get_or_create_contact(
         self,
@@ -520,6 +567,8 @@ class ChatwootBridgeService:
         platform_key: str = "bale_pv_enterprise",
         avatar_bytes: Optional[bytes] = None,
         avatar_filename: str = "avatar.jpg",
+        db: Optional[Session] = None,
+        instance: Optional[Instance] = None,
     ) -> tuple[int, bool]:
         """Find or create a Chatwoot contact for this chat.
 
@@ -529,6 +578,26 @@ class ChatwootBridgeService:
 
         Returns ``(contact_id, created)``.
         """
+        # Fast path: reuse the locally persisted contact mapping and skip the
+        # remote contacts/search call. A deleted remote contact surfaces as a
+        # 404 when posting, which triggers the recreate/refresh path.
+        if db is not None and instance is not None:
+            local = (
+                db.query(Conversation)
+                .filter(
+                    Conversation.instance_id == instance.id,
+                    Conversation.platform_conversation_id == chat_id,
+                    Conversation.is_active.is_(True),
+                )
+                .order_by(Conversation.id.desc())
+                .first()
+            )
+            if local and local.chatwoot_contact_id:
+                try:
+                    return int(local.chatwoot_contact_id), False
+                except (TypeError, ValueError):
+                    pass
+
         prefixed_identifier = connector_registry.prefixed_source_id(platform_key, chat_id)
         try:
             found = await client.search_contacts(account_id, prefixed_identifier)
@@ -595,17 +664,13 @@ class ChatwootBridgeService:
             .first()
         )
 
-        # If we have a local mapping, make sure the remote conversation is still open.
-        # If Chatwoot resolved it, mark local inactive and create a new one.
+        # Fast path: trust the local mapping and skip the remote conversations
+        # list call. Resolved/closed conversations are already marked inactive
+        # locally by the conversation_status_changed webhook handler, and a
+        # deleted remote conversation surfaces as a 404 when posting, which
+        # triggers the recreate path that refreshes this mapping.
         if existing and existing.chatwoot_conversation_id:
-            remote_status = await self._get_remote_conversation_status(
-                client, account_id, contact_id, existing.chatwoot_conversation_id, inbox_id
-            )
-            if remote_status not in ("resolved", "closed"):
-                return existing
-            existing.is_active = False
-            db.add(existing)
-            db.commit()
+            return existing
 
         # Try remote contact conversations in this inbox, skipping resolved/closed.
         try:
@@ -1141,7 +1206,28 @@ class ChatwootBridgeService:
             nick=user.get("nick"),
         )
         db.add(cached)
-        db.commit()
+        try:
+            db.commit()
+        except IntegrityError:
+            # A concurrent request inserted the same phone row first
+            # (uq_bale_pv_resolved_phone); reuse that row instead of failing.
+            db.rollback()
+            cached = (
+                db.query(BalePvPhoneResolvedUser)
+                .filter_by(instance_id=instance.id, phone_number=normalized)
+                .first()
+            )
+            if not cached:
+                raise
+            access_hash = cached.access_hash
+            access_hash_int = int(access_hash) if access_hash and str(access_hash).lstrip("-").isdigit() else None
+            runtime.adapter.cache_access_hash(str(cached.bale_user_id), access_hash_int)
+            return {
+                "id": cached.bale_user_id,
+                "access_hash": cached.access_hash,
+                "name": cached.name,
+                "nick": cached.nick,
+            }
         return {
             "id": int(user["id"]),
             "access_hash": access_hash_str,
@@ -1291,6 +1377,10 @@ class ChatwootBridgeService:
         contact_id: int,
         chat_id: str,
         old_conversation: Optional[Conversation] = None,
+        from_name: Optional[str] = None,
+        phone_number: Optional[str] = None,
+        chat_type: str = "private",
+        platform_key: str = "bale_pv_enterprise",
     ) -> Conversation:
         """Create a new Chatwoot conversation and update the local mapping.
 
@@ -1317,10 +1407,52 @@ class ChatwootBridgeService:
             )
 
         # No reusable remote conversation; create a new one.
-        created = await client.create_conversation(
-            account_id,
-            {"contact_id": str(contact_id), "inbox_id": str(inbox_id)},
-        )
+        try:
+            created = await client.create_conversation(
+                account_id,
+                {"contact_id": str(contact_id), "inbox_id": str(inbox_id)},
+            )
+        except httpx.HTTPStatusError as exc:
+            if exc.response is None or exc.response.status_code != 404:
+                raise
+            # The locally mapped contact was deleted remotely, so the create
+            # 404s. Clear the stale mapping and re-run the full remote
+            # get-or-create-contact + create-conversation flow exactly once.
+            logger.warning(
+                "chatwoot_bridge.recreate_contact_missing instance=%s contact_id=%s chat_id=%s; clearing stale mapping and retrying once",
+                instance.instance_key,
+                contact_id,
+                chat_id,
+            )
+            stale = (
+                db.query(Conversation)
+                .filter(
+                    Conversation.instance_id == instance.id,
+                    Conversation.platform_conversation_id == chat_id,
+                )
+                .first()
+            )
+            if stale:
+                stale.chatwoot_contact_id = None
+                stale.chatwoot_conversation_id = None
+                db.add(stale)
+                db.commit()
+            contact_id, _ = await self._get_or_create_contact(
+                client,
+                account_id=account_id,
+                inbox_id=inbox_id,
+                chat_id=chat_id,
+                from_name=from_name or f"User {chat_id}",
+                phone_number=phone_number,
+                chat_type=chat_type,
+                platform_key=platform_key,
+                db=db,
+                instance=instance,
+            )
+            created = await client.create_conversation(
+                account_id,
+                {"contact_id": str(contact_id), "inbox_id": str(inbox_id)},
+            )
         new_conv_id = self._extract_id(created) or self._extract_id((created or {}).get("payload"))
         if not new_conv_id:
             raise RuntimeError("Failed to create replacement Chatwoot conversation")

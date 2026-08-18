@@ -19,14 +19,24 @@ class MessageMappingRepository:
         """Initialize the instance."""
         self.db = db
 
-    def list_by_conversation(self, conversation_id: str) -> list[MessageMapping]:
+    def list_by_conversation(
+        self,
+        conversation_id: str,
+        *,
+        limit: Optional[int] = None,
+        offset: Optional[int] = None,
+    ) -> list[MessageMapping]:
         """List by conversation."""
-        return (
+        query = (
             self.db.query(MessageMapping)
             .filter(MessageMapping.conversation_id == str(conversation_id))
             .order_by(MessageMapping.created_at.desc())
-            .all()
         )
+        if offset:
+            query = query.offset(int(offset))
+        if limit is not None:
+            query = query.limit(int(limit))
+        return query.all()
 
     def get_by_chatwoot_message_id(self, conversation_id: str, chatwoot_message_id: str) -> Optional[MessageMapping]:
         """Get by chatwoot message id."""

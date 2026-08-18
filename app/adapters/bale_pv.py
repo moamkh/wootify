@@ -342,7 +342,8 @@ class BalePvAdapter(BasePlatformAdapter):
                 # JPEG (PNG fallback) so they render as normal image attachments.
                 if resolved_content_type == "image/webp":
                     original_size = len(content)
-                    converted, ext, converted_ct = self._convert_webp(content)
+                    # PIL transcode is CPU-bound; keep it off the event loop.
+                    converted, ext, converted_ct = await asyncio.to_thread(self._convert_webp, content)
                     if converted and ext and converted_ct:
                         content = converted
                         filename = str(filename).rsplit(".", 1)[0] + ext

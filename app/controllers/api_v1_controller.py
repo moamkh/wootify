@@ -13,6 +13,7 @@ _bale_pv_connector_path = str(Path(__file__).resolve().parent.parent.parent / "b
 if _bale_pv_connector_path not in sys.path:
     sys.path.insert(0, _bale_pv_connector_path)
 
+import asyncio
 import base64
 import binascii
 import logging
@@ -23,7 +24,7 @@ import httpx
 from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile, status
 from sqlalchemy.orm import Session
 
-from app.db import get_db
+from app.db import SessionLocal, get_db
 from app.schemas.api_v1 import (
     AutoCreateInboxResponse,
     BalePvContactsResponse,
@@ -65,6 +66,8 @@ from app.schemas.api_v1 import (
 )
 from app.services.bridge_service import BridgeService
 from app import runtime_registry
+from app.repositories.conversation_repository import ConversationRepository
+from app.repositories.message_mapping_repository import MessageMappingRepository
 from app.services.chatwoot_bridge_service import chatwoot_bridge
 from app.services.conversation_mapping_service import ConversationMappingService
 from app.services.enterprise_bale_service import EnterpriseBaleService
@@ -468,6 +471,10 @@ async def patch_instance(instance_key: str, payload: InstancePatchRequest, db: S
             endpoint='patch_instance',
             instance_key=instance_key,
         )
+    if payload.is_enabled is False:
+        # Disconnect the live adapter runtime; re-enable is picked up lazily
+        # by the poll manager via runtime_registry.connect_instance.
+        await runtime_registry.disconnect_instance(instance_key)
     if auto_create_result is not None:
         refreshed = instances.get_instance(db, instance_key)
         if refreshed is not None:
@@ -482,9 +489,10 @@ async def patch_instance(instance_key: str, payload: InstancePatchRequest, db: S
 
 
 @router.delete('/instances/{instance_key}', response_model=GenericMessageResponse)
-def delete_instance(instance_key: str, db: Session = Depends(get_db)):
+async def delete_instance(instance_key: str, db: Session = Depends(get_db)):
     """Delete instance."""
     try:
+        await runtime_registry.disconnect_instance(instance_key)
         if not instances.delete_instance(db, instance_key):
             _raise_http_error(
                 status_code=404,
@@ -650,17 +658,26 @@ async def bale_pv_validate_code(instance_key: str, payload: dict[str, Any], db: 
             )
         # Register the adapter runtime so inbound polling and outbound webhooks
         # can use it immediately.
+        runtime_warning: Optional[str] = None
         try:
             await runtime_registry.connect_instance(
                 instance_key,
                 'bale_pv_enterprise',
                 runtime.platform_metadata,
             )
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.warning(
+                'endpoint=bale_pv_validate_code runtime_connect_failed instance_key=%s error=%s',
+                instance_key,
+                exc,
+            )
+            runtime_warning = 'runtime_connect_failed'
+        detail = f"jwt_saved={result.get('jwt_saved')}"
+        if runtime_warning:
+            detail = f'{detail} warning={runtime_warning}'
         return GenericMessageResponse(
             message='authenticated',
-            detail=f"jwt_saved={result.get('jwt_saved')}",
+            detail=detail,
             status='ok',
         )
     except HTTPException:
@@ -1118,6 +1135,171 @@ async def bale_pv_dialogs(instance_key: str, db: Session = Depends(get_db)):
         )
 
 
+# Strong references to in-flight background webhook deliveries (prevents GC of tasks).
+_webhook_delivery_tasks: set = set()
+
+# Bounded fan-out for background deliveries so a burst of webhooks (or a slow
+# platform) cannot accumulate unlimited concurrent transfers.
+_webhook_delivery_semaphore = asyncio.Semaphore(20)
+
+# Hard cap on a single background delivery so hung transfers cannot live forever.
+_WEBHOOK_DELIVERY_TIMEOUT_SECONDS = 300
+
+# Per-(instance, conversation) delivery locks: serialize redeliveries/retries of
+# the same conversation so concurrent background tasks cannot both pass the
+# downstream dedup SELECT before either commits (TOCTOU double-send), and so
+# ordering within a conversation (delete before create, reply before parent) is
+# preserved. Bounded dict with FIFO eviction.
+_webhook_delivery_locks: dict[str, asyncio.Lock] = {}
+_WEBHOOK_DELIVERY_LOCKS_MAX = 1000
+
+
+def _chatwoot_delivery_lock_key(instance_key: str, payload: dict[str, Any]) -> str:
+    """Derive a serialization key for a Chatwoot webhook delivery.
+
+    Prefers the conversation id so all events of one conversation are ordered;
+    falls back to message id, then to the instance key.
+    """
+    conversation = payload.get('conversation') if isinstance(payload, dict) else None
+    conversation_id = None
+    if isinstance(conversation, dict):
+        conversation_id = conversation.get('id')
+    if conversation_id is None:
+        conversation_id = payload.get('conversation_id')
+    if conversation_id is not None:
+        return f'{instance_key}:conversation:{conversation_id}'
+    message_id = payload.get('id')
+    if message_id is not None:
+        return f'{instance_key}:message:{message_id}'
+    return f'{instance_key}:instance'
+
+
+def _get_webhook_delivery_lock(lock_key: str) -> asyncio.Lock:
+    """Return (creating if needed) the delivery lock for a key, with FIFO eviction."""
+    lock = _webhook_delivery_locks.get(lock_key)
+    if lock is None:
+        if len(_webhook_delivery_locks) >= _WEBHOOK_DELIVERY_LOCKS_MAX:
+            evicted_key = next(iter(_webhook_delivery_locks))
+            _webhook_delivery_locks.pop(evicted_key, None)
+        lock = asyncio.Lock()
+        _webhook_delivery_locks[lock_key] = lock
+    return lock
+
+
+def _release_webhook_delivery_lock(lock_key: str, lock: asyncio.Lock) -> None:
+    """Drop a lock entry once it is unlocked and has no waiters (simple cleanup)."""
+    if not lock.locked() and _webhook_delivery_locks.get(lock_key) is lock:
+        _webhook_delivery_locks.pop(lock_key, None)
+
+
+def _log_delivery_result(resolved_instance_key: str, route_key: Optional[str], result: Any) -> None:
+    """Log a warning when a background delivery result dict indicates not-ok.
+
+    Services often return failure dicts instead of raising; without this those
+    failures would be silently lost after the ack-first change. Successes stay
+    quiet; 'duplicate' logs at DEBUG.
+    """
+    if not isinstance(result, dict):
+        return
+    status_value = result.get('status')
+    if status_value == 'duplicate':
+        logger.debug(
+            'endpoint=webhook_chatwoot background_delivery_duplicate instance_key=%s route_key=%s detail=%s',
+            resolved_instance_key,
+            route_key,
+            result.get('detail') or result.get('message'),
+        )
+        return
+    not_ok = (
+        result.get('ok') is False
+        or status_value in ('failed', 'error')
+        or result.get('message') == 'delivery_failed'
+    )
+    if not_ok:
+        logger.warning(
+            'endpoint=webhook_chatwoot background_delivery_failed instance_key=%s route_key=%s status=%s detail=%s',
+            resolved_instance_key,
+            route_key,
+            status_value,
+            result.get('detail') or result.get('message'),
+        )
+
+
+async def _deliver_chatwoot_webhook_background(
+    platform_key: str,
+    resolved_instance_key: str,
+    payload: dict[str, Any],
+    *,
+    route_key: Optional[str],
+) -> None:
+    """Deliver a Chatwoot webhook to the platform in the background.
+
+    Runs with its own DB session because the request-scoped session is closed
+    when the webhook response is returned. Delivery failures were already
+    acknowledged with HTTP 200 before this change, so logging here preserves
+    the previous failure semantics while decoupling Chatwoot's webhook timeout
+    from platform delivery latency.
+
+    Delivery is serialized per (instance, conversation) to close the TOCTOU
+    duplicate window between concurrent redeliveries, bounded by a module-level
+    semaphore, and capped by a timeout so hung transfers cannot accumulate.
+    """
+    db = SessionLocal()
+    try:
+        if platform_key == 'bale_enterprise':
+            result = await enterprise.receive_chatwoot_webhook(db, resolved_instance_key, payload)
+        elif platform_key == 'telegram_enterprise':
+            result = await enterprise_telegram.receive_chatwoot_webhook(db, resolved_instance_key, payload)
+        elif platform_key == 'bale_pv_enterprise':
+            result = await chatwoot_bridge.handle_chatwoot_webhook(db, resolved_instance_key, payload)
+        else:
+            result = await bridge.receive_chatwoot_webhook(db, resolved_instance_key, payload)
+        _log_delivery_result(resolved_instance_key, route_key, result)
+    except Exception as exc:
+        logger.exception(
+            'endpoint=webhook_chatwoot background_delivery_failed instance_key=%s route_key=%s error=%s',
+            resolved_instance_key,
+            route_key,
+            str(exc),
+        )
+    finally:
+        db.close()
+
+
+async def _deliver_chatwoot_webhook_guarded(
+    platform_key: str,
+    resolved_instance_key: str,
+    payload: dict[str, Any],
+    *,
+    route_key: Optional[str],
+) -> None:
+    """Wrap background delivery with the semaphore, timeout, and per-conversation lock."""
+    lock_key = _chatwoot_delivery_lock_key(resolved_instance_key, payload)
+    async with _webhook_delivery_semaphore:
+        lock = _get_webhook_delivery_lock(lock_key)
+        async with lock:
+            try:
+                await asyncio.wait_for(
+                    _deliver_chatwoot_webhook_background(
+                        platform_key,
+                        resolved_instance_key,
+                        payload,
+                        route_key=route_key,
+                    ),
+                    timeout=_WEBHOOK_DELIVERY_TIMEOUT_SECONDS,
+                )
+            except asyncio.TimeoutError:
+                # Hung transfer hit the delivery timeout; log as a delivery
+                # failure (wait_for already cancelled the inner task).
+                logger.warning(
+                    'endpoint=webhook_chatwoot background_delivery_failed instance_key=%s route_key=%s error=delivery_timeout',
+                    resolved_instance_key,
+                    route_key,
+                )
+            finally:
+                _release_webhook_delivery_lock(lock_key, lock)
+
+
 async def _handle_chatwoot_webhook(
     db: Session,
     instance_key: str,
@@ -1125,22 +1307,30 @@ async def _handle_chatwoot_webhook(
     *,
     route_key: Optional[str],
 ) -> GenericMessageResponse:
-    """Shared Chatwoot webhook handler."""
+    """Shared Chatwoot webhook handler.
+
+    Resolves the target instance synchronously (fast, local), then acknowledges
+    Chatwoot immediately and performs the actual platform delivery in a
+    background task so slow Bale/media transfers cannot trip Chatwoot's
+    webhook timeout or cause webhook retries/duplicates.
+    """
     try:
         runtime = _resolve_chatwoot_webhook_runtime(db, instance_key, payload)
         resolved_instance_key = runtime.instance.instance_key
-        if runtime.platform_type.key == 'bale_enterprise':
-            result = await enterprise.receive_chatwoot_webhook(db, resolved_instance_key, payload)
-        elif runtime.platform_type.key == 'telegram_enterprise':
-            result = await enterprise_telegram.receive_chatwoot_webhook(db, resolved_instance_key, payload)
-        elif runtime.platform_type.key == 'bale_pv_enterprise':
-            result = await chatwoot_bridge.handle_chatwoot_webhook(db, resolved_instance_key, payload)
-        else:
-            result = await bridge.receive_chatwoot_webhook(db, resolved_instance_key, payload)
+        task = asyncio.create_task(
+            _deliver_chatwoot_webhook_guarded(
+                runtime.platform_type.key,
+                resolved_instance_key,
+                payload,
+                route_key=route_key,
+            )
+        )
+        _webhook_delivery_tasks.add(task)
+        task.add_done_callback(_webhook_delivery_tasks.discard)
         return GenericMessageResponse(
-            message=str(result.get('message') or 'ok'),
-            detail=result.get('detail'),
-            status=result.get('status'),
+            message='accepted',
+            detail='delivery scheduled in background',
+            status='queued',
         )
     except HTTPException:
         raise
@@ -1160,6 +1350,9 @@ async def _handle_chatwoot_webhook(
             instance_key=instance_key,
         )
     except RuntimeError as exc:
+        # Delivery runs in a background task now, so delivery failures can no
+        # longer propagate here; this branch only covers RuntimeErrors raised
+        # during instance/payload resolution (before the task is scheduled).
         logger.warning(
             'endpoint=webhook_chatwoot status=200 detail=delivery_failed instance_key=%s route_key=%s error=%s',
             instance_key,
@@ -1461,11 +1654,28 @@ def _enterprise_manual_group_to_response(row) -> EnterpriseManualGroupResponse:
 
 
 @router.get('/instances/{instance_key}/conversations', response_model=ConversationListResponse)
-def list_instance_conversations(instance_key: str, q: Optional[str] = None, db: Session = Depends(get_db)):
+def list_instance_conversations(
+    instance_key: str,
+    q: Optional[str] = None,
+    limit: int = 50,
+    offset: int = 0,
+    include: Optional[str] = None,
+    db: Session = Depends(get_db),
+):
     """List instance conversations."""
     try:
         runtime = _require_instance_runtime(db, instance_key)
-        rows = conversations.list_for_instance(db, runtime.instance.id)
+        limit = max(1, min(int(limit or 50), 200))
+        offset = max(0, int(offset or 0))
+        include_messages = include is not None and 'messages' in {
+            part.strip().lower() for part in include.split(',')
+        }
+        rows = ConversationRepository(db).list_by_instance(
+            runtime.instance.id,
+            limit=limit,
+            offset=offset,
+            include_messages=include_messages,
+        )
         if q:
             needle = q.strip().lower()
             rows = [
@@ -1905,7 +2115,13 @@ def get_instance_conversation(instance_key: str, conversation_id: str, db: Sessi
 
 
 @router.get('/instances/{instance_key}/conversations/{conversation_id}/messages', response_model=MessageMappingListResponse)
-def list_conversation_messages(instance_key: str, conversation_id: str, db: Session = Depends(get_db)):
+def list_conversation_messages(
+    instance_key: str,
+    conversation_id: str,
+    limit: int = 50,
+    offset: int = 0,
+    db: Session = Depends(get_db),
+):
     """List conversation messages."""
     try:
         runtime = _require_instance_runtime(db, instance_key)
@@ -1919,7 +2135,9 @@ def list_conversation_messages(instance_key: str, conversation_id: str, db: Sess
                 conversation_id=conversation_id,
             )
 
-        mapped = messages.list_for_conversation(db, row.id)
+        limit = max(1, min(int(limit or 50), 200))
+        offset = max(0, int(offset or 0))
+        mapped = MessageMappingRepository(db).list_by_conversation(row.id, limit=limit, offset=offset)
         return MessageMappingListResponse(items=[_msg_to_response(item) for item in mapped])
     except HTTPException:
         raise

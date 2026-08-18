@@ -73,6 +73,16 @@ class TelegramBotConnector:
         return f'{raw}/file/bot'
 
     @staticmethod
+    def _safe_error_message(exc: Exception) -> str:
+        """Internal helper to build a token-safe error detail for logs."""
+        detail = type(exc).__name__
+        response = getattr(exc, 'response', None)
+        status = getattr(response, 'status_code', None)
+        if status is not None:
+            detail = f'{detail} status={status}'
+        return detail
+
+    @staticmethod
     def _is_image(filename: str, content_type: Optional[str]) -> bool:
         """Internal helper to is image."""
         ctype = str(content_type or '').strip().lower()
@@ -147,7 +157,7 @@ class TelegramBotConnector:
                 ]
             )
         except Exception as exc:
-            self._logger.warning('failed to set telegram bot commands error=%s', str(exc))
+            self._logger.warning('failed to set telegram bot commands error=%s', self._safe_error_message(exc))
 
     async def _create_runtime(self, cfg: TelegramInstanceConfig) -> TelegramInstanceRuntime:
         """Internal helper to create runtime."""
@@ -156,17 +166,17 @@ class TelegramBotConnector:
         request = HTTPXRequest(
             proxy=proxy,
             read_timeout=30.0,
-            write_timeout=10.0,
-            connect_timeout=5.0,
-            pool_timeout=1.0,
+            write_timeout=30.0,
+            connect_timeout=10.0,
+            pool_timeout=10.0,
         )
         # getUpdates long-polling needs a read timeout longer than the poll timeout
         get_updates_request = HTTPXRequest(
             proxy=proxy,
-            read_timeout=35.0,
-            write_timeout=10.0,
-            connect_timeout=5.0,
-            pool_timeout=1.0,
+            read_timeout=float(settings.TELEGRAM_LONG_POLL_TIMEOUT_SECONDS) + 15.0,
+            write_timeout=30.0,
+            connect_timeout=10.0,
+            pool_timeout=10.0,
         )
         bot = Bot(
             token=cfg.token,
@@ -176,7 +186,7 @@ class TelegramBotConnector:
             get_updates_request=get_updates_request,
         )
         file_client = httpx.AsyncClient(
-            timeout=httpx.Timeout(connect=5.0, read=30.0, write=10.0, pool=1.0),
+            timeout=httpx.Timeout(connect=10.0, read=120.0, write=30.0, pool=10.0),
             proxy=proxy,
         )
         try:
@@ -208,6 +218,17 @@ class TelegramBotConnector:
             raise RuntimeError(f"Telegram instance '{instance}' is not configured")
         return runtime
 
+    @staticmethod
+    def _runtime_clients_closed(runtime: TelegramInstanceRuntime) -> bool:
+        """Internal helper to detect runtimes whose httpx clients are closed."""
+        if runtime.file_client.is_closed:
+            return True
+        for request in getattr(runtime.bot, '_request', None) or []:
+            client = getattr(request, '_client', None)
+            if client is not None and getattr(client, 'is_closed', False):
+                return True
+        return False
+
     async def connect(
         self,
         instance: str,
@@ -231,14 +252,19 @@ class TelegramBotConnector:
             proxy_url=proxy_url,
         )
         existing = self._instances.get(instance)
-        if existing and existing.cfg == cfg:
+        if existing and existing.cfg == cfg and not self._runtime_clients_closed(existing):
             return
 
         if existing:
             await self._shutdown_runtime(existing)
 
-        runtime = await self._create_runtime(cfg)
-        self._instances[instance] = runtime
+        try:
+            runtime = await self._create_runtime(cfg)
+            self._instances[instance] = runtime
+        except Exception:
+            # Drop any poisoned entry so the next connect() retries cleanly.
+            self._instances.pop(instance, None)
+            raise
         safe_token = redact_secret(token) if settings.LOG_REDACT_SECRETS else token
         self._logger.info(
             'configured instance=%s api_base_url=%s file_base_url=%s proxy=%s token=%s',
@@ -311,7 +337,7 @@ class TelegramBotConnector:
                 instance,
                 chat_id,
                 type(exc).__name__,
-                error_msg,
+                self._safe_error_message(exc),
                 exc_info=True,
             )
             raise RuntimeError(error_msg) from exc
@@ -407,7 +433,7 @@ class TelegramBotConnector:
                 chat_id,
                 filename,
                 type(exc).__name__,
-                error_msg,
+                self._safe_error_message(exc),
                 exc_info=True,
             )
             raise RuntimeError(error_msg) from exc
@@ -457,7 +483,7 @@ class TelegramBotConnector:
                 instance,
                 offset,
                 timeout,
-                str(exc),
+                self._safe_error_message(exc),
                 exc_info=True,
             )
             return {'ok': False, 'description': str(exc)}
@@ -491,7 +517,7 @@ class TelegramBotConnector:
                 'download_file_by_id failed instance=%s file_id=%s error=%s',
                 instance,
                 file_id,
-                str(exc),
+                self._safe_error_message(exc),
                 exc_info=True,
             )
             return b'', None, None

@@ -148,6 +148,12 @@ class BalePvConnector:
     def __init__(self) -> None:
         self._instances: Dict[str, BalePvInstanceRuntime] = {}
         self._logger = logging.getLogger("app.connectors.bale_pv")
+        # Per-instance HTTP clients for Nasim media upload/download; created
+        # lazily so no connections are opened until the first file transfer.
+        # Each client has its own cookie jar — the Bale set-cookie endpoint
+        # authenticates transfers purely via cookies, so a shared jar would
+        # let one instance's transfer authenticate as another instance.
+        self._media_http_clients: Dict[str, Any] = {}
 
     def _get_runtime(self, instance: str) -> BalePvInstanceRuntime:
         runtime = self._instances.get(instance)
@@ -155,18 +161,41 @@ class BalePvConnector:
             raise RuntimeError(f"Bale PV instance '{instance}' is not configured")
         return runtime
 
+    def _get_media_http_client(self, instance: str) -> Any:
+        """Return the per-instance AsyncClient for media transfer.
+
+        One client per instance key (each with an isolated cookie jar) to
+        avoid cross-tenant auth leakage via shared cookies. Long read/write
+        timeouts accommodate large attachments. Clients are closed in
+        ``disconnect()`` and ``close()``.
+        """
+        import httpx
+
+        client = self._media_http_clients.get(instance)
+        if client is None:
+            client = httpx.AsyncClient(
+                follow_redirects=True,
+                timeout=httpx.Timeout(connect=10, read=120, write=120, pool=10),
+            )
+            self._media_http_clients[instance] = client
+        return client
+
     @staticmethod
     def _normalize_bale_phone(phone: str) -> str:
         """Normalize an Iranian phone number for Bale auth.
 
         Strips non-digits. If it starts with 0, replaces with 98.
-        Examples: 09136421196 → 989136421196, +989136421196 → 989136421196
+        A leading 00 international prefix is treated as the country code.
+        Examples: 09136421196 → 989136421196, +989136421196 → 989136421196,
+        00989136421196 → 989136421196
         """
         digits = re.sub(r"\D", "", str(phone or "").strip())
-        if digits.startswith("0") and len(digits) == 11:
+        if digits.startswith("00"):
+            # International prefix (e.g. 0098...) — strip it; the country
+            # code that follows is already in dialable form.
+            digits = digits[2:]
+        elif digits.startswith("0") and len(digits) == 11:
             digits = "98" + digits[1:]
-        elif digits.startswith("+"):
-            digits = digits[1:]
         return digits
 
     @staticmethod
@@ -271,6 +300,32 @@ class BalePvConnector:
             return None, AudioExt(duration=0)
 
         return None, None
+
+    @staticmethod
+    def _validate_session_dir(session_dir: Path) -> Path:
+        """Reject ``bale_pv_session_dir`` values that escape the data root.
+
+        The value comes from unauthenticated instance metadata and is used
+        for ``mkdir`` and JWT file writes, so it must stay inside
+        ``<repo_root>/data``.  Relative paths are resolved against the repo
+        root so the default ``./data/bale_pv_sessions`` keeps working.
+        Raises ``ValueError`` on traversal attempts.
+        """
+        if ".." in session_dir.parts:
+            raise ValueError(
+                f"bale_pv_session_dir must not contain '..' components: {session_dir}"
+            )
+        repo_root = Path(__file__).resolve().parent.parent.parent
+        data_root = (repo_root / "data").resolve()
+        if session_dir.is_absolute():
+            resolved = session_dir.resolve()
+        else:
+            resolved = (repo_root / session_dir).resolve()
+        if not resolved.is_relative_to(data_root):
+            raise ValueError(
+                f"bale_pv_session_dir must be under {data_root}: {session_dir}"
+            )
+        return resolved
 
     def _session_path(self, runtime: BalePvInstanceRuntime) -> Path:
         runtime.session_dir.mkdir(parents=True, exist_ok=True)
@@ -421,6 +476,7 @@ class BalePvConnector:
             await self.disconnect(instance)
 
         session_dir = Path(str(params.get("bale_pv_session_dir") or "./data/bale_pv_sessions"))
+        session_dir = self._validate_session_dir(session_dir)
         session_dir.mkdir(parents=True, exist_ok=True)
 
         # NOTE: Bale PV userbot mode requires gRPC-Web/protobuf auth (next-ws.bale.ai).
@@ -467,6 +523,12 @@ class BalePvConnector:
 
     async def disconnect(self, instance: str) -> None:
         """Stop connector runtime for a specific instance."""
+        media_client = self._media_http_clients.pop(instance, None)
+        if media_client is not None:
+            try:
+                await media_client.aclose()
+            except Exception:
+                pass
         runtime = self._instances.pop(instance, None)
         if not runtime:
             return
@@ -659,21 +721,20 @@ class BalePvConnector:
                 media_url_or_bytes[:120],
             )
             try:
-                import httpx
-                async with httpx.AsyncClient(follow_redirects=True, timeout=60) as client:
-                    resp = await client.get(media_url_or_bytes)
-                    self._logger.info(
-                        "bale_pv media_download_status instance=%s status=%s len=%s",
-                        instance,
-                        resp.status_code,
-                        len(resp.content),
+                client = self._get_media_http_client(instance)
+                resp = await client.get(media_url_or_bytes)
+                self._logger.info(
+                    "bale_pv media_download_status instance=%s status=%s len=%s",
+                    instance,
+                    resp.status_code,
+                    len(resp.content),
+                )
+                if resp.status_code == 200:
+                    file_bytes = resp.content
+                else:
+                    raise RuntimeError(
+                        f"Media download failed: HTTP {resp.status_code} - {resp.text[:200]}"
                     )
-                    if resp.status_code == 200:
-                        file_bytes = resp.content
-                    else:
-                        raise RuntimeError(
-                            f"Media download failed: HTTP {resp.status_code} - {resp.text[:200]}"
-                        )
             except Exception as exc:
                 self._logger.exception(
                     "bale_pv media_download_error instance=%s url=%s error=%s",
@@ -760,225 +821,227 @@ class BalePvConnector:
             jwt = jwt_raw[4:] if jwt_raw.startswith("jwt:") else jwt_raw
 
         upload_timeout = settings.BALE_PV_MEDIA_UPLOAD_TIMEOUT_SECONDS
-        async with httpx.AsyncClient(
-            follow_redirects=True,
-            timeout=upload_timeout,
-        ) as client:
-            # Establish cookie session with retries on transient network errors.
-            cookie_resp = None
-            last_cookie_err = None
-            for attempt in range(1, 4):
-                try:
-                    cookie_resp = await client.post(
-                        "https://next-ws.bale.ai/set-cookie/",
-                        headers={
-                            "Authorization": f"Bearer {jwt}",
-                            "Origin": "https://web.bale.ai",
-                        },
-                    )
-                    break
-                except (httpx.ConnectTimeout, httpx.ConnectError, httpx.ReadTimeout) as exc:
-                    last_cookie_err = exc
-                    self._logger.warning(
-                        "bale_pv set_cookie_retry instance=%s attempt=%s/%s error=%s",
-                        instance,
-                        attempt,
-                        3,
-                        exc,
-                    )
-                    if attempt < 3:
-                        await asyncio.sleep(2 ** attempt)
-            if cookie_resp is None:
-                raise RuntimeError(
-                    f"Bale set-cookie failed after retries: {last_cookie_err}"
-                )
-            if cookie_resp.status_code != 200:
-                raise RuntimeError(
-                    f"Bale set-cookie failed: HTTP {cookie_resp.status_code}"
-                )
-
-            # Call GetNasimFileUploadUrl with retries on transient network errors.
-            resp = None
-            last_upload_url_err = None
-            for attempt in range(1, 4):
-                try:
-                    resp = await client.post(
-                        "https://next-ws.bale.ai/ai.bale.server.Files/GetNasimFileUploadUrl",
-                        content=grpc_web_frame(req.serialize()),
-                        headers={
-                            "content-type": "application/grpc-web+proto",
-                            "x-grpc-web": "1",
-                            "mt_app_version": "157595",
-                            "app_version": "157595",
-                            "browser_type": "1",
-                            "mt_browser_type": "1",
-                            "browser_version": "148.0.0.0",
-                            "mt_browser_version": "148.0.0.0",
-                            "os_type": "3",
-                            "mt_os_type": "3",
-                            "session_id": str(int(time.time() * 1000)),
-                            "mt_session_id": str(int(time.time() * 1000)),
-                        },
-                    )
-                    break
-                except (httpx.ConnectTimeout, httpx.ConnectError, httpx.ReadTimeout) as exc:
-                    last_upload_url_err = exc
-                    self._logger.warning(
-                        "bale_pv get_upload_url_retry instance=%s attempt=%s/%s error=%s",
-                        instance,
-                        attempt,
-                        3,
-                        exc,
-                    )
-                    if attempt < 3:
-                        await asyncio.sleep(2 ** attempt)
-            if resp is None:
-                raise RuntimeError(
-                    f"GetNasimFileUploadUrl failed after retries: {last_upload_url_err}"
-                )
-
-            msg, status, grpc_msg = parse_grpc_web_response(resp.content)
-            self._logger.info(
-                "bale_pv upload_url_raw_hex instance=%s hex=%s",
-                instance,
-                msg.hex() if msg else "empty",
-            )
-            if status != 0:
-                raise RuntimeError(
-                    f"GetNasimFileUploadUrl failed: gRPC status {status} - {grpc_msg}"
-                )
-
-            # Parse upload URL response
-            fields = ProtobufParser(msg).parse()
-            upload_url = ""
-            file_id = 0
-            file_access_hash = 0
-            chunk_size = len(file_bytes)
-            self._logger.info("bale_pv upload_url_response fields=%s", fields)
-            for key, vals in fields.items():
-                if key == 2 and vals:
-                    val = vals[0]
-                    if isinstance(val, bytes):
-                        val = val.decode("utf-8", errors="replace")
-                    if isinstance(val, str) and val.startswith("http"):
-                        upload_url = val
-                elif key == 1 and vals:
-                    v = vals[0]
-                    if isinstance(v, int):
-                        file_id = v
-                    elif isinstance(v, bytes) and len(v) == 8:
-                        # fixed64 encoding
-                        file_id = int.from_bytes(v, "little")
-                elif key == 3 and vals:
-                    v = vals[0]
-                    if isinstance(v, int) and v != 0:
-                        # varint-encoded access_hash
-                        file_access_hash = v
-                    elif isinstance(v, bytes) and len(v) == 8:
-                        # fixed64-encoded access_hash
-                        file_access_hash = int.from_bytes(v, "little")
-                elif key == 4 and vals and isinstance(vals[0], int):
-                    chunk_size = vals[0]
-
-            # Fallback: the server has been observed to accept the peer_id as
-            # DocumentMessage.access_hash when the upload response doesn't carry
-            # an explicit file access_hash (field 3 absent or zero).  Using 0
-            # causes the server to reject with InvalidFileLocation.
-            if file_access_hash == 0 and peer_id != 0:
-                self._logger.info(
-                    "bale_pv upload_url_no_file_access_hash instance=%s falling_back_to_peer_id=%s",
-                    instance,
-                    peer_id,
-                )
-                file_access_hash = peer_id
-
-            if not upload_url:
-                raise RuntimeError(
-                    f"GetNasimFileUploadUrl returned no upload URL: {fields}"
-                )
-            if not file_id:
-                raise RuntimeError(
-                    f"GetNasimFileUploadUrl returned no file_id: {fields}"
-                )
-
-            self._logger.info(
-                "bale_pv uploading file instance=%s url=%s size=%s file_id=%s chunk_size=%s",
-                instance,
-                upload_url[:120],
-                len(file_bytes),
-                file_id,
-                chunk_size,
-            )
-
-            # Upload file bytes via PUT (matching Balethon behaviour).
-            # The signed URL was requested for a specific Content-Type, so we
-            # must include it (and Content-Length) in the PUT.
+        # Reuse the per-instance media client (created lazily, closed in
+        # disconnect()/close()).
+        client = self._get_media_http_client(instance)
+        # Establish cookie session with retries on transient network errors.
+        cookie_resp = None
+        last_cookie_err = None
+        for attempt in range(1, 4):
             try:
-                upload_resp = await client.put(
-                    upload_url,
-                    content=file_bytes,
+                cookie_resp = await client.post(
+                    "https://next-ws.bale.ai/set-cookie/",
                     headers={
-                        "content-type": mime_type,
-                        "content-length": str(len(file_bytes)),
+                        "Authorization": f"Bearer {jwt}",
+                        "Origin": "https://web.bale.ai",
                     },
                 )
-            except (httpx.ConnectTimeout, httpx.ConnectError, httpx.ReadTimeout, httpx.WriteTimeout) as exc:
-                raise RuntimeError(
-                    f"File upload to Nasim timed out (size={len(file_bytes)} bytes, "
-                    f"timeout={upload_timeout}s). Consider increasing "
-                    f"BALE_PV_MEDIA_UPLOAD_TIMEOUT_SECONDS: {exc}"
-                ) from exc
-            if upload_resp.status_code not in (200, 201, 204):
-                raise RuntimeError(
-                    f"File upload to Nasim failed: HTTP {upload_resp.status_code} - {upload_resp.text[:200]}"
+                break
+            except (httpx.ConnectTimeout, httpx.ConnectError, httpx.ReadTimeout) as exc:
+                last_cookie_err = exc
+                self._logger.warning(
+                    "bale_pv set_cookie_retry instance=%s attempt=%s/%s error=%s",
+                    instance,
+                    attempt,
+                    3,
+                    exc,
                 )
-
-            self._logger.info(
-                "bale_pv file_uploaded instance=%s file_id=%s size=%s",
-                instance,
-                file_id,
-                len(file_bytes),
+                if attempt < 3:
+                    await asyncio.sleep(2 ** attempt)
+        if cookie_resp is None:
+            raise RuntimeError(
+                f"Bale set-cookie failed after retries: {last_cookie_err}"
+            )
+        if cookie_resp.status_code != 200:
+            raise RuntimeError(
+                f"Bale set-cookie failed: HTTP {cookie_resp.status_code}"
             )
 
-            # Build optional media metadata (thumb + dimensions/duration) so the
-            # Bale client renders photos/videos/voice correctly instead of as
-            # generic documents.
-            thumb, ext = self._media_metadata_for_send(
-                filename=filename,
-                mime_type=mime_type,
-                file_bytes=file_bytes,
-                send_type=send_type,
+        # Call GetNasimFileUploadUrl with retries on transient network errors.
+        resp = None
+        last_upload_url_err = None
+        for attempt in range(1, 4):
+            try:
+                resp = await client.post(
+                    "https://next-ws.bale.ai/ai.bale.server.Files/GetNasimFileUploadUrl",
+                    content=grpc_web_frame(req.serialize()),
+                    headers={
+                        "content-type": "application/grpc-web+proto",
+                        "x-grpc-web": "1",
+                        "mt_app_version": "157595",
+                        "app_version": "157595",
+                        "browser_type": "1",
+                        "mt_browser_type": "1",
+                        "browser_version": "148.0.0.0",
+                        "mt_browser_version": "148.0.0.0",
+                        "os_type": "3",
+                        "mt_os_type": "3",
+                        "session_id": str(int(time.time() * 1000)),
+                        "mt_session_id": str(int(time.time() * 1000)),
+                    },
+                )
+                break
+            except (httpx.ConnectTimeout, httpx.ConnectError, httpx.ReadTimeout) as exc:
+                last_upload_url_err = exc
+                self._logger.warning(
+                    "bale_pv get_upload_url_retry instance=%s attempt=%s/%s error=%s",
+                    instance,
+                    attempt,
+                    3,
+                    exc,
+                )
+                if attempt < 3:
+                    await asyncio.sleep(2 ** attempt)
+        if resp is None:
+            raise RuntimeError(
+                f"GetNasimFileUploadUrl failed after retries: {last_upload_url_err}"
             )
 
-            # Send document message via WebSocket
-            reply_to = None
-            if quoted:
-                reply_to_val = quoted.get("message_id") or quoted.get("id")
-                if reply_to_val is not None:
-                    reply_to = int(reply_to_val)
+        msg, status, grpc_msg = parse_grpc_web_response(resp.content)
+        self._logger.info(
+            "bale_pv upload_url_raw_hex instance=%s hex=%s",
+            instance,
+            msg.hex() if msg else "empty",
+        )
+        if status != 0:
+            raise RuntimeError(
+                f"GetNasimFileUploadUrl failed: gRPC status {status} - {grpc_msg}"
+            )
 
+        # Parse upload URL response
+        fields = ProtobufParser(msg).parse()
+        upload_url = ""
+        file_id = 0
+        file_access_hash = 0
+        chunk_size = len(file_bytes)
+        self._logger.info("bale_pv upload_url_response fields=%s", fields)
+        for key, vals in fields.items():
+            if key == 2 and vals:
+                val = vals[0]
+                if isinstance(val, bytes):
+                    val = val.decode("utf-8", errors="replace")
+                if isinstance(val, str) and val.startswith("http"):
+                    upload_url = val
+            elif key == 1 and vals:
+                v = vals[0]
+                if isinstance(v, int):
+                    file_id = v
+                elif isinstance(v, bytes) and len(v) == 8:
+                    # fixed64 encoding
+                    file_id = int.from_bytes(v, "little")
+            elif key == 3 and vals:
+                v = vals[0]
+                if isinstance(v, int) and v != 0:
+                    # varint-encoded access_hash
+                    file_access_hash = v
+                elif isinstance(v, bytes) and len(v) == 8:
+                    # fixed64-encoded access_hash
+                    file_access_hash = int.from_bytes(v, "little")
+            elif key == 4 and vals and isinstance(vals[0], int):
+                chunk_size = vals[0]
+
+        # Fallback: the server has been observed to accept the peer_id as
+        # DocumentMessage.access_hash when the upload response doesn't carry
+        # an explicit file access_hash (field 3 absent or zero).  Using 0
+        # causes the server to reject with InvalidFileLocation.
+        if file_access_hash == 0 and peer_id != 0:
             self._logger.info(
-                "bale_pv sending_document instance=%s peer_id=%s file_id=%s file_access_hash=%s peer_access_hash=%s",
+                "bale_pv upload_url_no_file_access_hash instance=%s falling_back_to_peer_id=%s",
                 instance,
                 peer_id,
-                file_id,
-                file_access_hash,
-                access_hash,
             )
-            await runtime.client.send_document(
-                peer_id=peer_id,
-                file_id=file_id,
-                file_access_hash=file_access_hash,
-                file_size=len(file_bytes),
-                name=filename,
-                mime_type=mime_type,
-                caption=caption or None,
-                reply_to_message_id=reply_to,
-                thumb=thumb,
-                ext=ext,
-                peer_access_hash=access_hash or 0,
+            file_access_hash = peer_id
+
+        if not upload_url:
+            raise RuntimeError(
+                f"GetNasimFileUploadUrl returned no upload URL: {fields}"
             )
-            return {"ok": True, "result": {"file_id": file_id, "name": filename}}
+        if not file_id:
+            raise RuntimeError(
+                f"GetNasimFileUploadUrl returned no file_id: {fields}"
+            )
+
+        self._logger.info(
+            "bale_pv uploading file instance=%s url=%s size=%s file_id=%s chunk_size=%s",
+            instance,
+            upload_url[:120],
+            len(file_bytes),
+            file_id,
+            chunk_size,
+        )
+
+        # Upload file bytes via PUT (matching Balethon behaviour).
+        # The signed URL was requested for a specific Content-Type, so we
+        # must include it (and Content-Length) in the PUT.
+        try:
+            upload_resp = await client.put(
+                upload_url,
+                content=file_bytes,
+                headers={
+                    "content-type": mime_type,
+                    "content-length": str(len(file_bytes)),
+                },
+                timeout=httpx.Timeout(
+                    connect=10, read=upload_timeout, write=upload_timeout, pool=10
+                ),
+            )
+        except (httpx.ConnectTimeout, httpx.ConnectError, httpx.ReadTimeout, httpx.WriteTimeout) as exc:
+            raise RuntimeError(
+                f"File upload to Nasim timed out (size={len(file_bytes)} bytes, "
+                f"timeout={upload_timeout}s). Consider increasing "
+                f"BALE_PV_MEDIA_UPLOAD_TIMEOUT_SECONDS: {exc}"
+            ) from exc
+        if upload_resp.status_code not in (200, 201, 204):
+            raise RuntimeError(
+                f"File upload to Nasim failed: HTTP {upload_resp.status_code} - {upload_resp.text[:200]}"
+            )
+
+        self._logger.info(
+            "bale_pv file_uploaded instance=%s file_id=%s size=%s",
+            instance,
+            file_id,
+            len(file_bytes),
+        )
+
+        # Build optional media metadata (thumb + dimensions/duration) so the
+        # Bale client renders photos/videos/voice correctly instead of as
+        # generic documents.
+        thumb, ext = self._media_metadata_for_send(
+            filename=filename,
+            mime_type=mime_type,
+            file_bytes=file_bytes,
+            send_type=send_type,
+        )
+
+        # Send document message via WebSocket
+        reply_to = None
+        if quoted:
+            reply_to_val = quoted.get("message_id") or quoted.get("id")
+            if reply_to_val is not None:
+                reply_to = int(reply_to_val)
+
+        self._logger.info(
+            "bale_pv sending_document instance=%s peer_id=%s file_id=%s file_access_hash=%s peer_access_hash=%s",
+            instance,
+            peer_id,
+            file_id,
+            file_access_hash,
+            access_hash,
+        )
+        await runtime.client.send_document(
+            peer_id=peer_id,
+            file_id=file_id,
+            file_access_hash=file_access_hash,
+            file_size=len(file_bytes),
+            name=filename,
+            mime_type=mime_type,
+            caption=caption or None,
+            reply_to_message_id=reply_to,
+            thumb=thumb,
+            ext=ext,
+            peer_access_hash=access_hash or 0,
+        )
+        return {"ok": True, "result": {"file_id": file_id, "name": filename}}
 
     async def update_message(
         self,
@@ -1126,7 +1189,7 @@ class BalePvConnector:
 
         updates: List[Dict[str, Any]] = []
         max_items = 50
-        wait_seconds = min(timeout or 1, 5)
+        wait_seconds = min(timeout or 1, 25)
 
         raw_updates: List[Any] = []
         try:
@@ -1782,7 +1845,6 @@ class BalePvConnector:
             return b"", None, None
 
         try:
-            import httpx
             from bale_pv_connector.messaging_messages import (
                 GetNasimFileUrlRequest,
                 GetNasimFileUrlsRequest,
@@ -1802,30 +1864,83 @@ class BalePvConnector:
 
             peer_id = file_info.get("peer_id")
 
-            async with httpx.AsyncClient(follow_redirects=True) as client:
-                # Establish cookie session
-                cookie_resp = await client.post(
-                    "https://next-ws.bale.ai/set-cookie/",
-                    headers={
-                        "Authorization": f"Bearer {jwt}",
-                        "Origin": "https://web.bale.ai",
-                    },
+            # Reuse the per-instance media client (created lazily, closed in
+            # disconnect()/close()).
+            client = self._get_media_http_client(instance)
+            # Establish cookie session
+            cookie_resp = await client.post(
+                "https://next-ws.bale.ai/set-cookie/",
+                headers={
+                    "Authorization": f"Bearer {jwt}",
+                    "Origin": "https://web.bale.ai",
+                },
+            )
+            if cookie_resp.status_code != 200:
+                self._logger.warning(
+                    "bale_pv set_cookie_failed instance=%s status=%s",
+                    instance,
+                    cookie_resp.status_code,
                 )
-                if cookie_resp.status_code != 200:
+                return b"", None, None
+
+            download_url: Optional[str] = None
+
+            # Try GetNasimFileUrl first (single file URL).
+            req = GetNasimFileUrlRequest(file_id=fid, access_hash=ahash, file_storage_version=file_storage_version)
+            resp = await client.post(
+                "https://next-ws.bale.ai/ai.bale.server.Files/GetNasimFileUrl",
+                content=grpc_web_frame(req.serialize()),
+                headers={
+                    "content-type": "application/grpc-web+proto",
+                    "x-grpc-web": "1",
+                    "mt_app_version": "157595",
+                    "app_version": "157595",
+                    "browser_type": "1",
+                    "mt_browser_type": "1",
+                    "browser_version": "148.0.0.0",
+                    "mt_browser_version": "148.0.0.0",
+                    "os_type": "3",
+                    "mt_os_type": "3",
+                    "session_id": str(int(time.time() * 1000)),
+                    "mt_session_id": str(int(time.time() * 1000)),
+                },
+            )
+
+            msg, status, grpc_msg = parse_grpc_web_response(resp.content)
+            if status != 0:
+                self._logger.warning(
+                    "bale_pv GetNasimFileUrl grpc_error instance=%s status=%s msg=%s",
+                    instance,
+                    status,
+                    grpc_msg,
+                )
+            else:
+                download_url = self._extract_url_from_nasim_response(msg)
+                if not download_url:
                     self._logger.warning(
-                        "bale_pv set_cookie_failed instance=%s status=%s",
+                        "bale_pv GetNasimFileUrl no_url instance=%s msg_len=%s fields=%s",
                         instance,
-                        cookie_resp.status_code,
+                        len(msg),
+                        msg[:32].hex() if msg else "empty",
                     )
-                    return b"", None, None
 
-                download_url: Optional[str] = None
-
-                # Try GetNasimFileUrl first (single file URL).
-                req = GetNasimFileUrlRequest(file_id=fid, access_hash=ahash, file_storage_version=file_storage_version)
-                resp = await client.post(
-                    "https://next-ws.bale.ai/ai.bale.server.Files/GetNasimFileUrl",
-                    content=grpc_web_frame(req.serialize()),
+            # Fallback to GetNasimFileUrls (plural) when the single-file call
+            # fails or returns no URL. Some forwarded/sticker files need peer
+            # context to resolve.
+            if not download_url and peer_id is not None:
+                self._logger.info(
+                    "bale_pv trying_GetNasimFileUrls instance=%s file_id=%s peer_id=%s",
+                    instance,
+                    fid,
+                    peer_id,
+                )
+                urls_req = GetNasimFileUrlsRequest(
+                    peer_id=int(peer_id),
+                    files=[{"file_id": fid, "access_hash": ahash, "file_storage_version": file_storage_version}],
+                )
+                urls_resp = await client.post(
+                    "https://next-ws.bale.ai/ai.bale.server.Files/GetNasimFileUrls",
+                    content=grpc_web_frame(urls_req.serialize()),
                     headers={
                         "content-type": "application/grpc-web+proto",
                         "x-grpc-web": "1",
@@ -1841,107 +1956,56 @@ class BalePvConnector:
                         "mt_session_id": str(int(time.time() * 1000)),
                     },
                 )
-
-                msg, status, grpc_msg = parse_grpc_web_response(resp.content)
-                if status != 0:
+                urls_msg, urls_status, urls_grpc_msg = parse_grpc_web_response(
+                    urls_resp.content
+                )
+                if urls_status != 0:
                     self._logger.warning(
-                        "bale_pv GetNasimFileUrl grpc_error instance=%s status=%s msg=%s",
+                        "bale_pv GetNasimFileUrls grpc_error instance=%s status=%s msg=%s",
                         instance,
-                        status,
-                        grpc_msg,
+                        urls_status,
+                        urls_grpc_msg,
                     )
                 else:
-                    download_url = self._extract_url_from_nasim_response(msg)
+                    download_url = self._extract_url_from_nasim_urls_response(
+                        urls_msg, fid
+                    )
                     if not download_url:
                         self._logger.warning(
-                            "bale_pv GetNasimFileUrl no_url instance=%s msg_len=%s fields=%s",
+                            "bale_pv GetNasimFileUrls no_url instance=%s msg_len=%s",
                             instance,
-                            len(msg),
-                            msg[:32].hex() if msg else "empty",
+                            len(urls_msg),
                         )
 
-                # Fallback to GetNasimFileUrls (plural) when the single-file call
-                # fails or returns no URL. Some forwarded/sticker files need peer
-                # context to resolve.
-                if not download_url and peer_id is not None:
-                    self._logger.info(
-                        "bale_pv trying_GetNasimFileUrls instance=%s file_id=%s peer_id=%s",
-                        instance,
-                        fid,
-                        peer_id,
-                    )
-                    urls_req = GetNasimFileUrlsRequest(
-                        peer_id=int(peer_id),
-                        files=[{"file_id": fid, "access_hash": ahash, "file_storage_version": file_storage_version}],
-                    )
-                    urls_resp = await client.post(
-                        "https://next-ws.bale.ai/ai.bale.server.Files/GetNasimFileUrls",
-                        content=grpc_web_frame(urls_req.serialize()),
-                        headers={
-                            "content-type": "application/grpc-web+proto",
-                            "x-grpc-web": "1",
-                            "mt_app_version": "157595",
-                            "app_version": "157595",
-                            "browser_type": "1",
-                            "mt_browser_type": "1",
-                            "browser_version": "148.0.0.0",
-                            "mt_browser_version": "148.0.0.0",
-                            "os_type": "3",
-                            "mt_os_type": "3",
-                            "session_id": str(int(time.time() * 1000)),
-                            "mt_session_id": str(int(time.time() * 1000)),
-                        },
-                    )
-                    urls_msg, urls_status, urls_grpc_msg = parse_grpc_web_response(
-                        urls_resp.content
-                    )
-                    if urls_status != 0:
-                        self._logger.warning(
-                            "bale_pv GetNasimFileUrls grpc_error instance=%s status=%s msg=%s",
-                            instance,
-                            urls_status,
-                            urls_grpc_msg,
-                        )
-                    else:
-                        download_url = self._extract_url_from_nasim_urls_response(
-                            urls_msg, fid
-                        )
-                        if not download_url:
-                            self._logger.warning(
-                                "bale_pv GetNasimFileUrls no_url instance=%s msg_len=%s",
-                                instance,
-                                len(urls_msg),
-                            )
+            if not download_url:
+                return b"", None, None
 
-                if not download_url:
-                    return b"", None, None
+            self._logger.info(
+                "bale_pv downloading file instance=%s url=%s",
+                instance,
+                download_url[:120],
+            )
 
-                self._logger.info(
-                    "bale_pv downloading file instance=%s url=%s",
+            # Download the actual file
+            file_resp = await client.get(download_url)
+            if file_resp.status_code != 200:
+                self._logger.warning(
+                    "bale_pv file_download_failed instance=%s status=%s url=%s",
                     instance,
-                    download_url[:120],
+                    file_resp.status_code,
+                    download_url[:80],
                 )
+                return b"", None, None
 
-                # Download the actual file
-                file_resp = await client.get(download_url)
-                if file_resp.status_code != 200:
-                    self._logger.warning(
-                        "bale_pv file_download_failed instance=%s status=%s url=%s",
-                        instance,
-                        file_resp.status_code,
-                        download_url[:80],
-                    )
-                    return b"", None, None
-
-                content = file_resp.content
-                content_type = file_resp.headers.get("content-type")
-                self._logger.info(
-                    "bale_pv file_downloaded instance=%s size=%s ctype=%s",
-                    instance,
-                    len(content),
-                    content_type,
-                )
-                return content, content_type, filename or None
+            content = file_resp.content
+            content_type = file_resp.headers.get("content-type")
+            self._logger.info(
+                "bale_pv file_downloaded instance=%s size=%s ctype=%s",
+                instance,
+                len(content),
+                content_type,
+            )
+            return content, content_type, filename or None
 
         except Exception as exc:
             self._logger.exception(
@@ -1956,6 +2020,12 @@ class BalePvConnector:
         for key in list(self._instances.keys()):
             await self.disconnect(key)
         self._instances.clear()
+        for client in self._media_http_clients.values():
+            try:
+                await client.aclose()
+            except Exception:
+                pass
+        self._media_http_clients.clear()
 
     # ------------------------------------------------------------------
     # Auth helpers (used by API controller)

@@ -4,6 +4,7 @@ Module Overview
 Purpose: FastAPI application bootstrap, lifecycle hooks, and route mounting.
 Documentation Standard: module/class/public-method docstrings.
 """
+import asyncio
 import logging
 import time
 from contextlib import asynccontextmanager
@@ -16,12 +17,15 @@ from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 
 from app.config import settings
+from app.controllers.api_v1_controller import _webhook_delivery_tasks
 from app.controllers.api_v1_controller import router as api_v1_router
 from app.db import SessionLocal, engine
 from app.logging_config import configure_logging
 from app.models import Base
 from app.services.bale_polling_service import BalePollingService
 from app.services.platform_registry_service import PlatformRegistryService
+from app.utils.crypto_utils import build_previous_encryptor, encryptor
+from app.utils.key_rotation import rotate_instance_encryption
 
 polling_service = BalePollingService()
 logger = logging.getLogger('app.main')
@@ -40,6 +44,17 @@ async def lifespan(app: FastAPI):
         with SessionLocal() as db:
             PlatformRegistryService().ensure_seed_data(db)
 
+        # One-shot key rotation: when DATA_ENCRYPTION_KEY_PREVIOUS is set,
+        # re-encrypt stored instance secrets from the old key to the current
+        # one before any service tries to read them.
+        previous_encryptor = build_previous_encryptor()
+        if previous_encryptor is not None:
+            try:
+                with SessionLocal() as db:
+                    rotate_instance_encryption(db, encryptor, previous_encryptor)
+            except Exception:
+                logger.exception('encryption key rotation failed; continuing startup')
+
         await polling_service.start()
     except Exception:
         logger.exception('startup failed')
@@ -49,6 +64,19 @@ async def lifespan(app: FastAPI):
         yield
     finally:
         logger.info('shutdown')
+        # Drain in-flight background webhook deliveries before stopping services
+        # so acknowledged webhooks get a chance to finish platform delivery.
+        pending_tasks = [t for t in _webhook_delivery_tasks if not t.done()]
+        if pending_tasks:
+            logger.info('shutdown: draining %d in-flight webhook deliveries', len(pending_tasks))
+            try:
+                await asyncio.wait_for(asyncio.gather(*pending_tasks, return_exceptions=True), timeout=5)
+            except asyncio.TimeoutError:
+                for task in pending_tasks:
+                    task.cancel()
+                await asyncio.gather(*pending_tasks, return_exceptions=True)
+                cancelled = sum(1 for t in pending_tasks if t.cancelled())
+                logger.warning('shutdown: cancelled %d in-flight webhook deliveries', cancelled)
         try:
             await polling_service.stop()
         except Exception:

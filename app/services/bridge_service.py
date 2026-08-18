@@ -20,6 +20,7 @@ import time
 from typing import Any, Optional
 
 import httpx
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.clients.chatwoot_client import ChatwootClient
@@ -412,37 +413,102 @@ class BridgeService:
 
             if attachments:
                 message_kind = MessageKind.media
-                for index, attachment in enumerate(attachments):
-                    media = attachment.get('data_url') or attachment.get('content')
-                    if isinstance(media, str) and media.startswith('/'):
-                        media = f"{runtime.chatwoot.get('base_url', '').rstrip('/')}{media}"
-                    filename = self._normalize_filename_for_platform(
-                        attachment.get('file_name') or attachment.get('filename'),
-                        attachment.get('file_type') or attachment.get('content_type'),
-                        media if isinstance(media, str) else None,
-                    )
-                    result = await connector.send_media(
+                # Limit concurrent media sends (download from Chatwoot + upload
+                # to Bale) so a multi-attachment message doesn't block the loop.
+                media_send_semaphore = asyncio.Semaphore(3)
+
+                # access_hash is only accepted by the Bale PV connector;
+                # passing it to Bale/Telegram connectors raises TypeError.
+                access_hash_kwargs: dict[str, Any] = {}
+                if platform_key == 'bale_pv_enterprise':
+                    access_hash_kwargs['access_hash'] = phone_access_hash
+
+                async def _send_attachment(index: int, attachment: dict[str, Any]) -> dict[str, Any]:
+                    async with media_send_semaphore:
+                        media = attachment.get('data_url') or attachment.get('content')
+                        if isinstance(media, str) and media.startswith('/'):
+                            media = f"{runtime.chatwoot.get('base_url', '').rstrip('/')}{media}"
+                        filename = self._normalize_filename_for_platform(
+                            attachment.get('file_name') or attachment.get('filename'),
+                            attachment.get('file_type') or attachment.get('content_type'),
+                            media if isinstance(media, str) else None,
+                        )
+                        result = await connector.send_media(
+                            instance_key,
+                            str(destination_chat_id),
+                            media,
+                            filename,
+                            # Caption and quote only on the first attachment so
+                            # a text+N-photo message isn't delivered N times
+                            # and the quoted parent is only replied to once.
+                            caption=(content or None) if index == 0 else None,
+                            quoted=quoted if index == 0 else None,
+                            **access_hash_kwargs,
+                        )
+                        return result if isinstance(result, dict) else {}
+
+                send_results = await asyncio.gather(
+                    *(_send_attachment(index, attachment) for index, attachment in enumerate(attachments)),
+                    return_exceptions=True,
+                )
+                # asyncio.gather(return_exceptions=True) also captures
+                # CancelledError (a BaseException), so check BaseException
+                # everywhere in this block.
+                failed_indexes = [
+                    index
+                    for index, send_result in enumerate(send_results)
+                    if isinstance(send_result, BaseException)
+                ]
+                for index in failed_indexes:
+                    logger.warning(
+                        'outbound_media_attachment_failed instance=%s conversation_id=%s index=%s error=%s',
                         instance_key,
-                        str(destination_chat_id),
-                        media,
-                        filename,
-                        caption=content or None,
-                        quoted=quoted,
-                        access_hash=phone_access_hash,
+                        chatwoot_conversation_id,
+                        index,
+                        send_results[index],
                     )
-                    if index == 0:
-                        platform_response = result if isinstance(result, dict) else {}
+                first_result = send_results[0] if send_results else {}
+                if isinstance(first_result, BaseException):
+                    # Attachment 0 failed: fall back to the first successful
+                    # result for the platform response, or fail the message
+                    # when every attachment failed (same semantics as before).
+                    first_result = next(
+                        (r for r in send_results if not isinstance(r, BaseException)),
+                        None,
+                    )
+                    if first_result is None:
+                        raise send_results[0]
+                platform_response = first_result
+                if failed_indexes:
+                    # Partial failure: the successful attachments were
+                    # delivered, but the message must be marked failed so
+                    # redelivery can retry the missing ones (succeeded
+                    # attachments may duplicate on redelivery; acceptable).
+                    logger.error(
+                        'outbound_media_partial_failure instance=%s conversation_id=%s failed_indexes=%s',
+                        instance_key,
+                        chatwoot_conversation_id,
+                        failed_indexes,
+                    )
+                    raise RuntimeError(
+                        f'attachment send failed for indexes: {failed_indexes}'
+                    )
             else:
+                # access_hash is only accepted by the Bale PV connector;
+                # passing it to Bale/Telegram connectors raises TypeError.
+                text_kwargs: dict[str, Any] = {}
+                if platform_key == 'bale_pv_enterprise':
+                    text_kwargs['access_hash'] = phone_access_hash
                 result = await connector.send_text(
                     instance_key,
                     str(destination_chat_id),
                     content,
                     quoted=quoted,
-                    access_hash=phone_access_hash,
+                    **text_kwargs,
                 )
                 platform_response = result if isinstance(result, dict) else {}
 
-            platform_message_id = (platform_response or {}).get('id')
+            platform_message_id = self._extract_platform_message_id(platform_response)
             self._messages.upsert(
                 db,
                 conversation_id=conversation_id,
@@ -486,6 +552,28 @@ class BridgeService:
                 'chatwoot_message_id': str(chatwoot_message_id) if chatwoot_message_id else None,
                 'source_id': source_id,
             }
+
+    @staticmethod
+    def _extract_platform_message_id(platform_response: Optional[dict[str, Any]]) -> Optional[Any]:
+        """Extract the best available platform message id from a send response.
+
+        Bot-style connectors return a flat ``{'id': ...}``; Bale PV connectors
+        wrap the payload in an ``{'ok': True, 'result': {...}}`` envelope. Bale
+        PV sends are fire-and-forget, so ``result`` may carry no message id at
+        all (only ``raw_response``/``file_id``, which are not message ids) — in
+        that case None is returned gracefully.
+        """
+        if not isinstance(platform_response, dict):
+            return None
+        message_id = platform_response.get('id')
+        if message_id is not None:
+            return message_id
+        result = platform_response.get('result')
+        if isinstance(result, dict):
+            for key in ('message_id', 'rid', 'id', 'date'):
+                if result.get(key) is not None:
+                    return result.get(key)
+        return None
 
     async def ingest_platform_event(self, db: Session, instance_key: str, event: dict[str, Any]) -> dict[str, Any]:
         """Ingest platform event."""
@@ -2718,7 +2806,7 @@ class BridgeService:
         if not previous_name:
             if not row:
                 row = repo.get_or_create(conversation_id)
-            return resolved_name, row, resolved_name
+            return f'Operator {resolved_name} joined the conversation.', row, resolved_name
 
         if previous_name.casefold() == resolved_name.casefold():
             return None, row, previous_name
@@ -2967,6 +3055,17 @@ class BridgeService:
             .first()
         )
         if cached:
+            # Re-populate the adapter access-hash cache so the mapping survives
+            # an adapter restart (mirrors ChatwootBridgeService behavior).
+            access_hash = cached.access_hash
+            access_hash_int = int(access_hash) if access_hash and str(access_hash).lstrip("-").isdigit() else None
+            try:
+                from app.runtime_registry import get_runtime
+                registry_runtime = get_runtime(instance_key)
+                if registry_runtime is not None:
+                    registry_runtime.adapter.cache_access_hash(str(cached.bale_user_id), access_hash_int)
+            except Exception:
+                pass
             return {
                 "id": cached.bale_user_id,
                 "access_hash": cached.access_hash,
@@ -2989,7 +3088,25 @@ class BridgeService:
             nick=user.get("nick"),
         )
         db.add(cached)
-        db.commit()
+        try:
+            db.commit()
+        except IntegrityError:
+            # A concurrent request inserted the same phone row first
+            # (uq_bale_pv_resolved_phone); reuse that row instead of failing.
+            db.rollback()
+            cached = (
+                db.query(BalePvPhoneResolvedUser)
+                .filter_by(instance_id=runtime.instance.id, phone_number=normalized)
+                .first()
+            )
+            if not cached:
+                raise
+            return {
+                "id": cached.bale_user_id,
+                "access_hash": cached.access_hash,
+                "name": cached.name,
+                "nick": cached.nick,
+            }
         return {
             "id": int(user["id"]),
             "access_hash": access_hash_str,

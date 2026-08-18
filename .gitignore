@@ -31,3 +31,5 @@ terminal_logs.txt
 scripts/diagnose_bale_phone.py
 scripts/diagnose_sticker.py
 tests/test_ws_debug_decoder.py
+
+backend.log.*

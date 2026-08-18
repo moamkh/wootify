@@ -180,6 +180,16 @@ class BaleBotConnector(BaleConnector):
             return "request_error"
         return "unexpected_error"
 
+    @staticmethod
+    def _safe_error_message(exc: Exception) -> str:
+        """Internal helper to build a token-safe error detail for logs."""
+        detail = type(exc).__name__
+        response = getattr(exc, "response", None)
+        status = getattr(response, "status_code", None)
+        if status is not None:
+            detail = f"{detail} status={status}"
+        return detail
+
     async def _request(
         self,
         runtime: BaleInstanceRuntime,
@@ -212,7 +222,7 @@ class BaleBotConnector(BaleConnector):
                     target,
                     redact_proxy_url(runtime.cfg.proxy_url),
                     payload_preview,
-                    str(exc),
+                    self._safe_error_message(exc),
                 )
             raise
         except httpx.TimeoutException as exc:
@@ -224,7 +234,7 @@ class BaleBotConnector(BaleConnector):
                     target,
                     redact_proxy_url(runtime.cfg.proxy_url),
                     payload_preview,
-                    str(exc),
+                    self._safe_error_message(exc),
                 )
             raise
         except httpx.HTTPStatusError as exc:
@@ -248,7 +258,7 @@ class BaleBotConnector(BaleConnector):
                     target,
                     response.status_code if response is not None else "unknown",
                     body,
-                    str(exc),
+                    self._safe_error_message(exc),
                     exc_info=True,
                 )
             raise
@@ -261,7 +271,7 @@ class BaleBotConnector(BaleConnector):
                     target,
                     redact_proxy_url(runtime.cfg.proxy_url),
                     payload_preview,
-                    str(exc),
+                    self._safe_error_message(exc),
                     exc_info=True,
                 )
             raise
@@ -273,7 +283,7 @@ class BaleBotConnector(BaleConnector):
                     method,
                     target,
                     payload_preview,
-                    str(exc),
+                    self._safe_error_message(exc),
                     exc_info=True,
                 )
             raise
@@ -282,8 +292,21 @@ class BaleBotConnector(BaleConnector):
         self, instance: str, cfg: BaleInstanceConfig
     ) -> BaleInstanceRuntime:
         """Internal helper to create runtime."""
-        client = httpx.AsyncClient(timeout=30, proxy=cfg.proxy_url)
-        file_client = httpx.AsyncClient(timeout=30, proxy=cfg.proxy_url)
+        # getUpdates long-polls up to BALE_LONG_POLL_TIMEOUT_SECONDS, so the
+        # read timeout must stay comfortably above that; connect/pool stay tight.
+        client = httpx.AsyncClient(
+            timeout=httpx.Timeout(
+                connect=10,
+                read=int(settings.BALE_LONG_POLL_TIMEOUT_SECONDS) + 15,
+                write=30,
+                pool=10,
+            ),
+            proxy=cfg.proxy_url,
+        )
+        file_client = httpx.AsyncClient(
+            timeout=httpx.Timeout(connect=10, read=120, write=30, pool=10),
+            proxy=cfg.proxy_url,
+        )
         runtime = BaleInstanceRuntime(
             instance_key=str(instance), cfg=cfg, client=client, file_client=file_client
         )
@@ -323,7 +346,12 @@ class BaleBotConnector(BaleConnector):
             proxy_url=proxy_url,
         )
         existing = self._instances.get(instance)
-        if existing and existing.cfg == cfg:
+        if (
+            existing
+            and existing.cfg == cfg
+            and not existing.client.is_closed
+            and not existing.file_client.is_closed
+        ):
             return
 
         if existing:
@@ -336,7 +364,12 @@ class BaleBotConnector(BaleConnector):
             except Exception:
                 pass
 
-        self._instances[instance] = await self._create_runtime(instance, cfg)
+        try:
+            self._instances[instance] = await self._create_runtime(instance, cfg)
+        except Exception:
+            # Drop any poisoned entry so the next connect() retries cleanly.
+            self._instances.pop(instance, None)
+            raise
         safe_token = redact_secret(token) if settings.LOG_REDACT_SECRETS else token
         self._logger.info(
             "configured instance=%s api_base_url=%s file_base_url=%s proxy=%s token=%s",
@@ -475,7 +508,7 @@ class BaleBotConnector(BaleConnector):
                 len(text or ""),
                 not str(text or "").strip(),
                 type(exc).__name__,
-                error_msg,
+                self._safe_error_message(exc),
                 exc_info=True,
             )
             raise RuntimeError(error_msg) from exc
@@ -591,7 +624,7 @@ class BaleBotConnector(BaleConnector):
                 chat_id,
                 filename,
                 type(exc).__name__,
-                error_msg,
+                self._safe_error_message(exc),
                 exc_info=True,
             )
             raise RuntimeError(error_msg) from exc
@@ -626,7 +659,7 @@ class BaleBotConnector(BaleConnector):
                 self._safe_api_target(runtime.cfg, "getUpdates"),
                 redact_proxy_url(runtime.cfg.proxy_url),
                 error_code,
-                str(exc),
+                self._safe_error_message(exc),
             )
             return {"ok": False, "description": str(exc), "error_code": error_code}
         except Exception as exc:
@@ -635,7 +668,7 @@ class BaleBotConnector(BaleConnector):
                 instance,
                 offset,
                 timeout,
-                str(exc),
+                self._safe_error_message(exc),
                 exc_info=True,
             )
             return {"ok": False, "description": str(exc)}
@@ -670,7 +703,7 @@ class BaleBotConnector(BaleConnector):
                 "download_file_by_id failed instance=%s file_id=%s error=%s",
                 instance,
                 file_id,
-                str(exc),
+                self._safe_error_message(exc),
                 exc_info=True,
             )
             return b"", None, None
