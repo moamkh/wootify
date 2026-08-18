@@ -4,6 +4,7 @@ from __future__ import annotations
 import asyncio
 from types import SimpleNamespace
 
+import httpx
 import pytest
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
@@ -140,14 +141,47 @@ def test_phone_contact_resolved_and_message_sent(monkeypatch, db):
     assert adapter.sent_texts == [
         {'peer_id': '555000111', 'content': 'hello there', 'reply_to': None}
     ]
-    # Contact identifier rewritten to the resolved Bale user id.
-    assert client.updated_contacts and client.updated_contacts[0]['phone_number'] == '989123456789'
+    # Contact identifier rewritten to the resolved Bale user id (E.164 phone).
+    assert client.updated_contacts and client.updated_contacts[0]['phone_number'] == '+989123456789'
+    assert client.updated_contacts[0]['identifier'] == 'BALE_PV:555000111'
+    assert client.updated_contacts[0]['name'] == 'Ali Test'
     # Resolved user cached in the DB for future sends.
     from app.models import BalePvPhoneResolvedUser
     cached = db.query(BalePvPhoneResolvedUser).filter_by(phone_number='989123456789').one()
     assert cached.bale_user_id == 555000111
     # No failure note on success.
     assert client.posted_messages == []
+
+
+def test_contact_update_phone_conflict_retries_without_phone(monkeypatch, db):
+    """Chatwoot 422 (phone already taken by another contact) must not drop the
+    identifier/name write-back — retry without the phone number."""
+
+    class _ConflictClient(_FakeClient):
+        async def update_contact(self, account_id, contact_id, data):
+            if 'phone_number' in data:
+                request = httpx.Request('PUT', 'http://chatwoot.test')
+                response = httpx.Response(422, request=request)
+                raise httpx.HTTPStatusError(
+                    'phone already taken', request=request, response=response
+                )
+            return await super().update_contact(account_id, contact_id, data)
+
+    instance = _make_instance(db)
+    adapter = _FakeAdapter()
+    client = _ConflictClient()
+    service = _service(monkeypatch, db, adapter, client, instance)
+
+    result = asyncio.run(service.handle_chatwoot_webhook(db, 'inst-1', _payload()))
+
+    assert result['ok'] is True
+    # The write-back eventually landed without the conflicting phone number.
+    assert client.updated_contacts == [
+        {'name': 'Ali Test', 'identifier': 'BALE_PV:555000111'}
+    ]
+    assert adapter.sent_texts == [
+        {'peer_id': '555000111', 'content': 'hello there', 'reply_to': None}
+    ]
 
 
 def test_failed_send_posts_private_note(monkeypatch, db):

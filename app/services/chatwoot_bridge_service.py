@@ -1325,29 +1325,56 @@ class ChatwootBridgeService:
         """Update the Chatwoot contact with the resolved Bale identifier and name."""
         if not chatwoot_contact_id:
             return
+        name = (
+            resolved_user.get("name")
+            or resolved_user.get("nick")
+            or f"User {resolved_user['id']}"
+        )
+        identifier = connector_registry.prefixed_source_id(
+            "bale_pv_enterprise", str(resolved_user["id"])
+        )
+        normalized_phone = self._normalize_bale_pv_phone(phone_number)
+        # Chatwoot validates phone numbers in E.164 format (leading '+').
+        e164_phone = f"+{normalized_phone}" if normalized_phone else None
         try:
-            name = (
-                resolved_user.get("name")
-                or resolved_user.get("nick")
-                or f"User {resolved_user['id']}"
-            )
-            identifier = connector_registry.prefixed_source_id(
-                "bale_pv_enterprise", str(resolved_user["id"])
-            )
             await client.update_contact(
                 account_id,
                 int(chatwoot_contact_id),
                 {
                     "name": name,
                     "identifier": identifier,
-                    "phone_number": self._normalize_bale_pv_phone(phone_number),
+                    "phone_number": e164_phone,
                 },
+            )
+            return
+        except Exception as exc:
+            status = getattr(getattr(exc, "response", None), "status_code", None)
+            if status != 422:
+                logger.warning(
+                    "chatwoot_bridge.update_bale_pv_contact_failed "
+                    "contact_id=%s error=%s",
+                    chatwoot_contact_id,
+                    exc,
+                )
+                return
+            # 422: the phone number typically already belongs to another
+            # contact (Chatwoot enforces phone uniqueness) — retry without it
+            # so the Bale display name and identifier are still written back.
+            logger.info(
+                "chatwoot_bridge.update_bale_pv_contact_phone_conflict "
+                "contact_id=%s retry=without_phone",
+                chatwoot_contact_id,
+            )
+        try:
+            await client.update_contact(
+                account_id,
+                int(chatwoot_contact_id),
+                {"name": name, "identifier": identifier},
             )
         except Exception as exc:
             logger.warning(
                 "chatwoot_bridge.update_bale_pv_contact_failed "
-                "instance=%s contact_id=%s error=%s",
-                getattr(chatwoot_contact_id, "instance_key", None),
+                "contact_id=%s error=%s",
                 chatwoot_contact_id,
                 exc,
             )
