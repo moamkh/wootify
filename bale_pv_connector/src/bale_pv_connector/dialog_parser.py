@@ -478,6 +478,23 @@ def parse_search_contacts_response(data: bytes) -> Dict[str, Any]:
     return result
 
 
+def parse_imported_contact(data: bytes) -> Optional[Dict[str, Any]]:
+    """Parse ImportedContact { uid(1): int64, client_id(2): int64 }.
+
+    Wire-verified layout from bale.users.v1.Users/ImportContacts responses:
+    field 1 is the resolved Bale user id, field 2 is a small per-import
+    client-side index (NOT an access hash or user id).
+    """
+    try:
+        fields = ProtobufParser(data).parse()
+        uid = fields.get(1, [None])[0]
+        if not isinstance(uid, int):
+            return None
+        return {"uid": uid, "client_id": fields.get(2, [None])[0]}
+    except Exception:
+        return None
+
+
 def parse_import_contacts_response(data: bytes) -> Dict[str, Any]:
     """Parse ImportContacts response.
 
@@ -485,13 +502,17 @@ def parse_import_contacts_response(data: bytes) -> Dict[str, Any]:
       1: users (repeated User)
       2: seq (int32)
       3: state (bytes)
-      4: user_peers (repeated UserOutPeer)
+      4: imported (repeated ImportedContact { uid(1), client_id(2) })
+
+    Note: field 4 was previously mis-parsed as UserOutPeer { type, id },
+    which made the resolved "id" the client-side index (usually 1) instead
+    of the actual Bale user id — sending messages to the wrong user.
     """
     result: Dict[str, Any] = {
         "users": [],
         "seq": 0,
         "state": b"",
-        "user_peers": [],
+        "imported": [],
     }
     try:
         fields = ProtobufParser(data).parse()
@@ -504,9 +525,9 @@ def parse_import_contacts_response(data: bytes) -> Dict[str, Any]:
         if 3 in fields:
             result["state"] = fields[3][0]
         for raw in fields.get(4, []):
-            peer = parse_peer(raw) if isinstance(raw, bytes) else None
-            if peer:
-                result["user_peers"].append(peer)
+            contact = parse_imported_contact(raw) if isinstance(raw, bytes) else None
+            if contact:
+                result["imported"].append(contact)
     except Exception as exc:
         logger.warning("parse_import_contacts_response failed: %s", exc)
     return result

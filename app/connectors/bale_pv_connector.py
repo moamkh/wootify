@@ -634,30 +634,41 @@ class BalePvConnector:
         if users:
             user = users[0]
         else:
-            # Some Bale accounts only appear in the user_peers list even though
-            # the phone exists. Fall back to the peer so we can still message them.
-            user_peers = parsed.get("user_peers", [])
+            # ImportContacts typically returns only an ImportedContact with the
+            # resolved uid (no User object and no access_hash).  Fetch the full
+            # user via LoadUsers to obtain the access_hash; fall back to the
+            # bare uid so messaging can still be attempted.
+            imported = parsed.get("imported", [])
             self._logger.info(
-                "bale_pv import_contacts_no_users instance=%s phone=%s user_peers=%s",
+                "bale_pv import_contacts_no_users instance=%s phone=%s imported=%s",
                 instance,
                 redact_secret(normalized),
-                len(user_peers),
+                len(imported),
             )
-            if user_peers:
-                peer = user_peers[0]
-                peer_id = peer.get("id")
-                if peer_id is None:
-                    raise RuntimeError(
-                        f"Phone number {redact_secret(normalized)} not found on Bale"
-                    )
-                user = {
-                    "id": peer_id,
-                    "access_hash": peer.get("access_hash"),
-                }
-            else:
+            if not imported:
                 raise RuntimeError(
                     f"Phone number {redact_secret(normalized)} not found on Bale"
                 )
+            uid = imported[0].get("uid")
+            if uid is None:
+                raise RuntimeError(
+                    f"Phone number {redact_secret(normalized)} not found on Bale"
+                )
+            user = None
+            try:
+                loaded = await runtime.client.get_users([{"uid": uid}])
+                loaded_users = loaded.get("users", []) if isinstance(loaded, dict) else []
+                if loaded_users and loaded_users[0].get("id"):
+                    user = loaded_users[0]
+            except Exception as exc:
+                self._logger.warning(
+                    "bale_pv load_users_after_import_failed instance=%s uid=%s error=%s",
+                    instance,
+                    uid,
+                    exc,
+                )
+            if user is None:
+                user = {"id": uid, "access_hash": None}
         self._logger.info(
             "bale_pv phone_resolved instance=%s phone=%s bale_user_id=%s",
             instance,

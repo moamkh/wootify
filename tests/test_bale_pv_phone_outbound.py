@@ -239,3 +239,85 @@ def test_unprefixed_phone_like_identifier_is_resolved(monkeypatch, db):
     assert result['ok'] is True
     assert adapter.resolved_phones == ['989123456789']
     assert adapter.sent_texts[0]['peer_id'] == '555000111'
+
+
+# ---------------------------------------------------------------------------
+# ImportContacts wire format regression (uid was mis-parsed as client index)
+# ---------------------------------------------------------------------------
+
+# Captured from a live bale.users.v1.Users/ImportContacts response:
+# seq=26, imported contact {uid=1755271951, client_id=1}.
+_IMPORT_RESPONSE_HEX = '101a2208088fa6fdc4061001'
+
+
+def test_parse_import_contacts_response_decodes_imported_contact():
+    import sys
+    from pathlib import Path
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'bale_pv_connector' / 'src'))
+
+    from bale_pv_connector.dialog_parser import parse_import_contacts_response
+
+    parsed = parse_import_contacts_response(bytes.fromhex(_IMPORT_RESPONSE_HEX))
+
+    assert parsed['seq'] == 26
+    assert parsed['users'] == []
+    assert parsed['imported'] == [{'uid': 1755271951, 'client_id': 1}]
+
+
+def test_resolve_phone_to_user_uses_imported_uid_and_loads_access_hash():
+    from app.connectors.bale_pv_connector import BalePvConnector
+
+    class _FakeMessagingClient:
+        async def import_contacts(self, phones, optimizations=None):
+            return bytes.fromhex(_IMPORT_RESPONSE_HEX)
+
+        async def get_users(self, peers):
+            assert peers == [{'uid': 1755271951}]
+            return {'users': [{'id': 1755271951, 'access_hash': 4242, 'name': 'Ali'}]}
+
+    connector = BalePvConnector()
+    connector._instances['inst'] = SimpleNamespace(
+        auth_state='authenticated', client=_FakeMessagingClient()
+    )
+
+    user = asyncio.run(connector.resolve_phone_to_user('inst', '09123456789'))
+
+    assert user['id'] == 1755271951
+    assert user['access_hash'] == 4242
+
+
+def test_resolve_phone_to_user_falls_back_to_bare_uid_when_load_users_fails():
+    from app.connectors.bale_pv_connector import BalePvConnector
+
+    class _FakeMessagingClient:
+        async def import_contacts(self, phones, optimizations=None):
+            return bytes.fromhex(_IMPORT_RESPONSE_HEX)
+
+        async def get_users(self, peers):
+            raise RuntimeError('load users unavailable')
+
+    connector = BalePvConnector()
+    connector._instances['inst'] = SimpleNamespace(
+        auth_state='authenticated', client=_FakeMessagingClient()
+    )
+
+    user = asyncio.run(connector.resolve_phone_to_user('inst', '989136421196'))
+
+    assert user['id'] == 1755271951
+    assert user['access_hash'] is None
+
+
+def test_resolve_phone_to_user_raises_when_phone_not_on_bale():
+    from app.connectors.bale_pv_connector import BalePvConnector
+
+    class _FakeMessagingClient:
+        async def import_contacts(self, phones, optimizations=None):
+            return bytes.fromhex('101a')  # seq=26, no users, no imported
+
+    connector = BalePvConnector()
+    connector._instances['inst'] = SimpleNamespace(
+        auth_state='authenticated', client=_FakeMessagingClient()
+    )
+
+    with pytest.raises(RuntimeError, match='not found on Bale'):
+        asyncio.run(connector.resolve_phone_to_user('inst', '989136421196'))
