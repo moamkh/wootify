@@ -80,6 +80,11 @@ class Settings(BaseSettings):
     )
 
     DATA_ENCRYPTION_KEY: str = ''
+    # Optional previous key, used once to re-encrypt stored secrets after a key
+    # change (see app/utils/key_rotation.py). Special value 'dev-fallback' means
+    # the deterministic development key used when DATA_ENCRYPTION_KEY was empty.
+    # Remove this setting again after a successful rotation.
+    DATA_ENCRYPTION_KEY_PREVIOUS: str = ''
     STORE_MESSAGE_PAYLOADS: bool = False
 
     LOG_LEVEL: str = 'INFO'
