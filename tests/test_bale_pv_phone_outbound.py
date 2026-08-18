@@ -1,0 +1,201 @@
+"""Tests for Bale PV phone-number outbound messaging and failure notes."""
+from __future__ import annotations
+
+import asyncio
+from types import SimpleNamespace
+
+import pytest
+from sqlalchemy import create_engine
+from sqlalchemy.orm import sessionmaker
+from sqlalchemy.pool import StaticPool
+
+import app.services.chatwoot_bridge_service as bridge_module
+from app.models import Base, Instance
+from app.services.chatwoot_bridge_service import ChatwootBridgeService
+
+
+@pytest.fixture()
+def db():
+    engine = create_engine(
+        'sqlite://', connect_args={'check_same_thread': False}, poolclass=StaticPool
+    )
+    Base.metadata.create_all(bind=engine)
+    session = sessionmaker(bind=engine)()
+    yield session
+    session.close()
+    Base.metadata.drop_all(bind=engine)
+
+
+def _make_instance(db, key='inst-1') -> Instance:
+    row = Instance(
+        instance_key=key,
+        platform_type_id='pt-1',
+        is_enabled=True,
+        platform_metadata_encrypted='',
+        chatwoot_config_encrypted='',
+        proxy_config_encrypted='',
+    )
+    db.add(row)
+    db.commit()
+    return row
+
+
+class _FakeAdapter:
+    def __init__(self, send_error: Exception | None = None):
+        self.send_error = send_error
+        self.sent_texts = []
+        self.cached_hashes = {}
+
+    def cache_access_hash(self, user_id, access_hash):
+        self.cached_hashes[user_id] = access_hash
+
+    async def resolve_phone_to_user(self, phone):
+        return {'id': 555000111, 'access_hash': '998877', 'name': 'Ali Test'}
+
+    async def send_text(self, peer_id, content, reply_to=None):
+        if self.send_error is not None:
+            raise self.send_error
+        self.sent_texts.append({'peer_id': peer_id, 'content': content, 'reply_to': reply_to})
+        return {'ok': True}
+
+
+class _FakeClient:
+    def __init__(self):
+        self.posted_messages = []
+        self.updated_contacts = []
+
+    async def post_message(self, account_id, conversation_id, data):
+        self.posted_messages.append(
+            {'account_id': account_id, 'conversation_id': conversation_id, 'data': data}
+        )
+        return {'id': 1}
+
+    async def update_contact(self, account_id, contact_id, data):
+        self.updated_contacts.append(data)
+        return {'id': contact_id}
+
+
+def _service(monkeypatch, db, adapter, client, instance):
+    runtime = SimpleNamespace(
+        status='open', platform_type='bale_pv_enterprise', adapter=adapter
+    )
+    monkeypatch.setattr(bridge_module, 'get_runtime', lambda key: runtime)
+    service = ChatwootBridgeService()
+    monkeypatch.setattr(
+        service,
+        '_chatwoot_client_for_instance',
+        lambda db_, key: (instance, {'account_id': 1}, client),
+    )
+    return service
+
+
+def _payload(phone='09123456789'):
+    return {
+        'event': 'message_created',
+        'message_type': 'outgoing',
+        'content': 'hello there',
+        'conversation': {
+            'id': 77,
+            'meta': {'sender': {'id': 9, 'phone_number': phone}},
+            'messages': [],
+        },
+    }
+
+
+class TestPhoneDetection:
+    @pytest.mark.parametrize('value', [
+        '989123456789', '+989123456789', '00989123456789', '09123456789',
+        '9123456789', '+98 912 345 6789', '0912 345 6789',
+    ])
+    def test_phone_formats_detected(self, value):
+        assert ChatwootBridgeService._is_phone_number_destination(value) is True
+
+    @pytest.mark.parametrize('value', [None, '', '12345', 'BALE_PV:12345', 'ali'])
+    def test_non_phone_values_rejected(self, value):
+        assert ChatwootBridgeService._is_phone_number_destination(value) is False
+
+    @pytest.mark.parametrize('raw,expected', [
+        ('09123456789', '989123456789'),
+        ('+989123456789', '989123456789'),
+        ('00989123456789', '989123456789'),
+        ('9123456789', '989123456789'),
+        ('+98 912 345 6789', '989123456789'),
+    ])
+    def test_normalization(self, raw, expected):
+        assert ChatwootBridgeService._normalize_bale_pv_phone(raw) == expected
+
+
+def test_phone_contact_resolved_and_message_sent(monkeypatch, db):
+    instance = _make_instance(db)
+    adapter = _FakeAdapter()
+    client = _FakeClient()
+    service = _service(monkeypatch, db, adapter, client, instance)
+
+    result = asyncio.run(service.handle_chatwoot_webhook(db, 'inst-1', _payload()))
+
+    assert result['ok'] is True
+    assert result['peer_id'] == '555000111'
+    assert adapter.sent_texts == [
+        {'peer_id': '555000111', 'content': 'hello there', 'reply_to': None}
+    ]
+    # Contact identifier rewritten to the resolved Bale user id.
+    assert client.updated_contacts and client.updated_contacts[0]['phone_number'] == '989123456789'
+    # Resolved user cached in the DB for future sends.
+    from app.models import BalePvPhoneResolvedUser
+    cached = db.query(BalePvPhoneResolvedUser).filter_by(phone_number='989123456789').one()
+    assert cached.bale_user_id == 555000111
+    # No failure note on success.
+    assert client.posted_messages == []
+
+
+def test_failed_send_posts_private_note(monkeypatch, db):
+    instance = _make_instance(db)
+    adapter = _FakeAdapter(send_error=RuntimeError('send_text failed: Forbidden'))
+    client = _FakeClient()
+    service = _service(monkeypatch, db, adapter, client, instance)
+
+    result = asyncio.run(service.handle_chatwoot_webhook(db, 'inst-1', _payload()))
+
+    assert result['ok'] is False
+    assert result['message'] == 'delivery_failed'
+    assert len(client.posted_messages) == 1
+    note = client.posted_messages[0]
+    assert note['conversation_id'] == 77
+    assert note['data']['private'] is True
+    assert '555000111' in note['data']['content']
+    assert 'Forbidden' in note['data']['content']
+
+
+def test_unresolvable_phone_posts_private_note(monkeypatch, db):
+    instance = _make_instance(db)
+
+    class _NoUserAdapter(_FakeAdapter):
+        async def resolve_phone_to_user(self, phone):
+            raise RuntimeError('Phone number 989123456789 not found on Bale')
+
+    adapter = _NoUserAdapter()
+    client = _FakeClient()
+    service = _service(monkeypatch, db, adapter, client, instance)
+
+    result = asyncio.run(service.handle_chatwoot_webhook(db, 'inst-1', _payload()))
+
+    assert result['ok'] is False
+    assert result['message'] == 'delivery_failed'
+    assert len(client.posted_messages) == 1
+    assert 'not found on Bale' in client.posted_messages[0]['data']['content']
+
+
+def test_contact_without_identifier_or_phone_reports_failure(monkeypatch, db):
+    instance = _make_instance(db)
+    adapter = _FakeAdapter()
+    client = _FakeClient()
+    service = _service(monkeypatch, db, adapter, client, instance)
+
+    payload = _payload()
+    payload['conversation']['meta']['sender'] = {'id': 9}
+    result = asyncio.run(service.handle_chatwoot_webhook(db, 'inst-1', payload))
+
+    assert result['ok'] is False
+    assert result['detail'] == 'peer_id_not_found'
+    assert len(client.posted_messages) == 1
+    assert client.posted_messages[0]['data']['private'] is True

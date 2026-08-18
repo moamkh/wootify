@@ -456,70 +456,88 @@ class ChatwootBridgeService:
             peer_id = str(phone_number).lstrip("+")
 
         if not peer_id:
-            return {"ok": False, "detail": "peer_id_not_found"}
-
-        # For Bale PV, a phone-number destination must be resolved to its Bale
-        # user id before we can send. The resolved id is also written back to the
-        # Chatwoot contact identifier for future messages.
-        if (
-            runtime.platform_type == "bale_pv_enterprise"
-            and self._is_phone_number_destination(peer_id)
-        ):
-            original_peer_id = peer_id
-            resolved_user = await self._resolve_bale_pv_phone(
-                db, instance, runtime, peer_id, chatwoot_contact_id
-            )
-            await self._update_chatwoot_contact_for_bale_pv_phone(
+            await self._notify_delivery_failure(
                 client,
                 account_id,
-                chatwoot_contact_id,
-                resolved_user,
-                peer_id,
+                payload,
+                None,
+                RuntimeError("recipient_not_resolvable: contact has neither identifier nor phone number"),
             )
-            peer_id = str(resolved_user["id"])
-            # Keep the local conversation mapping in sync with the resolved id.
-            await self._sync_conversation_platform_id(
-                db, instance, original_peer_id, peer_id
-            )
+            return {"ok": False, "detail": "peer_id_not_found"}
 
-        reply_to = None
-        parent_id = payload.get("conversation") and payload["conversation"].get("messages") and payload["conversation"]["messages"][0].get("id")
-        if parent_id:
-            mapping = (
-                db.query(MessageMapping)
-                .join(Conversation, MessageMapping.conversation_id == Conversation.id)
-                .filter(
-                    MessageMapping.chatwoot_message_id == str(parent_id),
-                    Conversation.instance_id == instance.id,
+        try:
+            # For Bale PV, a phone-number destination must be resolved to its Bale
+            # user id before we can send. The resolved id is also written back to the
+            # Chatwoot contact identifier for future messages.
+            if (
+                runtime.platform_type == "bale_pv_enterprise"
+                and self._is_phone_number_destination(peer_id)
+            ):
+                original_peer_id = peer_id
+                resolved_user = await self._resolve_bale_pv_phone(
+                    db, instance, runtime, peer_id, chatwoot_contact_id
                 )
-                .first()
-            )
-            if mapping and mapping.platform_message_id:
-                reply_to = mapping.platform_message_id
-
-        attachments = self._extract_chatwoot_attachments(payload)
-
-        sent: List[Dict[str, Any]] = []
-        if attachments and isinstance(attachments, list):
-            for att in attachments:
-                data_url = att.get("data_url") if isinstance(att, dict) else None
-                if not data_url:
-                    continue
-                if isinstance(data_url, str) and data_url.startswith("/"):
-                    base_url = str(chatwoot_cfg.get("base_url") or "").rstrip("/")
-                    data_url = f"{base_url}{data_url}"
-                filename = self._attachment_filename(att, data_url)
-                result = await runtime.adapter.send_media(
+                await self._update_chatwoot_contact_for_bale_pv_phone(
+                    client,
+                    account_id,
+                    chatwoot_contact_id,
+                    resolved_user,
                     peer_id,
-                    data_url,
-                    filename=filename,
-                    caption=content or None,
-                    reply_to=reply_to,
                 )
+                peer_id = str(resolved_user["id"])
+                # Keep the local conversation mapping in sync with the resolved id.
+                await self._sync_conversation_platform_id(
+                    db, instance, original_peer_id, peer_id
+                )
+
+            reply_to = None
+            parent_id = payload.get("conversation") and payload["conversation"].get("messages") and payload["conversation"]["messages"][0].get("id")
+            if parent_id:
+                mapping = (
+                    db.query(MessageMapping)
+                    .join(Conversation, MessageMapping.conversation_id == Conversation.id)
+                    .filter(
+                        MessageMapping.chatwoot_message_id == str(parent_id),
+                        Conversation.instance_id == instance.id,
+                    )
+                    .first()
+                )
+                if mapping and mapping.platform_message_id:
+                    reply_to = mapping.platform_message_id
+
+            attachments = self._extract_chatwoot_attachments(payload)
+
+            sent: List[Dict[str, Any]] = []
+            if attachments and isinstance(attachments, list):
+                for att in attachments:
+                    data_url = att.get("data_url") if isinstance(att, dict) else None
+                    if not data_url:
+                        continue
+                    if isinstance(data_url, str) and data_url.startswith("/"):
+                        base_url = str(chatwoot_cfg.get("base_url") or "").rstrip("/")
+                        data_url = f"{base_url}{data_url}"
+                    filename = self._attachment_filename(att, data_url)
+                    result = await runtime.adapter.send_media(
+                        peer_id,
+                        data_url,
+                        filename=filename,
+                        caption=content or None,
+                        reply_to=reply_to,
+                    )
+                    sent.append(result)
+            else:
+                result = await runtime.adapter.send_text(peer_id, content, reply_to=reply_to)
                 sent.append(result)
-        else:
-            result = await runtime.adapter.send_text(peer_id, content, reply_to=reply_to)
-            sent.append(result)
+        except Exception as exc:
+            # Delivery runs in a background task (the webhook was already
+            # acked), so surface the failure to agents as a private note on
+            # the conversation instead of failing silently.
+            await self._notify_delivery_failure(client, account_id, payload, peer_id, exc)
+            return {
+                "ok": False,
+                "message": "delivery_failed",
+                "detail": f"{type(exc).__name__}: {exc}"[:300],
+            }
 
         return {"ok": True, "peer_id": peer_id, "sent": sent}
 
@@ -1148,21 +1166,76 @@ class ChatwootBridgeService:
                 return True
         return False
 
+    async def _notify_delivery_failure(
+        self,
+        client: ChatwootClient,
+        account_id: int,
+        payload: Dict[str, Any],
+        peer_id: Optional[str],
+        exc: Exception,
+    ) -> None:
+        """Post a private note to the Chatwoot conversation when delivery fails.
+
+        Webhook deliveries are acknowledged before the platform send runs
+        (background task), so without this note an agent would never see that
+        their message was not delivered.  Private notes do not retrigger the
+        webhook loop (private messages are skipped by handle_chatwoot_webhook).
+        Best-effort: note failures are logged, never raised.
+        """
+        try:
+            conversation = payload.get("conversation") if isinstance(payload, dict) else None
+            conversation_id = None
+            if isinstance(conversation, dict):
+                conversation_id = conversation.get("id")
+            if conversation_id is None:
+                conversation_id = payload.get("conversation_id")
+            if not conversation_id:
+                return
+            recipient = peer_id or "unknown recipient"
+            note = (
+                f"\u26a0\ufe0f Delivery to Bale failed for {recipient}: "
+                f"{type(exc).__name__}: {exc}"
+            )[:900]
+            await client.post_message(
+                account_id,
+                int(conversation_id),
+                {"content": note, "private": True, "message_type": "outgoing"},
+            )
+            logger.info(
+                "chatwoot_bridge.delivery_failure_note_posted account_id=%s conversation_id=%s recipient=%s",
+                account_id,
+                conversation_id,
+                recipient,
+            )
+        except Exception:
+            logger.warning(
+                "chatwoot_bridge.delivery_failure_note_failed",
+                exc_info=True,
+            )
+
     @staticmethod
     def _is_phone_number_destination(value: Optional[str]) -> bool:
         """Return True if the destination looks like a raw phone number."""
         if not value:
             return False
         digits = re.sub(r"\D", "", str(value))
-        # Iranian mobile numbers: international 98XXXXXXXXXX or local 0XXXXXXXXXX.
-        return bool(re.match(r"^(98\d{10}|0\d{10})$", digits))
+        # Iranian mobile numbers in any common notation: 98XXXXXXXXXX,
+        # 0098XXXXXXXXXX, 0XXXXXXXXXX, or bare 9XXXXXXXXX.
+        return bool(re.match(r"^(98\d{10}|0098\d{10}|0\d{10}|9\d{9})$", digits))
 
     @staticmethod
     def _normalize_bale_pv_phone(phone: str) -> str:
         """Normalize phone number to 98XXXXXXXXXX digits."""
         digits = re.sub(r"\D", "", str(phone or "").strip())
-        if digits.startswith("0") and len(digits) == 11:
+        if digits.startswith("00"):
+            # International prefix (e.g. 0098...): strip it; the country code
+            # that follows is already in dialable form.
+            digits = digits[2:]
+        elif digits.startswith("0") and len(digits) == 11:
             digits = "98" + digits[1:]
+        if len(digits) == 10 and digits.startswith("9"):
+            # Bare mobile without country code (912XXXXXXX).
+            digits = "98" + digits
         return digits
 
     async def _resolve_bale_pv_phone(
