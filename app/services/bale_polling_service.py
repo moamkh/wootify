@@ -14,6 +14,9 @@ Responsibilities
     - ``bale_pv_enterprise`` → ``EnterpriseBaleService``
     - ``bale_pv``            → ``ChatwootBridgeService`` via ``BalePvAdapter``
     - ``bale`` (legacy bot)  → ``BridgeService`` / ``EnterpriseBaleService``
+* Persist inbound updates that repeatedly fail Chatwoot delivery into the
+  ``inbound_event_retries`` table and redeliver them in the background
+  (survives restarts and long Chatwoot outages).
 * Detect and recover from stalled or crashed poll tasks.
 """
 from __future__ import annotations
@@ -23,18 +26,19 @@ import json
 import logging
 import mimetypes
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Optional
 
 import httpx
-from sqlalchemy.exc import OperationalError
+from sqlalchemy.exc import IntegrityError, OperationalError
 
 from app.adapters.bale_pv import BalePvAdapter
 from app.config import settings
 from app.connectors.registry import connector_registry
 from app.db import SessionLocal
 from app import runtime_registry
+from app.models import InboundEventRetry, Instance
 from app.services.bridge_service import BridgeService
 from app.services.chatwoot_bridge_service import chatwoot_bridge
 from app.services.enterprise_bale_service import EnterpriseBaleService
@@ -50,11 +54,21 @@ class BalePollingService:
     all down cleanly.
     """
 
+    # How many times a failing update is refetched before it is dead-lettered.
+    _MAX_UPDATE_ATTEMPTS = 3
+
+    # Retry-queue drainer: how often due rows are retried, and the exponential
+    # backoff applied per failed retry (base * 2**(attempts-1), capped).
+    _RETRY_QUEUE_INTERVAL_SECONDS = 30
+    _RETRY_BACKOFF_BASE_SECONDS = 60
+    _RETRY_BACKOFF_MAX_SECONDS = 3600
+
     def __init__(self) -> None:
         self._logger = logging.getLogger("app.services.bale_polling")
         self._sms_logger = logging.getLogger("app.services.enterprise_sms")
         self._stop = asyncio.Event()
         self._manager_task: Optional[asyncio.Task] = None
+        self._retry_task: Optional[asyncio.Task] = None
         self._poll_tasks: dict[str, asyncio.Task] = {}
         self._last_update_ids: dict[str, str] = {}
         self._enterprise_sms_last_run: dict[str, float] = {}
@@ -62,6 +76,8 @@ class BalePollingService:
         self._enterprise_sms_sync_tasks: dict[str, asyncio.Task] = {}
         self._enterprise_sms_sync_started_at: dict[str, float] = {}
         self._share_phone_prompted: set[tuple[str, str]] = set()
+        # Bounded-retry counters for updates whose processing failed: {instance_key: {update_id: attempts}}.
+        self._update_fail_counts: dict[str, dict[str, int]] = {}
         # Temporary debug dump for periodic enterprise SMS sync results.
         self._temp_sms_dump_path = (
             Path(__file__).resolve().parents[2] / 'data' / 'tmp-enterprise-smoke' / 'sms-sync-results.jsonl'
@@ -77,29 +93,42 @@ class BalePollingService:
             return
         self._stop.clear()
         self._manager_task = asyncio.create_task(self._run_manager())
+        self._retry_task = asyncio.create_task(self._run_retry_queue())
         self._logger.info('started')
 
     async def stop(self) -> None:
         """Stop."""
         self._stop.set()
-        for task in self._poll_tasks.values():
+        poll_tasks = list(self._poll_tasks.values())
+        for task in poll_tasks:
             task.cancel()
         self._poll_tasks.clear()
         self._last_update_ids.clear()
         self._enterprise_sms_last_run.clear()
         self._enterprise_sms_enabled_state.clear()
         self._enterprise_sms_sync_started_at.clear()
-        for task in self._enterprise_sms_sync_tasks.values():
-            if not task.done():
-                task.cancel()
+        sync_tasks = [task for task in self._enterprise_sms_sync_tasks.values() if not task.done()]
+        for task in sync_tasks:
+            task.cancel()
         self._enterprise_sms_sync_tasks.clear()
         self._share_phone_prompted.clear()
+        self._update_fail_counts.clear()
+        if self._retry_task:
+            self._retry_task.cancel()
+            try:
+                await self._retry_task
+            except asyncio.CancelledError:
+                pass
+            self._retry_task = None
         if self._manager_task:
             self._manager_task.cancel()
             try:
                 await self._manager_task
             except asyncio.CancelledError:
                 pass
+        pending_tasks = [task for task in poll_tasks + sync_tasks if not task.done()]
+        if pending_tasks:
+            await asyncio.gather(*pending_tasks, return_exceptions=True)
         await connector_registry.close_all()
         self._logger.info('stopped')
 
@@ -110,9 +139,11 @@ class BalePollingService:
                 enabled = self._list_enabled_instance_keys()
                 existing = set(self._poll_tasks.keys())
 
+                disabled_tasks = []
                 for key in existing - enabled:
                     task = self._poll_tasks.pop(key)
                     task.cancel()
+                    disabled_tasks.append(task)
                     self._last_update_ids.pop(key, None)
                     self._enterprise_sms_last_run.pop(key, None)
                     self._enterprise_sms_enabled_state.pop(key, None)
@@ -120,7 +151,14 @@ class BalePollingService:
                     sms_task = self._enterprise_sms_sync_tasks.pop(key, None)
                     if sms_task and not sms_task.done():
                         sms_task.cancel()
+                        disabled_tasks.append(sms_task)
+                    self._update_fail_counts.pop(key, None)
+                    self._share_phone_prompted = {
+                        entry for entry in self._share_phone_prompted if entry[0] != key
+                    }
                     self._logger.info('stopped polling instance=%s', key)
+                if disabled_tasks:
+                    await asyncio.gather(*disabled_tasks, return_exceptions=True)
 
                 for key in enabled - existing:
                     self._poll_tasks[key] = asyncio.create_task(self._run_instance(key))
@@ -208,7 +246,10 @@ class BalePollingService:
                     continue
 
                 updates = resp.get('result') or []
-                max_update = int(last_update) if str(last_update or '').isdigit() else None
+                # High-water mark of updates whose processing actually succeeded.
+                # Only this value is persisted at batch end so failed updates are
+                # refetched by the next poll instead of being skipped silently.
+                max_processed_update = int(last_update) if str(last_update or '').isdigit() else None
 
                 for update in updates:
                     if not isinstance(update, dict):
@@ -217,12 +258,9 @@ class BalePollingService:
                     processed_update_id: Optional[str] = None
                     if update_id is not None and str(update_id).isdigit():
                         normalized_update_id = int(str(update_id))
-                        max_update = max(max_update or normalized_update_id, normalized_update_id)
                         processed_update_id = str(normalized_update_id)
 
                     update_processed = False
-                    # Rate-limit: small pause between updates to avoid hammering Chatwoot
-                    await asyncio.sleep(0.5)
 
                     if platform_key == 'bale_enterprise':
                         try:
@@ -238,7 +276,13 @@ class BalePollingService:
                                 str(exc),
                                 exc_info=True,
                             )
-                            # Do NOT mark as processed on failure to avoid message loss.
+                            # Do NOT mark as processed on failure: the offset stays
+                            # behind so the next poll refetches; once the refetch
+                            # budget is exhausted the update is persisted to the
+                            # retry queue so it survives a long Chatwoot outage.
+                            update_processed = self._handle_update_failure(
+                                instance_key, platform_key, update, processed_update_id, exc
+                            )
                     elif platform_key == 'telegram_enterprise':
                         try:
                             with SessionLocal() as db:
@@ -253,7 +297,13 @@ class BalePollingService:
                                 str(exc),
                                 exc_info=True,
                             )
-                            # Do NOT mark as processed on failure to avoid message loss.
+                            # Do NOT mark as processed on failure: the offset stays
+                            # behind so the next poll refetches; once the refetch
+                            # budget is exhausted the update is persisted to the
+                            # retry queue so it survives a long Chatwoot outage.
+                            update_processed = self._handle_update_failure(
+                                instance_key, platform_key, update, processed_update_id, exc
+                            )
                     else:
                         handled = await self._maybe_handle_local_command(
                             instance_key,
@@ -264,34 +314,43 @@ class BalePollingService:
                         if handled:
                             update_processed = True
                         else:
-                            if platform_key == 'bale_pv_enterprise':
-                                event = await self._normalize_with_adapter(instance_key, update)
-                            else:
-                                event = await self._platform_update_to_event(instance_key, platform_key, update, connector=connector)
-                            self._logger.debug('poll normalized instance=%s update_id=%s event=%s', instance_key, processed_update_id, bool(event))
-                            if not event:
-                                update_processed = True
-                            else:
-                                try:
+                            try:
+                                if platform_key == 'bale_pv_enterprise':
+                                    event = await self._normalize_with_adapter(instance_key, update)
+                                else:
+                                    event = await self._platform_update_to_event(instance_key, platform_key, update, connector=connector)
+                                self._logger.debug('poll normalized instance=%s update_id=%s event=%s', instance_key, processed_update_id, bool(event))
+                                if not event:
+                                    update_processed = True
+                                else:
                                     with SessionLocal() as db:
                                         if platform_key == 'bale_pv_enterprise':
                                             await chatwoot_bridge.ingest_platform_event(db, instance_key, event)
                                         else:
                                             await self._bridge.ingest_platform_event(db, instance_key, event)
                                     self._logger.debug('poll bridge_ingest_ok instance=%s update_id=%s', instance_key, processed_update_id)
-                                except Exception as exc:
-                                    self._logger.error(
-                                        'bridge_ingest_error instance=%s update_id=%s error_type=%s error=%s',
-                                        instance_key,
-                                        processed_update_id,
-                                        type(exc).__name__,
-                                        str(exc),
-                                        exc_info=True,
-                                    )
-                                # Mark as processed even on bridge failure to avoid infinite replay.
-                                update_processed = True
+                                    update_processed = True
+                            except Exception as exc:
+                                self._logger.error(
+                                    'bridge_ingest_error instance=%s update_id=%s error_type=%s error=%s',
+                                    instance_key,
+                                    processed_update_id,
+                                    type(exc).__name__,
+                                    str(exc),
+                                    exc_info=True,
+                                )
+                                # Do NOT mark as processed on failure: the offset stays
+                                # behind so the next poll refetches; once the refetch
+                                # budget is exhausted the update is persisted to the
+                                # retry queue so it survives a long Chatwoot outage.
+                                update_processed = self._handle_update_failure(
+                                    instance_key, platform_key, update, processed_update_id, exc
+                                )
 
                     if processed_update_id and update_processed:
+                        self._reset_update_failure(instance_key, processed_update_id)
+                        normalized_processed_id = int(processed_update_id)
+                        max_processed_update = max(max_processed_update or normalized_processed_id, normalized_processed_id)
                         self._remember_last_update_id(instance_key, processed_update_id)
                         await self._update_runtime_state_with_retry(
                             runtime_instance_id,
@@ -300,11 +359,11 @@ class BalePollingService:
                             touch_sync=True,
                         )
 
-                if max_update is not None:
-                    self._remember_last_update_id(instance_key, str(max_update))
+                if max_processed_update is not None:
+                    self._remember_last_update_id(instance_key, str(max_processed_update))
                 await self._update_runtime_state_with_retry(
                     runtime_instance_id,
-                    last_platform_update_id=str(max_update) if max_update is not None else None,
+                    last_platform_update_id=str(max_processed_update) if max_processed_update is not None else None,
                     last_error=None,
                     touch_sync=True,
                 )
@@ -344,8 +403,16 @@ class BalePollingService:
                 await asyncio.sleep(5)
                 continue
 
+            # When the last batch contained updates, loop immediately to drain
+            # any backlog. On an empty/timed-out long-poll the request itself
+            # already paced the loop, so a short pause is enough; waiting on the
+            # stop event keeps shutdown responsive either way.
+            if updates:
+                continue
             try:
-                await asyncio.wait_for(self._stop.wait(), timeout=int(poll_interval))
+                # Honor the configured poll interval but cap the idle wait so a
+                # large interval does not add unbounded latency between polls.
+                await asyncio.wait_for(self._stop.wait(), timeout=min(float(poll_interval), 2.0))
             except asyncio.TimeoutError:
                 continue
 
@@ -567,6 +634,268 @@ class BalePollingService:
     def _is_sqlite_locked_error(exc: OperationalError) -> bool:
         """Internal helper to is sqlite locked error."""
         return 'database is locked' in str(exc).lower()
+
+    def _record_update_failure(self, instance_key: str, update_id: Optional[str]) -> bool:
+        """Count a processing failure; return True when the update must be dead-lettered.
+
+        The caller leaves the update unprocessed while this returns False so the
+        next poll refetches it.  Once the attempt budget is exhausted the failure
+        is logged loudly and the update is dropped to avoid a poison loop.
+        """
+        if not update_id:
+            # Without an id the offset cannot track this update; drop it immediately.
+            return True
+        counts = self._update_fail_counts.setdefault(instance_key, {})
+        attempts = counts.get(update_id, 0) + 1
+        if attempts >= self._MAX_UPDATE_ATTEMPTS:
+            counts.pop(update_id, None)
+            self._logger.error(
+                'update_dead_letter instance=%s update_id=%s attempts=%s',
+                instance_key,
+                update_id,
+                attempts,
+            )
+            return True
+        counts[update_id] = attempts
+        return False
+
+    def _reset_update_failure(self, instance_key: str, update_id: Optional[str]) -> None:
+        """Clear the failure counter for an update that finally processed successfully."""
+        if not update_id:
+            return
+        counts = self._update_fail_counts.get(instance_key)
+        if counts:
+            counts.pop(update_id, None)
+
+    # ------------------------------------------------------------------
+    # Persistent inbound retry queue
+    # ------------------------------------------------------------------
+
+    def _handle_update_failure(
+        self,
+        instance_key: str,
+        platform_key: str,
+        update: dict[str, Any],
+        update_id: Optional[str],
+        exc: Exception,
+    ) -> bool:
+        """Bounded-refetch bookkeeping plus persistent dead-lettering.
+
+        Returns True when the caller should treat the update as processed
+        (advance the offset).  While the in-memory refetch budget lasts this
+        returns False so the next poll refetches the update from the
+        platform.  Once the budget is exhausted (or the update has no id and
+        cannot be refetched at all) the update is persisted to the
+        ``inbound_event_retries`` table so the retry-queue drainer keeps
+        redelivering it until Chatwoot is reachable again.
+        """
+        exhausted = self._record_update_failure(instance_key, update_id)
+        if exhausted:
+            self._enqueue_failed_update(instance_key, platform_key, update, update_id, exc)
+        return exhausted
+
+    def _enqueue_failed_update(
+        self,
+        instance_key: str,
+        platform_key: str,
+        update: dict[str, Any],
+        update_id: Optional[str],
+        exc: Exception,
+    ) -> None:
+        """Persist a failed inbound update for background redelivery.
+
+        Best-effort: a duplicate (same instance/platform/update id) is
+        already queued and is left untouched; any other persistence error is
+        logged and the update is dropped (previous dead-letter behaviour).
+        """
+        try:
+            payload = json.loads(json.dumps(update, default=str))
+        except Exception:
+            payload = {'unserializable_update': True}
+        try:
+            with SessionLocal() as db:
+                db.add(
+                    InboundEventRetry(
+                        instance_key=instance_key,
+                        platform_key=platform_key,
+                        update_id=str(update_id) if update_id else None,
+                        payload_json=payload,
+                        last_error=f'{type(exc).__name__}: {exc}'[:500],
+                        attempts=0,
+                        next_attempt_at=self._utcnow(),
+                    )
+                )
+                db.commit()
+            self._logger.warning(
+                'inbound_event_queued instance=%s platform=%s update_id=%s',
+                instance_key,
+                platform_key,
+                update_id,
+            )
+        except IntegrityError:
+            self._logger.debug(
+                'inbound_event_already_queued instance=%s platform=%s update_id=%s',
+                instance_key,
+                platform_key,
+                update_id,
+            )
+        except Exception as enqueue_exc:
+            self._logger.error(
+                'inbound_event_enqueue_failed instance=%s update_id=%s error=%s; update dropped',
+                instance_key,
+                update_id,
+                enqueue_exc,
+            )
+
+    @staticmethod
+    def _utcnow() -> datetime:
+        """Return the current UTC time as a naive datetime (SQLite-safe)."""
+        return datetime.now(timezone.utc).replace(tzinfo=None)
+
+    async def _run_retry_queue(self) -> None:
+        """Periodically redeliver persisted inbound events until they succeed."""
+        while not self._stop.is_set():
+            try:
+                await self._drain_retry_queue()
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                self._logger.exception('retry_queue drain failed: %s', exc)
+            try:
+                await asyncio.wait_for(self._stop.wait(), timeout=self._RETRY_QUEUE_INTERVAL_SECONDS)
+            except asyncio.TimeoutError:
+                continue
+
+    async def _drain_retry_queue(self) -> None:
+        """Attempt delivery of every due queued event, in order per instance.
+
+        Rows are processed sequentially per instance in creation order and
+        processing stops at the first failure for that instance so per-chat
+        ordering is preserved (head-of-line blocking).  Rows of deleted
+        instances are purged; rows of disabled instances are kept for later.
+        """
+        now = self._utcnow()
+        with SessionLocal() as db:
+            known_keys = {key for (key,) in db.query(Instance.instance_key).all()}
+            rows = (
+                db.query(InboundEventRetry)
+                .order_by(InboundEventRetry.created_at.asc(), InboundEventRetry.id.asc())
+                .all()
+            )
+            stale = [row for row in rows if row.instance_key not in known_keys]
+            for row in stale:
+                db.delete(row)
+            if stale:
+                db.commit()
+                self._logger.info('retry_queue purged %d rows of deleted instances', len(stale))
+            # Snapshot primitives; the ORM rows detach when the session closes.
+            # All rows of known instances are kept (not only due ones) so a
+            # backed-off earlier row still blocks later rows of the same
+            # instance (strict per-instance ordering).
+            snapshots: list[dict[str, Any]] = [
+                {
+                    'id': row.id,
+                    'instance_key': row.instance_key,
+                    'platform_key': row.platform_key,
+                    'update_id': row.update_id,
+                    'payload': row.payload_json,
+                    'attempts': row.attempts,
+                    'due': row.next_attempt_at is None or row.next_attempt_at.replace(tzinfo=None) <= now,
+                }
+                for row in rows
+                if row.instance_key in known_keys
+            ]
+
+        by_instance: dict[str, list[dict[str, Any]]] = {}
+        for item in snapshots:
+            by_instance.setdefault(item['instance_key'], []).append(item)
+
+        for instance_key, items in by_instance.items():
+            if not items[0]['due']:
+                # Earliest row is still backing off; keep the whole instance waiting.
+                continue
+            try:
+                with SessionLocal() as db:
+                    runtime = self._instances.get_runtime_instance(db, instance_key)
+                    if not runtime or not runtime.instance.is_enabled:
+                        continue
+            except Exception as exc:
+                self._logger.warning(
+                    'retry_queue runtime lookup failed instance=%s error=%s', instance_key, exc
+                )
+                continue
+            for item in items:
+                if not item['due']:
+                    break
+                delivered = await self._retry_queued_event(item)
+                if not delivered:
+                    # Preserve per-instance ordering: stop at first failure.
+                    break
+
+    async def _retry_queued_event(self, item: dict[str, Any]) -> bool:
+        """Redeliver one queued event; delete it on success, back off on failure."""
+        instance_key = item['instance_key']
+        platform_key = item['platform_key']
+        try:
+            with SessionLocal() as db:
+                if platform_key == 'bale_enterprise':
+                    await self._enterprise.handle_platform_update(db, instance_key, item['payload'])
+                elif platform_key == 'telegram_enterprise':
+                    await self._enterprise_telegram.handle_platform_update(db, instance_key, item['payload'])
+                else:
+                    if platform_key == 'bale_pv_enterprise':
+                        event = await self._normalize_with_adapter(instance_key, item['payload'])
+                    else:
+                        connector = connector_registry.get(platform_key)
+                        event = await self._platform_update_to_event(
+                            instance_key, platform_key, item['payload'], connector=connector
+                        )
+                    if event:
+                        if platform_key == 'bale_pv_enterprise':
+                            await chatwoot_bridge.ingest_platform_event(db, instance_key, event)
+                        else:
+                            await self._bridge.ingest_platform_event(db, instance_key, event)
+                row = db.query(InboundEventRetry).filter(InboundEventRetry.id == item['id']).first()
+                if row:
+                    db.delete(row)
+                    db.commit()
+            self._logger.info(
+                'inbound_event_redelivered instance=%s platform=%s update_id=%s after_attempts=%s',
+                instance_key,
+                platform_key,
+                item['update_id'],
+                item['attempts'],
+            )
+            return True
+        except Exception as exc:
+            attempts = int(item['attempts'] or 0) + 1
+            backoff = min(
+                self._RETRY_BACKOFF_BASE_SECONDS * (2 ** (attempts - 1)),
+                self._RETRY_BACKOFF_MAX_SECONDS,
+            )
+            try:
+                with SessionLocal() as db:
+                    row = db.query(InboundEventRetry).filter(InboundEventRetry.id == item['id']).first()
+                    if row:
+                        row.attempts = attempts
+                        row.last_error = f'{type(exc).__name__}: {exc}'[:500]
+                        row.last_attempt_at = self._utcnow()
+                        row.next_attempt_at = self._utcnow() + timedelta(seconds=backoff)
+                        db.commit()
+            except Exception as update_exc:
+                self._logger.error(
+                    'retry_queue backoff update failed id=%s error=%s', item['id'], update_exc
+                )
+            self._logger.warning(
+                'inbound_event_retry_failed instance=%s platform=%s update_id=%s attempts=%s next_retry_in=%ss error=%s',
+                instance_key,
+                platform_key,
+                item['update_id'],
+                attempts,
+                backoff,
+                exc,
+            )
+            return False
 
     def _remember_last_update_id(self, instance_key: str, update_id: Optional[str]) -> None:
         """Keep an in-memory high-water mark so transient DB locks do not replay updates."""
@@ -925,36 +1254,43 @@ class BalePollingService:
         file_id, filename, content_type_hint = self._extract_file(message)
         if file_id:
             content, content_type, file_path = await connector.download_file_by_id(instance_key, file_id=file_id)
-            if content:
-                resolved_filename = filename or (str(file_path).split('/')[-1] if file_path else 'file')
-                resolved_content_type = BalePvAdapter._normalize_content_type(
-                    filename=resolved_filename,
-                    content_type=content_type or content_type_hint,
-                    content=content,
+            if not content:
+                # Attachment expected but the download returned empty content: treat
+                # as a transient failure so the update is retried (bounded by the
+                # dead-letter counter) instead of delivering media stripped of its media.
+                raise RuntimeError(f'attachment download returned empty content file_id={file_id}')
+            resolved_filename = filename or (str(file_path).split('/')[-1] if file_path else 'file')
+            resolved_content_type = BalePvAdapter._normalize_content_type(
+                filename=resolved_filename,
+                content_type=content_type or content_type_hint,
+                content=content,
+            )
+            # Convert WEBP stickers to JPEG/PNG so Chatwoot can render them.
+            if resolved_content_type == 'image/webp':
+                # Pillow conversion is blocking; run it off the event loop.
+                converted, ext, converted_ct = await asyncio.to_thread(
+                    BalePvAdapter._convert_webp, content
                 )
-                # Convert WEBP stickers to JPEG/PNG so Chatwoot can render them.
-                if resolved_content_type == 'image/webp':
-                    converted, ext, converted_ct = BalePvAdapter._convert_webp(content)
-                    if converted and ext and converted_ct:
-                        content = converted
-                        resolved_content_type = converted_ct
-                        resolved_filename = str(resolved_filename).rsplit('.', 1)[0] + ext
-                    else:
-                        self._logger.warning(
-                            'bale_polling webp_conversion_failed instance=%s filename=%s',
-                            instance_key,
-                            resolved_filename,
-                        )
-                resolved_filename = BalePvAdapter._normalize_filename_extension(
-                    resolved_filename, resolved_content_type
-                )
-                attachments.append(
-                    {
-                        'filename': resolved_filename,
-                        'content': content,
-                        'content_type': resolved_content_type,
-                    }
-                )
+                if converted and ext and converted_ct:
+                    content = converted
+                    resolved_content_type = converted_ct
+                    resolved_filename = str(resolved_filename).rsplit('.', 1)[0] + ext
+                else:
+                    self._logger.warning(
+                        'bale_polling webp_conversion_failed instance=%s filename=%s',
+                        instance_key,
+                        resolved_filename,
+                    )
+            resolved_filename = BalePvAdapter._normalize_filename_extension(
+                resolved_filename, resolved_content_type
+            )
+            attachments.append(
+                {
+                    'filename': resolved_filename,
+                    'content': content,
+                    'content_type': resolved_content_type,
+                }
+            )
 
         event: dict[str, Any] = {
             'chat_id': str(chat_id),
@@ -1032,24 +1368,24 @@ class BalePollingService:
         first_name = str(contact.get('first_name') or '').strip()
         last_name = str(contact.get('last_name') or '').strip()
         full_name = ' '.join([first_name, last_name]).strip()
+        label = ' '.join(part for part in (full_name, phone) if part)
+        if not label:
+            return None
+        return f'Shared contact: {label}'
+
+    @staticmethod
+    def _extract_contact_payload(message: dict[str, Any]) -> Optional[dict[str, Any]]:
+        """Internal helper to extract contact payload."""
+        contact = message.get('contact')
+        if not isinstance(contact, dict):
+            return None
+
+        phone = str(contact.get('phone_number') or '').strip()
         if not phone:
             return None
-        if full_name:
-            return None
-        if content.startswith(b'\x89PNG\r\n\x1a\n'):
-            return 'image/png'
-        if content.startswith(b'\xff\xd8\xff'):
-            return 'image/jpeg'
-        if content.startswith((b'GIF87a', b'GIF89a')):
-            return 'image/gif'
-        if len(content) > 12 and content[:4] == b'RIFF' and content[8:12] == b'WEBP':
-            return 'image/webp'
-        if content.startswith(b'OggS'):
-            return 'audio/ogg'
-        if len(content) > 12 and content[:4] == b'RIFF' and content[8:12] == b'WAVE':
-            return 'audio/wav'
-        if content.startswith(b'ID3') or (len(content) > 1 and content[0] == 0xFF and (content[1] & 0xE0) == 0xE0):
-            return 'audio/mpeg'
-        if len(content) > 8 and content[4:8] == b'ftyp':
-            return 'video/mp4'
-        return None
+        return {
+            'phone_number': phone,
+            'first_name': str(contact.get('first_name') or '').strip() or None,
+            'last_name': str(contact.get('last_name') or '').strip() or None,
+            'user_id': str(contact.get('user_id') or '').strip() or None,
+        }

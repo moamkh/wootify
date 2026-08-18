@@ -912,3 +912,42 @@ class BalePvPhoneMapping(Base):
     )
 
     instance = relationship("Instance", backref="bale_pv_phone_mappings")
+
+
+class InboundEventRetry(Base):
+    """Persisted inbound platform update that failed delivery to Chatwoot.
+
+    Rows are written by ``BalePollingService`` when a polled update exhausts
+    its in-memory refetch budget (see ``_record_update_failure``) and are
+    retried by the polling service retry-queue drainer until delivery
+    succeeds or the owning instance is deleted.  This makes inbound delivery
+    survive extended Chatwoot outages (platforms only keep unconfirmed
+    updates for ~24h, so refetch alone cannot cover long downtimes).
+    """
+
+    __tablename__ = "inbound_event_retries"
+    __table_args__ = (
+        UniqueConstraint(
+            "instance_key",
+            "platform_key",
+            "update_id",
+            name="uq_inbound_event_retry",
+        ),
+    )
+
+    id = Column(String(36), primary_key=True, default=_uuid)
+    instance_key = Column(String(128), nullable=False, index=True)
+    platform_key = Column(String(64), nullable=False)
+    # Nullable: platform updates without a numeric id cannot be tracked via
+    # the polling offset, so they are queued on first failure instead of
+    # being dropped.  Rows with NULL update_id are not deduplicated.
+    update_id = Column(String(64), nullable=True)
+    payload_json = Column(JSON, nullable=False, default=dict)
+    last_error = Column(Text, nullable=True)
+    attempts = Column(Integer, nullable=False, default=0)
+    created_at = Column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    last_attempt_at = Column(DateTime(timezone=True), nullable=True)
+    # Earliest time the drainer should retry this row (exponential backoff).
+    next_attempt_at = Column(DateTime(timezone=True), nullable=True, index=True)
