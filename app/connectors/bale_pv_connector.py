@@ -656,9 +656,15 @@ class BalePvConnector:
                 )
             user = None
             try:
-                loaded = await runtime.client.get_users([{"uid": uid}])
-                loaded_users = loaded.get("users", []) if isinstance(loaded, dict) else []
-                if loaded_users and loaded_users[0].get("id"):
+                from bale_pv_connector.dialog_parser import parse_load_users_response
+
+                raw_loaded = await runtime.client.load_users([{"uid": uid}])
+                loaded_users = parse_load_users_response(raw_loaded).get("users", [])
+                for candidate in loaded_users:
+                    if candidate.get("id") == uid:
+                        user = candidate
+                        break
+                if user is None and loaded_users:
                     user = loaded_users[0]
             except Exception as exc:
                 self._logger.warning(

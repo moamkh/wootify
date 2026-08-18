@@ -250,6 +250,23 @@ def test_unprefixed_phone_like_identifier_is_resolved(monkeypatch, db):
 _IMPORT_RESPONSE_HEX = '101a2208088fa6fdc4061001'
 
 
+def _load_users_response_bytes(uid, access_hash, name):
+    """Serialize a LoadUsers response containing one User message."""
+    import sys
+    from pathlib import Path
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'bale_pv_connector' / 'src'))
+
+    from bale_pv_connector.protobuf_wire import ProtobufMessage
+
+    user = ProtobufMessage()
+    user.add_int32(1, uid)
+    user.add_int64(2, access_hash)
+    user.add_string(3, name)
+    response = ProtobufMessage()
+    response.add_message(1, user)
+    return response.serialize()
+
+
 def test_parse_import_contacts_response_decodes_imported_contact():
     import sys
     from pathlib import Path
@@ -271,9 +288,9 @@ def test_resolve_phone_to_user_uses_imported_uid_and_loads_access_hash():
         async def import_contacts(self, phones, optimizations=None):
             return bytes.fromhex(_IMPORT_RESPONSE_HEX)
 
-        async def get_users(self, peers):
+        async def load_users(self, peers):
             assert peers == [{'uid': 1755271951}]
-            return {'users': [{'id': 1755271951, 'access_hash': 4242, 'name': 'Ali'}]}
+            return _load_users_response_bytes(1755271951, 4242, 'Ali')
 
     connector = BalePvConnector()
     connector._instances['inst'] = SimpleNamespace(
@@ -293,7 +310,7 @@ def test_resolve_phone_to_user_falls_back_to_bare_uid_when_load_users_fails():
         async def import_contacts(self, phones, optimizations=None):
             return bytes.fromhex(_IMPORT_RESPONSE_HEX)
 
-        async def get_users(self, peers):
+        async def load_users(self, peers):
             raise RuntimeError('load users unavailable')
 
     connector = BalePvConnector()
