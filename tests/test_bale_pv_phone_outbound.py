@@ -273,6 +273,122 @@ def test_unprefixed_phone_like_identifier_is_resolved(monkeypatch, db):
     assert result['ok'] is True
     assert adapter.resolved_phones == ['989123456789']
     assert adapter.sent_texts[0]['peer_id'] == '555000111'
+    # Bare phone identifiers are wootify-managed: the write-back still happens.
+    assert client.updated_contacts
+    assert client.updated_contacts[0]['identifier'] == 'BALE_PV:555000111'
+
+
+class TestForeignIdentifierGuard:
+    """Contacts owned by other backends (WhatsApp, ...) must never be rewritten."""
+
+    @pytest.mark.parametrize('value,expected', [
+        ('989136421196@s.whatsapp.net', True),
+        ('120363000000000000@g.us', True),
+        ('1234567890@lid', True),
+        ('WHATSAPP:989136421196', True),  # not a wootify-registered prefix
+        ('some-opaque-string', True),
+        ('BALE_PV:1755271951', False),
+        ('BALE_ENTERPRISE:123', False),
+        ('989123456789', False),
+        ('+98 912 345 6789', False),
+        ('09123456789', False),
+        ('', False),
+        (None, False),
+    ])
+    def test_classifier(self, value, expected):
+        assert ChatwootBridgeService._is_foreign_contact_identifier(value) is expected
+
+    def test_whatsapp_jid_contact_is_not_updated(self, monkeypatch, db):
+        """A contact identified by a WhatsApp JID keeps its identifier; the
+        Bale message is still delivered to the resolved Bale user."""
+        instance = _make_instance(db)
+        adapter = _FakeAdapter()
+        client = _FakeClient()
+        service = _service(monkeypatch, db, adapter, client, instance)
+
+        payload = _payload()
+        payload['conversation']['meta']['sender'] = {
+            'id': 9,
+            'identifier': '989136421196@s.whatsapp.net',
+            'phone_number': '+989136421196',
+        }
+        result = asyncio.run(service.handle_chatwoot_webhook(db, 'inst-1', payload))
+
+        assert result['ok'] is True
+        # Phone resolution and delivery still happen...
+        assert adapter.resolved_phones == ['989136421196']
+        assert adapter.sent_texts == [
+            {'peer_id': '555000111', 'content': 'hello there', 'reply_to': None}
+        ]
+        # ...but the foreign contact is never rewritten.
+        assert client.updated_contacts == []
+
+    def test_whatsapp_group_jid_contact_is_not_updated(self, monkeypatch, db):
+        """Group JIDs are not phone numbers: no Bale phone resolution is
+        attempted (pre-existing behavior) and the contact is never rewritten."""
+        instance = _make_instance(db)
+        adapter = _FakeAdapter()
+        client = _FakeClient()
+        service = _service(monkeypatch, db, adapter, client, instance)
+
+        payload = _payload()
+        payload['conversation']['meta']['sender'] = {
+            'id': 9,
+            'identifier': '120363000000000000@g.us',
+            'phone_number': '+989136421196',
+        }
+        result = asyncio.run(service.handle_chatwoot_webhook(db, 'inst-1', payload))
+
+        assert adapter.resolved_phones == []
+        assert client.updated_contacts == []
+
+    def test_phone_only_contact_still_updated(self, monkeypatch, db):
+        """No identifier at all (phone-only contact): write-back as before."""
+        instance = _make_instance(db)
+        adapter = _FakeAdapter()
+        client = _FakeClient()
+        service = _service(monkeypatch, db, adapter, client, instance)
+
+        result = asyncio.run(service.handle_chatwoot_webhook(db, 'inst-1', _payload()))
+
+        assert result['ok'] is True
+        assert client.updated_contacts
+        assert client.updated_contacts[0]['identifier'] == 'BALE_PV:555000111'
+
+    def test_repeat_send_to_whatsapp_contact_uses_cached_phone_map(self, monkeypatch, db):
+        """The phone->Bale-user map (bale_pv_phone_resolved_users) keeps
+        first-time phone messaging working on every subsequent send: no
+        re-resolution against Bale, no contact rewrite, delivery still works."""
+        from app.models import BalePvPhoneResolvedUser
+
+        instance = _make_instance(db)
+        db.add(BalePvPhoneResolvedUser(
+            instance_id=instance.id,
+            phone_number='989136421196',
+            bale_user_id=555000111,
+            access_hash='998877',
+            name='Ali Test',
+            nick=None,
+        ))
+        db.commit()
+
+        adapter = _FakeAdapter()
+        client = _FakeClient()
+        service = _service(monkeypatch, db, adapter, client, instance)
+
+        payload = _payload()
+        payload['conversation']['meta']['sender'] = {
+            'id': 9,
+            'identifier': '989136421196@s.whatsapp.net',
+            'phone_number': '+989136421196',
+        }
+        result = asyncio.run(service.handle_chatwoot_webhook(db, 'inst-1', payload))
+
+        assert result['ok'] is True
+        assert adapter.resolved_phones == []  # served from the cached phone map
+        assert adapter.cached_hashes == {'555000111': 998877}
+        assert adapter.sent_texts[0]['peer_id'] == '555000111'
+        assert client.updated_contacts == []  # foreign contact untouched
 
 
 # ---------------------------------------------------------------------------

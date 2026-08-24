@@ -521,6 +521,7 @@ class ChatwootBridgeService:
                     chatwoot_contact_id,
                     resolved_user,
                     peer_id,
+                    current_identifier=identifier,
                 )
                 peer_id = str(resolved_user["id"])
                 # Keep the local conversation mapping in sync with the resolved id.
@@ -1261,6 +1262,26 @@ class ChatwootBridgeService:
         # 0098XXXXXXXXXX, 0XXXXXXXXXX, or bare 9XXXXXXXXX.
         return bool(re.match(r"^(98\d{10}|0098\d{10}|0\d{10}|9\d{9})$", digits))
 
+    @classmethod
+    def _is_foreign_contact_identifier(cls, value: Optional[Any]) -> bool:
+        """Return True if the identifier belongs to a non-wootify platform.
+
+        Wootify-managed identifiers are empty, bare phone numbers, or carry a
+        known platform prefix (``BALE_PV:``, ``BALE_ENTERPRISE:``, ...).
+        Anything else — WhatsApp JIDs (``989136421196@s.whatsapp.net``,
+        ``...@g.us``, ``...@lid``) or any other string scheme — is foreign and
+        must never be rewritten: another backend owns that identifier and
+        depends on it to find/update its contact.
+        """
+        raw = str(value or "").strip()
+        if not raw:
+            return False
+        if cls._strip_source_prefix(raw) != raw:
+            return False  # wootify-managed platform prefix
+        if "@" in raw:
+            return True  # WhatsApp-style JID
+        return any(ch.isalpha() for ch in raw)
+
     @staticmethod
     def _normalize_bale_pv_phone(phone: str) -> str:
         """Normalize phone number to 98XXXXXXXXXX digits."""
@@ -1353,9 +1374,26 @@ class ChatwootBridgeService:
         chatwoot_contact_id: Optional[Any],
         resolved_user: Dict[str, Any],
         phone_number: str,
+        current_identifier: Optional[Any] = None,
     ) -> None:
-        """Update the Chatwoot contact with the resolved Bale identifier and name."""
+        """Update the Chatwoot contact with the resolved Bale identifier and name.
+
+        Contacts whose current identifier belongs to another platform (e.g.
+        WhatsApp's ``989136421196@s.whatsapp.net``) are left untouched: that
+        identifier is owned by the other backend, and replacing it with
+        ``BALE_PV:<id>`` breaks that integration. The Bale message itself is
+        still delivered — only the write-back is skipped. A separate
+        ``BALE_PV:`` contact is created automatically on the user's first
+        inbound Bale message via ``_get_or_create_contact``.
+        """
         if not chatwoot_contact_id:
+            return
+        if self._is_foreign_contact_identifier(current_identifier):
+            logger.info(
+                "chatwoot_bridge.skip_foreign_contact_update contact_id=%s identifier=%s",
+                chatwoot_contact_id,
+                current_identifier,
+            )
             return
         name = (
             resolved_user.get("name")
