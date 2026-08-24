@@ -171,3 +171,44 @@ def test_parse_private_edit_ignores_channel_peer_self() -> None:
 def test_parse_unknown_update_returns_none() -> None:
     frame = ProtobufMessage().add_bytes(1, b"not a valid update").serialize()
     assert parse_ws_update(frame) is None
+
+
+def _build_service_message_frame(peer_id: int, sender_uid: int, rid: int) -> bytes:
+    """Frame whose Message G carries only an unknown content field.
+
+    Simulates Bale's ServiceMessage bodies (e.g. the "<name> joined Bale"
+    contact-registered notice) which contain no text/document/sticker fields.
+    """
+    service_body = ProtobufMessage()
+    service_body.add_int64(1, sender_uid)  # opaque service payload
+    msg = ProtobufMessage()
+    msg.add_bytes(2, service_body.serialize())  # unknown content field in Message G
+
+    update = ProtobufMessage()
+    update.add_bytes(1, Peer(peer_id).serialize())
+    update.add_int32(2, sender_uid)
+    update.add_int64(4, rid)
+    update.add_bytes(5, msg.serialize())
+
+    wrapper = ProtobufMessage()
+    wrapper.add_bytes(BaleUpdateType.NEW_MESSAGE, update.serialize())
+
+    inner = ProtobufMessage()
+    inner.add_bytes(1, wrapper.serialize())
+
+    outer = ProtobufMessage()
+    outer.add_bytes(1, inner.serialize())
+
+    return outer.serialize()
+
+
+def test_parse_service_message_update_is_tagged_unsupported() -> None:
+    """A message with no displayable content must be tagged, not dropped."""
+    frame = _build_service_message_frame(peer_id=456, sender_uid=456, rid=999)
+    parsed = parse_ws_update(frame)
+    assert parsed is not None
+    assert parsed["type"] == "message"
+    assert parsed["sender_uid"] == 456
+    assert parsed["text"] == ""
+    assert parsed["message_type"] == "unsupported"
+    assert parsed.get("media") is None

@@ -1622,6 +1622,24 @@ class BalePvConnector:
         date = parsed.get("date")
         media = parsed.get("media")
 
+        # Service messages (e.g. the "<name> joined Bale" contact-registered
+        # notice Bale pushes into the PV chat when a contact registers) carry no
+        # text and no media. Tag them so the bridge can still create/refresh the
+        # Chatwoot contact but skip creating a conversation/message — otherwise
+        # the empty conversation fires inbox automations (greeting/auto-message)
+        # toward the user.
+        service_notice = not text and not media
+        if service_notice:
+            logger.info(
+                "bale_pv service_notice_detected sender_uid=%s peer_type=%s chat_id=%s rid=%s outgoing=%s edited=%s",
+                sender_uid,
+                peer_type,
+                chat_id,
+                rid,
+                is_outgoing,
+                is_edited,
+            )
+
         message: Dict[str, Any] = {
             "message_id": str(rid) if rid else None,
             "date": int(date or 0),
@@ -1635,6 +1653,8 @@ class BalePvConnector:
         }
         if isinstance(sender_access_hash, int):
             message["_sender_access_hash"] = sender_access_hash
+        if service_notice:
+            message["_service_notice"] = True
         if is_outgoing:
             message["_outgoing"] = True
         if is_edited:

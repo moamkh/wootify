@@ -155,6 +155,27 @@ class ChatwootBridgeService:
                     exc,
                 )
 
+        # Service notices (e.g. Bale's "<name> joined Bale" contact-registered
+        # message) carry no displayable content. The contact above is still
+        # created/resolved so the sender is known to agents, but no conversation
+        # or message is created: an otherwise empty conversation would trigger
+        # inbox automations (greeting/auto-message) toward a user who never
+        # actually wrote to us. Outgoing echoes keep the existing behavior.
+        if event.get("service_notice") and not event.get("outgoing"):
+            logger.info(
+                "chatwoot_bridge.service_notice_contact_only instance=%s chat_id=%s contact_id=%s",
+                instance_key,
+                chat_id,
+                contact_id,
+            )
+            return {
+                "ok": True,
+                "contact_only": True,
+                "chatwoot_contact_id": contact_id,
+                "chatwoot_conversation_id": None,
+                "chatwoot_message_id": None,
+            }
+
         # 1b. For group/channel messages, also create/update a contact for the
         # actual sender so agents can start private conversations with members.
         sender_contact = event.get("sender_contact")

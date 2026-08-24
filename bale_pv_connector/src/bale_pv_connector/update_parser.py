@@ -401,6 +401,18 @@ def _parse_message_content(data: bytes) -> Optional[Dict[str, Any]]:
             text = _parse_text_message(text_bytes)
             if text:
                 return {"text": text, "message_type": "text"}
+        if fields:
+            # The message body exists but uses a content type we do not parse
+            # (e.g. ServiceMessage for the "<name> joined Bale" notice that Bale
+            # pushes when a contact registers, contact cards, locations, ...).
+            # Tag it so downstream consumers can treat it as a non-displayable
+            # service notice instead of posting an empty message.
+            logger.info(
+                "bale_ws_message_content_unsupported fields=%s data_len=%s",
+                sorted(fields.keys()),
+                len(data),
+            )
+            return {"text": "", "message_type": "unsupported"}
         logger.debug("bale_ws_parse_message_content_empty data_len=%s fields=%s", len(data), list(fields.keys()))
         return {}
     except Exception as exc:

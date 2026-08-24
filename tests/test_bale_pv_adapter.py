@@ -1987,3 +1987,256 @@ async def test_resolve_group_title_returns_cached_title():
     title = await connector.resolve_group_title("test-instance", 395054013, 2)
     assert title == "cached_group"
     runtime.client.load_groups.assert_not_awaited()
+
+
+# ---------------------------------------------------------------------------
+# Service notices ("<name> joined Bale")
+# ---------------------------------------------------------------------------
+
+
+def _build_service_notice_frame(peer_id: int, sender_uid: int, rid: int) -> bytes:
+    """Build a WS update frame whose Message G has no displayable content.
+
+    Simulates Bale's ServiceMessage bodies (e.g. the "<name> joined Bale"
+    contact-registered notice): no text/document/sticker fields.
+    """
+    from bale_pv_connector.messaging_messages import Peer
+    from bale_pv_connector.protobuf_wire import ProtobufMessage
+    from bale_pv_connector.update_parser import BaleUpdateType
+
+    service_body = ProtobufMessage()
+    service_body.add_int64(1, sender_uid)  # opaque service payload
+    msg = ProtobufMessage()
+    msg.add_bytes(2, service_body.serialize())  # unknown content field in Message G
+
+    update = ProtobufMessage()
+    update.add_bytes(1, Peer(peer_id).serialize())
+    update.add_int32(2, sender_uid)
+    update.add_int64(4, rid)
+    update.add_bytes(5, msg.serialize())
+
+    wrapper = ProtobufMessage()
+    wrapper.add_bytes(BaleUpdateType.NEW_MESSAGE, update.serialize())
+
+    inner = ProtobufMessage()
+    inner.add_bytes(1, wrapper.serialize())
+
+    outer = ProtobufMessage()
+    outer.add_bytes(1, inner.serialize())
+    return outer.serialize()
+
+
+def test_parse_raw_update_flags_service_notice():
+    """Content-less private messages are tagged as service notices."""
+    frame = _build_service_notice_frame(peer_id=456, sender_uid=456, rid=999)
+    parsed = BalePvConnector._parse_raw_update(
+        frame, user_cache={456: "Sara"}, self_user_id=999
+    )
+    assert parsed is not None
+    message = parsed["message"]
+    assert message["_service_notice"] is True
+    assert message["text"] == ""
+    assert message["chat"]["id"] == "456"
+    # The contact name from the user cache is still used.
+    assert message["from"]["first_name"] == "Sara"
+
+
+def test_parse_raw_update_text_message_not_flagged():
+    """Normal text messages must not be flagged as service notices."""
+    from bale_pv_connector.messaging_messages import Peer, TextMessage
+    from bale_pv_connector.protobuf_wire import ProtobufMessage
+    from bale_pv_connector.update_parser import BaleUpdateType
+
+    msg = ProtobufMessage()
+    msg.add_message(15, TextMessage("hello"))
+    update = ProtobufMessage()
+    update.add_bytes(1, Peer(456).serialize())
+    update.add_int32(2, 456)
+    update.add_int64(4, 1000)
+    update.add_bytes(5, msg.serialize())
+    wrapper = ProtobufMessage()
+    wrapper.add_bytes(BaleUpdateType.NEW_MESSAGE, update.serialize())
+    inner = ProtobufMessage()
+    inner.add_bytes(1, wrapper.serialize())
+    outer = ProtobufMessage()
+    outer.add_bytes(1, inner.serialize())
+
+    parsed = BalePvConnector._parse_raw_update(outer.serialize(), user_cache={}, self_user_id=999)
+    assert parsed is not None
+    assert "_service_notice" not in parsed["message"]
+    assert parsed["message"]["text"] == "hello"
+
+
+def test_adapter_normalize_marks_service_notice():
+    adapter = BalePvAdapter("test", {"bale_pv_phone_number": "989136421196"})
+    raw = {
+        "update_id": 126,
+        "message": {
+            "message_id": "999",
+            "date": 1,
+            "chat": {"id": "456", "type": "private", "title": "Sara"},
+            "from": {"id": 456, "first_name": "Sara"},
+            "text": "",
+            "_service_notice": True,
+        },
+    }
+    event = adapter.normalize_incoming_update(raw)
+    assert event is not None
+    assert event["service_notice"] is True
+    assert event["from_name"] == "Sara"
+    assert event["outgoing"] is False
+
+
+def test_adapter_normalize_normal_message_not_service_notice():
+    adapter = BalePvAdapter("test", {"bale_pv_phone_number": "989136421196"})
+    raw = {
+        "update_id": 127,
+        "message": {
+            "message_id": "1000",
+            "date": 1,
+            "chat": {"id": "456", "type": "private"},
+            "from": {"id": 456, "first_name": "Sara"},
+            "text": "hello",
+        },
+    }
+    event = adapter.normalize_incoming_update(raw)
+    assert event is not None
+    assert event["service_notice"] is False
+
+
+def _make_bridge_instance(db_session, instance_key: str) -> Instance:
+    platform = PlatformType(
+        key="bale_pv_enterprise",
+        display_name="Bale PV Enterprise",
+        capabilities_json={},
+        metadata_schema_json={},
+    )
+    db_session.add(platform)
+    db_session.flush()
+    instance = Instance(
+        instance_key=instance_key,
+        platform_type_id=platform.id,
+        is_enabled=True,
+        platform_metadata_encrypted="",
+        chatwoot_config_encrypted='{"account_id": 1, "base_url": "http://chatwoot", "api_access_token": "token", "inbox_id": 5}',
+        proxy_config_encrypted="",
+    )
+    db_session.add(instance)
+    db_session.commit()
+    return instance
+
+
+@pytest.mark.anyio
+async def test_ingest_service_notice_creates_contact_only(db_session):
+    """A joined-Bale service notice must create the contact but no conversation."""
+    instance = _make_bridge_instance(db_session, "bale-pv-notice")
+
+    client = AsyncMock()
+    client.search_contacts = AsyncMock(return_value={"payload": []})
+    client.create_contact = AsyncMock(return_value={"id": 77})
+    client.create_conversation = AsyncMock(return_value={"id": 116})
+    client.post_message = AsyncMock(return_value={"id": 12345})
+
+    event = {
+        "chat_id": "456",
+        "chat_type": "private",
+        "from_name": "Sara",
+        "text": "",
+        "message_id": "999",
+        "platform_message_id": "999",
+        "outgoing": False,
+        "service_notice": True,
+    }
+
+    with patch.object(
+        chatwoot_bridge,
+        "_chatwoot_client_for_instance",
+        return_value=(instance, {"account_id": 1, "inbox_id": 5}, client),
+    ):
+        result = await chatwoot_bridge.ingest_platform_event(db_session, "bale-pv-notice", event)
+
+    assert result["ok"] is True
+    assert result["contact_only"] is True
+    assert result["chatwoot_contact_id"] == 77
+    client.create_contact.assert_awaited_once()
+    client.create_conversation.assert_not_awaited()
+    client.post_message.assert_not_awaited()
+
+    # No local conversation mapping may be created either.
+    conv = (
+        db_session.query(Conversation)
+        .filter_by(instance_id=instance.id, platform_conversation_id="456")
+        .first()
+    )
+    assert conv is None
+
+
+@pytest.mark.anyio
+async def test_ingest_service_notice_repeated_does_not_duplicate(db_session):
+    """Retransmitted notices for a known contact stay conversation-free."""
+    instance = _make_bridge_instance(db_session, "bale-pv-notice2")
+
+    client = AsyncMock()
+    client.search_contacts = AsyncMock(return_value={"payload": [{"id": 77}]})
+
+    event = {
+        "chat_id": "456",
+        "chat_type": "private",
+        "from_name": "Sara",
+        "text": "",
+        "message_id": "1001",
+        "platform_message_id": "1001",
+        "outgoing": False,
+        "service_notice": True,
+    }
+
+    with patch.object(
+        chatwoot_bridge,
+        "_chatwoot_client_for_instance",
+        return_value=(instance, {"account_id": 1, "inbox_id": 5}, client),
+    ):
+        result = await chatwoot_bridge.ingest_platform_event(db_session, "bale-pv-notice2", event)
+
+    assert result["ok"] is True
+    assert result["contact_only"] is True
+    assert result["chatwoot_contact_id"] == 77
+    client.create_contact.assert_not_awaited()
+    client.create_conversation.assert_not_awaited()
+    client.post_message.assert_not_awaited()
+
+
+@pytest.mark.anyio
+async def test_ingest_outgoing_echo_unaffected_by_flag(db_session):
+    """Outgoing echoes keep the existing mirror behavior even if flagged."""
+    instance = _make_bridge_instance(db_session, "bale-pv-notice3")
+
+    client = AsyncMock()
+    client.search_contacts = AsyncMock(return_value={"payload": [{"id": 77}]})
+    client.list_contact_conversations = AsyncMock(return_value=[])
+    client.create_conversation = AsyncMock(return_value={"id": 116})
+    client.post_message = AsyncMock(return_value={"id": 12345})
+
+    event = {
+        "chat_id": "456",
+        "chat_type": "private",
+        "from_name": "Bale User 456",
+        "text": "",
+        "message_id": "1002",
+        "platform_message_id": "1002",
+        "outgoing": True,
+        "service_notice": True,
+    }
+
+    with patch.object(
+        chatwoot_bridge,
+        "_chatwoot_client_for_instance",
+        return_value=(instance, {"account_id": 1, "inbox_id": 5}, client),
+    ):
+        result = await chatwoot_bridge.ingest_platform_event(db_session, "bale-pv-notice3", event)
+
+    assert result["ok"] is True
+    assert result.get("contact_only") is not True
+    assert result["chatwoot_conversation_id"] == 116
+    assert result["chatwoot_message_id"] == 12345
+    client.create_conversation.assert_awaited_once()
+    client.post_message.assert_awaited_once()

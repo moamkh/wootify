@@ -266,6 +266,10 @@ class BalePvAdapter(BasePlatformAdapter):
             "reply_to": reply_to,
             "outgoing": is_outgoing,
             "edited": bool(message.get("_edited")),
+            # True for non-displayable service messages (e.g. Bale's
+            # "<name> joined Bale" contact-registered notice). The bridge uses
+            # this to create/refresh the contact without opening a conversation.
+            "service_notice": bool(message.get("_service_notice")),
             "raw": raw_update,
         }
 
