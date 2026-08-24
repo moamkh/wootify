@@ -36,6 +36,7 @@ PLATFORM_REQUIRED_TOKEN_KEY = {
     'bale': 'bale_token',
     'bale_enterprise': 'bale_token',
     'bale_pv_enterprise': 'bale_pv_phone_number',
+    'instagram_pv_enterprise': 'instagram_username',
     'telegram': 'telegram_token',
     'telegram_enterprise': 'telegram_token',
 }
@@ -199,7 +200,9 @@ class InstanceService:
                         {
                             key: val
                             for key, val in payload.platform_metadata.items()
-                            if val is not None and not (isinstance(val, str) and not val.strip())
+                            if val is not None
+                            and not (isinstance(val, str) and not val.strip())
+                            and not (isinstance(val, str) and '***' in val)
                         }
                     )
                 platform_metadata = self._normalize_platform_metadata(platform.key, merged_platform)
@@ -594,6 +597,19 @@ class InstanceService:
                 ).strip(),
             }
 
+        if key == 'instagram_pv_enterprise':
+            return {
+                'instagram_username': str(data.get('instagram_username') or '').strip(),
+                'instagram_password': str(data.get('instagram_password') or '').strip(),
+                'instagram_sessionid': str(data.get('instagram_sessionid') or '').strip() or None,
+                'instagram_verification_code': str(data.get('instagram_verification_code') or '').strip() or None,
+                'instagram_totp_seed': str(data.get('instagram_totp_seed') or '').strip() or None,
+                'instagram_session_dir': str(data.get('instagram_session_dir') or '').strip() or None,
+                'instagram_poll_interval': int(data.get('instagram_poll_interval') or settings.INSTAGRAM_PV_POLL_INTERVAL_SECONDS),
+                'instagram_display_name': str(data.get('instagram_display_name') or '').strip() or None,
+                'instagram_department': str(data.get('instagram_department') or '').strip() or None,
+            }
+
         if key == 'bale_enterprise':
             return {
                 'bale_token': str(data.get('bale_token') or '').strip(),
@@ -780,7 +796,7 @@ class InstanceService:
         masked: dict[str, Any] = {}
         for key, raw in value.items():
             lower = str(key).lower()
-            if any(token in lower for token in ('token', 'secret', 'password', 'key')) and raw:
+            if any(token in lower for token in ('token', 'secret', 'password', 'key', 'sessionid')) and raw:
                 masked[key] = mask_secret(raw)
             else:
                 masked[key] = raw

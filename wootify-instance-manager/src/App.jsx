@@ -1,4 +1,4 @@
-﻿/**
+/**
  * Module Overview
  * ---------------
  * Purpose: Main React screen for instance management, mappings, and simulation tools.
@@ -45,9 +45,16 @@ import {
   balePvAuthStatus,
   balePvSyncContacts,
   balePvSyncDialogs,
+  instagramPvCheck,
+  instagramPvReconnect,
+  instagramPvChallengeStart,
+  instagramPvChallengeValidateCode,
+  instagramPvChallengeResume,
   balePvRemoveChatwootContacts,
 } from './api.js';
 import PageLoader from './components/PageLoader.jsx';
+import LoginPage from './components/LoginPage.jsx';
+import { getPanelToken, panelAuthStatus, clearPanelToken } from './api.js';
 
 const InstancesPage = lazy(() => import('./pages/InstancesPage.jsx'));
 const InstanceWorkspacePage = lazy(() => import('./pages/InstanceWorkspacePage.jsx'));
@@ -55,6 +62,7 @@ const InstanceWorkspacePage = lazy(() => import('./pages/InstanceWorkspacePage.j
 const PLATFORM_BALE = 'bale';
 const PLATFORM_BALE_ENTERPRISE = 'bale_enterprise';
 const PLATFORM_BALE_PV_ENTERPRISE = 'bale_pv_enterprise';
+const PLATFORM_INSTAGRAM_PV_ENTERPRISE = 'instagram_pv_enterprise';
 const PLATFORM_TELEGRAM = 'telegram';
 const PLATFORM_TELEGRAM_ENTERPRISE = 'telegram_enterprise';
 const DEFAULT_PLATFORM = PLATFORM_BALE;
@@ -125,6 +133,15 @@ function defaultForm(features) {
     bale_pv_share_phone_prompt_enabled: true,
     bale_pv_share_phone_prompt_only_if_missing_phone: true,
     bale_pv_share_phone_prompt_text: 'Use the button below to share your phone number.\nCommands: /share_phone, /help',
+    instagram_username: '',
+    instagram_password: '',
+    instagram_sessionid: '',
+    instagram_verification_code: '',
+    instagram_totp_seed: '',
+    instagram_session_dir: '',
+    instagram_poll_interval: '10',
+    instagram_display_name: '',
+    instagram_department: '',
     enterprise_welcome_text: ENTERPRISE_DEFAULTS.welcome_text,
     enterprise_phone_prompt_text: ENTERPRISE_DEFAULTS.phone_prompt_text,
     enterprise_menu_prompt_text: ENTERPRISE_DEFAULTS.menu_prompt_text,
@@ -212,6 +229,24 @@ function createPayload(form, { patch = false } = {}) {
     platformMetadata.bale_pv_share_phone_prompt_enabled = Boolean(form.bale_pv_share_phone_prompt_enabled);
     platformMetadata.bale_pv_share_phone_prompt_only_if_missing_phone = Boolean(form.bale_pv_share_phone_prompt_only_if_missing_phone);
     platformMetadata.bale_pv_share_phone_prompt_text = form.bale_pv_share_phone_prompt_text?.trim() || undefined;
+  }
+  if (form.platform_type_key === PLATFORM_INSTAGRAM_PV_ENTERPRISE) {
+    platformMetadata.instagram_username = form.instagram_username?.trim() || undefined;
+    const instagramPassword = form.instagram_password?.trim();
+    if (instagramPassword && !instagramPassword.includes('***')) {
+      platformMetadata.instagram_password = instagramPassword;
+    }
+    const instagramSessionid = form.instagram_sessionid?.trim();
+    if (instagramSessionid && !instagramSessionid.includes('***')) {
+      platformMetadata.instagram_sessionid = instagramSessionid;
+    }
+    platformMetadata.instagram_verification_code = form.instagram_verification_code?.trim() || undefined;
+    platformMetadata.instagram_totp_seed = form.instagram_totp_seed?.trim() || undefined;
+    platformMetadata.instagram_session_dir = form.instagram_session_dir?.trim() || undefined;
+    platformMetadata.instagram_poll_interval =
+      Number(form.instagram_poll_interval) > 0 ? Number(form.instagram_poll_interval) : undefined;
+    platformMetadata.instagram_display_name = form.instagram_display_name?.trim() || undefined;
+    platformMetadata.instagram_department = form.instagram_department?.trim() || undefined;
   }
   if (form.platform_type_key === PLATFORM_TELEGRAM || form.platform_type_key === PLATFORM_TELEGRAM_ENTERPRISE) {
     platformMetadata.telegram_api_base_url = form.telegram_api_base_url?.trim() || undefined;
@@ -351,7 +386,10 @@ function createPayload(form, { patch = false } = {}) {
     payload.platform_metadata.telegram_token = telegramToken;
   }
 
-  if (form.platform_type_key === PLATFORM_BALE_PV_ENTERPRISE) {
+  if (
+    form.platform_type_key === PLATFORM_BALE_PV_ENTERPRISE ||
+    form.platform_type_key === PLATFORM_INSTAGRAM_PV_ENTERPRISE
+  ) {
     payload.chatwoot.inbox_id = Number(form.chatwoot_inbox_id) > 0 ? Number(form.chatwoot_inbox_id) : undefined;
     payload.chatwoot.inbox_name = form.chatwoot_inbox_name?.trim() || undefined;
     payload.chatwoot.auto_create = Boolean(form.chatwoot_auto_create);
@@ -443,6 +481,8 @@ async function copyTextToClipboard(value) {
 }
 
 export default function App() {
+  // Panel auth: null = still checking, false = login required, true = authed.
+  const [panelAuthed, setPanelAuthed] = useState(getPanelToken() ? null : false);
   const [platformTypes, setPlatformTypes] = useState([]);
   const [features, setFeatures] = useState([]);
   const [instances, setInstances] = useState([]);
@@ -491,6 +531,11 @@ export default function App() {
   const [version, setVersion] = useState('');
   const [balePvAuthCode, setBalePvAuthCode] = useState('');
   const [balePvAuthLoading, setBalePvAuthLoading] = useState(false);
+  const [instagramCheckLoading, setInstagramCheckLoading] = useState(false);
+  const [instagramCheckResult, setInstagramCheckResult] = useState(null);
+  const [instagramChallengeCode, setInstagramChallengeCode] = useState('');
+  const [instagramChallengeLoading, setInstagramChallengeLoading] = useState(false);
+  const [instagramChallengeInfo, setInstagramChallengeInfo] = useState(null);
 
   const selectedPlatform = useMemo(
     () => platformTypes.find((item) => item.key === form.platform_type_key) || null,
@@ -520,6 +565,9 @@ export default function App() {
         item.platform_metadata?.bale_pv_display_name,
         item.platform_metadata?.bale_pv_department,
         item.platform_metadata?.bale_pv_phone_number,
+        item.platform_metadata?.instagram_display_name,
+        item.platform_metadata?.instagram_department,
+        item.platform_metadata?.instagram_username,
         item.platform_metadata?.telegram_bot_name,
         item.platform_metadata?.telegram_department,
         item.chatwoot?.account_id,
@@ -537,6 +585,7 @@ export default function App() {
   const isStandardBalePlatform = form.platform_type_key === PLATFORM_BALE;
   const isEnterpriseBalePlatform = form.platform_type_key === PLATFORM_BALE_ENTERPRISE;
   const isBalePvPlatform = form.platform_type_key === PLATFORM_BALE_PV_ENTERPRISE;
+  const isInstagramPvPlatform = form.platform_type_key === PLATFORM_INSTAGRAM_PV_ENTERPRISE;
   const isTelegramPlatform = form.platform_type_key === PLATFORM_TELEGRAM || form.platform_type_key === PLATFORM_TELEGRAM_ENTERPRISE;
   const isEnterpriseTelegramPlatform = form.platform_type_key === PLATFORM_TELEGRAM_ENTERPRISE;
   const isEnterprisePlatform = isEnterpriseBalePlatform || isEnterpriseTelegramPlatform;
@@ -620,9 +669,53 @@ export default function App() {
     setEnterpriseSessions(sessions || []);
   }
 
+  // Resolve panel auth state once: when the backend has no panel password
+  // configured the gate is skipped entirely.
   useEffect(() => {
-    refreshBootstrap();
+    let cancelled = false;
+    panelAuthStatus()
+      .then((s) => {
+        if (cancelled) return;
+        if (s && s.auth_enabled === false) {
+          setPanelAuthed(true);
+          return;
+        }
+        setPanelAuthed(Boolean(s?.authenticated));
+      })
+      .catch(() => {
+        if (!cancelled) setPanelAuthed(Boolean(getPanelToken()));
+      });
+    return () => {
+      cancelled = true;
+    };
   }, []);
+
+  // A 401 from any API call drops the stored token; return to the login screen.
+  useEffect(() => {
+    const onUnauthorized = () => setPanelAuthed(false);
+    window.addEventListener('wootify:unauthorized', onUnauthorized);
+    return () => window.removeEventListener('wootify:unauthorized', onUnauthorized);
+  }, []);
+
+  // Softnu signature card effect: cursor-tracked radial highlight driven by
+  // --x/--y CSS custom properties (see styles.css .card::before).
+  useEffect(() => {
+    const handler = (e) => {
+      const el = e.target?.closest?.('.card, .instance-card');
+      if (!el) return;
+      const rect = el.getBoundingClientRect();
+      el.style.setProperty('--x', `${e.clientX - rect.left}px`);
+      el.style.setProperty('--y', `${e.clientY - rect.top}px`);
+    };
+    window.addEventListener('mousemove', handler);
+    return () => window.removeEventListener('mousemove', handler);
+  }, []);
+
+  useEffect(() => {
+    if (panelAuthed === true) {
+      refreshBootstrap();
+    }
+  }, [panelAuthed]);
 
   // Poll per-instance connection health so the badges stay fresh.
   useEffect(() => {
@@ -633,10 +726,11 @@ export default function App() {
   }, [instances]);
 
   useEffect(() => {
+    if (panelAuthed !== true) return;
     getVersion()
       .then((data) => setVersion(data?.version || ''))
       .catch(() => setVersion(''));
-  }, []);
+  }, [panelAuthed]);
 
   async function loadConversations(instanceKey, q = '') {
     if (!instanceKey) {
@@ -713,6 +807,15 @@ export default function App() {
       bale_pv_share_phone_prompt_text:
         row.platform_metadata?.bale_pv_share_phone_prompt_text ||
         'Use the button below to share your phone number.\nCommands: /share_phone, /help',
+      instagram_username: row.platform_metadata?.instagram_username || '',
+      instagram_password: row.platform_metadata?.instagram_password || '',
+      instagram_sessionid: row.platform_metadata?.instagram_sessionid || '',
+      instagram_verification_code: row.platform_metadata?.instagram_verification_code || '',
+      instagram_totp_seed: row.platform_metadata?.instagram_totp_seed || '',
+      instagram_session_dir: row.platform_metadata?.instagram_session_dir || '',
+      instagram_poll_interval: String(row.platform_metadata?.instagram_poll_interval ?? '10'),
+      instagram_display_name: row.platform_metadata?.instagram_display_name || '',
+      instagram_department: row.platform_metadata?.instagram_department || '',
       enterprise_welcome_text: row.platform_metadata?.enterprise_welcome_text || ENTERPRISE_DEFAULTS.welcome_text,
       enterprise_phone_prompt_text:
         row.platform_metadata?.enterprise_phone_prompt_text || ENTERPRISE_DEFAULTS.phone_prompt_text,
@@ -967,6 +1070,85 @@ export default function App() {
       alert(e?.message || String(e));
     } finally {
       setBusy(false);
+    }
+  }
+
+  async function onInstagramPvCheck(instanceKey) {
+    setInstagramCheckLoading(true);
+    setInstagramCheckResult(null);
+    try {
+      const result = await instagramPvCheck(instanceKey);
+      setInstagramCheckResult(result);
+    } catch (e) {
+      setInstagramCheckResult({ connected: false, detail: e?.message || String(e) });
+    } finally {
+      setInstagramCheckLoading(false);
+    }
+  }
+
+  async function onInstagramPvReconnect(instanceKey) {
+    setInstagramCheckLoading(true);
+    setInstagramCheckResult(null);
+    try {
+      const result = await instagramPvReconnect(instanceKey);
+      setInstagramCheckResult(result);
+    } catch (e) {
+      setInstagramCheckResult({ connected: false, detail: e?.message || String(e) });
+    } finally {
+      setInstagramCheckLoading(false);
+    }
+  }
+
+  async function onInstagramPvChallengeStart(instanceKey) {
+    setInstagramChallengeLoading(true);
+    setInstagramChallengeInfo(null);
+    try {
+      const result = await instagramPvChallengeStart(instanceKey);
+      setInstagramChallengeInfo(result);
+      if (result?.state === 'connected') {
+        setInstagramCheckResult({ connected: true, detail: result.detail || 'authenticated' });
+      }
+    } catch (e) {
+      setInstagramChallengeInfo({ state: 'failed', detail: e?.message || String(e) });
+    } finally {
+      setInstagramChallengeLoading(false);
+    }
+  }
+
+  async function onInstagramPvChallengeValidateCode(instanceKey, code) {
+    setInstagramChallengeLoading(true);
+    try {
+      const result = await instagramPvChallengeValidateCode(instanceKey, code);
+      setInstagramChallengeInfo({
+        state: result?.connected ? 'connected' : result?.challenge_state || 'failed',
+        detail: result?.challenge_detail || result?.detail || '',
+        choice: result?.challenge_choice,
+      });
+      setInstagramCheckResult(result);
+      if (result?.connected) {
+        setInstagramChallengeCode('');
+      }
+    } catch (e) {
+      setInstagramChallengeInfo({ state: 'failed', detail: e?.message || String(e) });
+    } finally {
+      setInstagramChallengeLoading(false);
+    }
+  }
+
+  async function onInstagramPvChallengeResume(instanceKey) {
+    setInstagramChallengeLoading(true);
+    try {
+      const result = await instagramPvChallengeResume(instanceKey);
+      setInstagramChallengeInfo({
+        state: result?.connected ? 'connected' : result?.challenge_state || 'manual_approval',
+        detail: result?.challenge_detail || result?.detail || '',
+        choice: result?.challenge_choice,
+      });
+      setInstagramCheckResult(result);
+    } catch (e) {
+      setInstagramChallengeInfo({ state: 'failed', detail: e?.message || String(e) });
+    } finally {
+      setInstagramChallengeLoading(false);
     }
   }
 
@@ -1418,6 +1600,7 @@ export default function App() {
     isTelegramPlatform,
     isEnterpriseBalePlatform,
     isBalePvPlatform,
+    isInstagramPvPlatform,
     isEnterpriseTelegramPlatform,
     isEnterprisePlatform,
     enterpriseRoutes: selectedInstance?.platform_metadata?.enterprise_routes || [],
@@ -1443,6 +1626,7 @@ export default function App() {
     isStandardBalePlatform,
     isEnterpriseBalePlatform,
     isBalePvPlatform,
+    isInstagramPvPlatform,
     isEnterpriseTelegramPlatform,
     isEnterprisePlatform,
     isTelegramPlatform,
@@ -1488,6 +1672,17 @@ export default function App() {
         alert(e?.message || String(e));
       }
     },
+    instagramCheckLoading,
+    instagramCheckResult,
+    onInstagramPvCheck,
+    onInstagramPvReconnect,
+    instagramChallengeCode,
+    setInstagramChallengeCode,
+    instagramChallengeLoading,
+    instagramChallengeInfo,
+    onInstagramPvChallengeStart,
+    onInstagramPvChallengeValidateCode,
+    onInstagramPvChallengeResume,
   };
 
   const mappingProps = {
@@ -1561,6 +1756,13 @@ export default function App() {
     busy,
   };
 
+  if (panelAuthed === null) {
+    return <PageLoader label="Checking panel session" />;
+  }
+  if (panelAuthed === false) {
+    return <LoginPage onSuccess={() => setPanelAuthed(true)} />;
+  }
+
   return (
     <div className="page app-shell">
       <header className="header app-header">
@@ -1592,6 +1794,15 @@ export default function App() {
           <a className="btn secondary" href={`${API_BASE}/docs`} target="_blank" rel="noreferrer">
             API Docs
           </a>
+          <button
+            className="btn secondary"
+            onClick={() => {
+              clearPanelToken();
+              setPanelAuthed(false);
+            }}
+          >
+            Sign out
+          </button>
         </div>
       </header>
 
@@ -1656,6 +1867,7 @@ export default function App() {
             PLATFORM_TELEGRAM={PLATFORM_TELEGRAM}
             PLATFORM_BALE_ENTERPRISE={PLATFORM_BALE_ENTERPRISE}
             PLATFORM_BALE_PV_ENTERPRISE={PLATFORM_BALE_PV_ENTERPRISE}
+            PLATFORM_INSTAGRAM_PV_ENTERPRISE={PLATFORM_INSTAGRAM_PV_ENTERPRISE}
             PLATFORM_TELEGRAM_ENTERPRISE={PLATFORM_TELEGRAM_ENTERPRISE}
           />
         )}

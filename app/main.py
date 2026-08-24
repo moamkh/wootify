@@ -19,9 +19,12 @@ from fastapi.staticfiles import StaticFiles
 from app.config import settings
 from app.controllers.api_v1_controller import _webhook_delivery_tasks
 from app.controllers.api_v1_controller import router as api_v1_router
+from app.controllers.panel_auth_controller import router as panel_auth_router
 from app.db import SessionLocal, engine
+from app.instagram.polling_service import instagram_polling_service
 from app.logging_config import configure_logging
 from app.models import Base
+from app.panel_auth.middleware import PanelAuthMiddleware
 from app.services.bale_polling_service import BalePollingService
 from app.services.platform_registry_service import PlatformRegistryService
 from app.utils.crypto_utils import build_previous_encryptor, encryptor
@@ -56,6 +59,7 @@ async def lifespan(app: FastAPI):
                 logger.exception('encryption key rotation failed; continuing startup')
 
         await polling_service.start()
+        await instagram_polling_service.start()
     except Exception:
         logger.exception('startup failed')
         raise
@@ -78,6 +82,7 @@ async def lifespan(app: FastAPI):
                 cancelled = sum(1 for t in pending_tasks if t.cancelled())
                 logger.warning('shutdown: cancelled %d in-flight webhook deliveries', cancelled)
         try:
+            await instagram_polling_service.stop()
             await polling_service.stop()
         except Exception:
             logger.exception('shutdown failed')
@@ -85,6 +90,11 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title='Wootify Connector API', lifespan=lifespan)
+
+# Panel auth runs inside CORS so 401 responses still carry CORS headers for
+# the browser-based admin panel. It only guards /api/v1 panel endpoints;
+# /api/v1/webhooks/* and /health stay public (see app/panel_auth/middleware.py).
+app.add_middleware(PanelAuthMiddleware)
 
 app.add_middleware(
     CORSMiddleware,
@@ -95,6 +105,7 @@ app.add_middleware(
 )
 
 app.include_router(api_v1_router)
+app.include_router(panel_auth_router)
 
 
 @app.exception_handler(RequestValidationError)

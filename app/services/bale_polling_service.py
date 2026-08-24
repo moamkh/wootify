@@ -175,7 +175,14 @@ class BalePollingService:
         """Internal helper to list enabled instance keys."""
         with SessionLocal() as db:
             runtimes = self._instances.list_runtime_enabled_instances(db)
-            return {runtime.instance.instance_key for runtime in runtimes}
+            return {
+                runtime.instance.instance_key
+                for runtime in runtimes
+                # Instagram PV instances are owned by InstagramPollingService
+                # (app/instagram); skip them here so the two poll loops never
+                # overlap on the same instance.
+                if str(runtime.platform_type.key or '').strip().lower() != 'instagram_pv_enterprise'
+            }
 
     async def _run_instance(self, instance_key: str) -> None:
         """Internal helper to run instance."""

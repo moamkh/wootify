@@ -18,6 +18,7 @@ export default function InstancesPage({
   PLATFORM_TELEGRAM,
   PLATFORM_BALE_ENTERPRISE,
   PLATFORM_BALE_PV_ENTERPRISE,
+  PLATFORM_INSTAGRAM_PV_ENTERPRISE,
   PLATFORM_TELEGRAM_ENTERPRISE,
 }) {
   return (
@@ -50,27 +51,36 @@ export default function InstancesPage({
             const healthTone = !item.is_enabled || health == null ? 'warn' : health ? 'good' : 'bad';
             const isTelegram = item.platform_type_key === PLATFORM_TELEGRAM || item.platform_type_key === PLATFORM_TELEGRAM_ENTERPRISE;
             const isBalePv = item.platform_type_key === PLATFORM_BALE_PV_ENTERPRISE;
+            const isInstagramPv = item.platform_type_key === PLATFORM_INSTAGRAM_PV_ENTERPRISE;
             const isEnterprise = item.platform_type_key === PLATFORM_BALE_ENTERPRISE || item.platform_type_key === PLATFORM_TELEGRAM_ENTERPRISE;
             const botName = isTelegram
               ? item.platform_metadata?.telegram_bot_name || '-'
               : isBalePv
                 ? item.platform_metadata?.bale_pv_display_name || '-'
-                : item.platform_metadata?.bale_bot_name || '-';
+                : isInstagramPv
+                  ? item.platform_metadata?.instagram_display_name || '-'
+                  : item.platform_metadata?.bale_bot_name || '-';
             const botId = isTelegram
               ? item.platform_metadata?.telegram_bot_id || '-'
               : isBalePv
                 ? item.platform_metadata?.bale_pv_phone_number || '-'
-                : item.platform_metadata?.bale_bot_id || '-';
+                : isInstagramPv
+                  ? item.platform_metadata?.instagram_username || '-'
+                  : item.platform_metadata?.bale_bot_id || '-';
             const department = isTelegram
               ? item.platform_metadata?.telegram_department || '-'
               : isBalePv
                 ? item.platform_metadata?.bale_pv_department || '-'
-                : item.platform_metadata?.bale_department || '-';
+                : isInstagramPv
+                  ? item.platform_metadata?.instagram_department || '-'
+                  : item.platform_metadata?.bale_department || '-';
             const maskedToken = isBalePv
               ? maskTokenValue(item.platform_metadata?.bale_pv_phone_number)
-              : maskTokenValue(
-                  isTelegram ? item.platform_metadata?.telegram_token : item.platform_metadata?.bale_token,
-                );
+              : isInstagramPv
+                ? maskTokenValue(item.platform_metadata?.instagram_username)
+                : maskTokenValue(
+                    isTelegram ? item.platform_metadata?.telegram_token : item.platform_metadata?.bale_token,
+                  );
             const enterpriseRoutes = item.platform_metadata?.enterprise_routes || [];
 
             return (

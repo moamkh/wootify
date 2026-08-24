@@ -12,6 +12,7 @@ from typing import Any, Dict, Optional
 
 from app.adapters.base import BasePlatformAdapter
 from app.adapters.bale_pv import BalePvAdapter
+from app.instagram.adapter import InstagramPvAdapter
 
 logger = logging.getLogger("app.runtime_registry")
 
@@ -47,6 +48,8 @@ registry = InstanceRuntimeRegistry()
 def _build_adapter(platform_type: str, instance_key: str, config: Dict[str, Any]) -> BasePlatformAdapter:
     if platform_type == "bale_pv_enterprise":
         return BalePvAdapter(instance_key, config)
+    if platform_type == "instagram_pv_enterprise":
+        return InstagramPvAdapter(instance_key, config)
     raise ValueError(f"Unsupported platform_type for adapter registry: {platform_type}")
 
 

@@ -12,12 +12,14 @@ from app.connectors.bale_connector import bale
 from app.connectors.bale_pv_connector import bale_pv
 from app.connectors.base_connector import PlatformConnector
 from app.connectors.telegram_connector import telegram
+from app.instagram.connector import instagram_pv
 
 
 CONNECTOR_SOURCE_PREFIX = {
     'bale': 'BALE',
     'bale_enterprise': 'BALE_ENTERPRISE',
     'bale_pv_enterprise': 'BALE_PV',
+    'instagram_pv_enterprise': 'INSTAGRAM_PV',
     'telegram': 'TELEGRAM',
     'telegram_enterprise': 'TELEGRAM_ENTERPRISE',
 }
@@ -31,6 +33,7 @@ class ConnectorRegistry:
             'bale': bale,
             'bale_enterprise': bale,
             'bale_pv_enterprise': bale_pv,
+            'instagram_pv_enterprise': instagram_pv,
             'telegram': telegram,
             'telegram_enterprise': telegram,
         }

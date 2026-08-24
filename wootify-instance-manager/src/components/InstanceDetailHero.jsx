@@ -12,6 +12,7 @@ export default function InstanceDetailHero({
   isTelegramPlatform,
   isEnterpriseBalePlatform,
   isBalePvPlatform,
+  isInstagramPvPlatform,
   isEnterpriseTelegramPlatform,
   isEnterprisePlatform,
   enterpriseRoutes,
@@ -40,6 +41,9 @@ export default function InstanceDetailHero({
       ) : null}
       {isBalePvPlatform ? (
         <div className="instance-token">{maskTokenValue(form.bale_pv_phone_number || selectedInstance?.platform_metadata?.bale_pv_phone_number)}</div>
+      ) : null}
+      {isInstagramPvPlatform ? (
+        <div className="instance-token">{maskTokenValue(form.instagram_username || selectedInstance?.platform_metadata?.instagram_username)}</div>
       ) : null}
       {isTelegramPlatform ? (
         <div className="instance-token">
@@ -77,6 +81,22 @@ export default function InstanceDetailHero({
             <div>
               <span className="k">Department</span>
               <span className="v">{form.bale_pv_department || '-'}</span>
+            </div>
+          </>
+        ) : null}
+        {isInstagramPvPlatform ? (
+          <>
+            <div>
+              <span className="k">Display name</span>
+              <span className="v">{form.instagram_display_name || '-'}</span>
+            </div>
+            <div>
+              <span className="k">Username</span>
+              <span className="v">{form.instagram_username || '-'}</span>
+            </div>
+            <div>
+              <span className="k">Department</span>
+              <span className="v">{form.instagram_department || '-'}</span>
             </div>
           </>
         ) : null}

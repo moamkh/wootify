@@ -59,6 +59,9 @@ from app.schemas.api_v1 import (
     InstanceListResponse,
     InstancePatchRequest,
     InstanceResponse,
+    InstagramPvChallengeCodeRequest,
+    InstagramPvChallengeStartResponse,
+    InstagramPvCheckResponse,
     MessageMappingListResponse,
     MessageMappingResponse,
     PlatformTypeResponse,
@@ -78,6 +81,7 @@ from app.services.instance_service import InstanceService
 from app.services.message_mapping_service import MessageMappingService
 from app.connectors.bale_pv_connector import bale_pv
 from app.connectors.registry import connector_registry
+from app.instagram import instagram_pv
 from app.services.platform_registry_service import PlatformRegistryService
 
 router = APIRouter(prefix='/api/v1', tags=['api-v1'])
@@ -731,6 +735,179 @@ async def bale_pv_auth_status(instance_key: str, db: Session = Depends(get_db)):
         )
 
 
+@router.post('/instances/{instance_key}/instagram-pv/check', response_model=InstagramPvCheckResponse)
+async def instagram_pv_check(instance_key: str, db: Session = Depends(get_db)):
+    """Live connectivity probe for an Instagram PV instance.
+
+    Ensures the session is initialized, then calls ``account_info`` against
+    Instagram to confirm the login session is still valid. Used by the admin
+    panel "Check connectivity" button.
+    """
+    try:
+        runtime = _require_instance_runtime(db, instance_key)
+        if runtime.platform_type.key != 'instagram_pv_enterprise':
+            _raise_http_error(
+                status_code=400,
+                detail='not an instagram_pv_enterprise instance',
+                endpoint='instagram_pv_check',
+                instance_key=instance_key,
+            )
+        result = await instagram_pv.check_connectivity(
+            instance_key, runtime.platform_metadata, runtime.proxy
+        )
+        return InstagramPvCheckResponse(**result)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        _raise_http_error(
+            status_code=500,
+            detail='internal server error',
+            endpoint='instagram_pv_check',
+            exc=exc,
+            instance_key=instance_key,
+        )
+
+
+@router.post('/instances/{instance_key}/instagram-pv/reconnect', response_model=InstagramPvCheckResponse)
+async def instagram_pv_reconnect(
+    instance_key: str,
+    fresh: bool = False,
+    db: Session = Depends(get_db),
+):
+    """Force a fresh Instagram login for an Instagram PV instance.
+
+    Drops the in-memory session and re-authenticates with the configured
+    username/password through the instance proxy. ``?fresh=true`` also
+    deletes the persisted session file (new device fingerprint).
+    """
+    try:
+        runtime = _require_instance_runtime(db, instance_key)
+        if runtime.platform_type.key != 'instagram_pv_enterprise':
+            _raise_http_error(
+                status_code=400,
+                detail='not an instagram_pv_enterprise instance',
+                endpoint='instagram_pv_reconnect',
+                instance_key=instance_key,
+            )
+        result = await instagram_pv.reconnect(
+            instance_key, runtime.platform_metadata, runtime.proxy, fresh=fresh
+        )
+        return InstagramPvCheckResponse(**result)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        _raise_http_error(
+            status_code=500,
+            detail='internal server error',
+            endpoint='instagram_pv_reconnect',
+            exc=exc,
+            instance_key=instance_key,
+        )
+
+
+@router.post('/instances/{instance_key}/instagram-pv/challenge/start', response_model=InstagramPvChallengeStartResponse)
+async def instagram_pv_challenge_start(instance_key: str, db: Session = Depends(get_db)):
+    """Start the Instagram checkpoint challenge flow for an instance.
+
+    Attempts a login; on a native checkpoint, drives the contact-form flow so
+    Instagram emails (or SMSes) a security code. Submit it via the
+    validate-code endpoint. Mirrors the Bale PV send-code UX.
+    """
+    try:
+        runtime = _require_instance_runtime(db, instance_key)
+        if runtime.platform_type.key != 'instagram_pv_enterprise':
+            _raise_http_error(
+                status_code=400,
+                detail='not an instagram_pv_enterprise instance',
+                endpoint='instagram_pv_challenge_start',
+                instance_key=instance_key,
+            )
+        result = await instagram_pv.start_challenge(
+            instance_key, runtime.platform_metadata, runtime.proxy
+        )
+        return InstagramPvChallengeStartResponse(**result)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        _raise_http_error(
+            status_code=500,
+            detail='internal server error',
+            endpoint='instagram_pv_challenge_start',
+            exc=exc,
+            instance_key=instance_key,
+        )
+
+
+@router.post('/instances/{instance_key}/instagram-pv/challenge/validate-code', response_model=InstagramPvCheckResponse)
+async def instagram_pv_challenge_validate_code(
+    instance_key: str,
+    payload: InstagramPvChallengeCodeRequest,
+    db: Session = Depends(get_db),
+):
+    """Submit the emailed/SMSed checkpoint security code and finish login."""
+    try:
+        runtime = _require_instance_runtime(db, instance_key)
+        if runtime.platform_type.key != 'instagram_pv_enterprise':
+            _raise_http_error(
+                status_code=400,
+                detail='not an instagram_pv_enterprise instance',
+                endpoint='instagram_pv_challenge_validate_code',
+                instance_key=instance_key,
+            )
+        result = await instagram_pv.submit_challenge_code(instance_key, payload.code)
+        return InstagramPvCheckResponse(**result)
+    except HTTPException:
+        raise
+    except ValueError as exc:
+        _raise_http_error(
+            status_code=400,
+            detail=str(exc),
+            endpoint='instagram_pv_challenge_validate_code',
+            instance_key=instance_key,
+        )
+    except Exception as exc:
+        _raise_http_error(
+            status_code=500,
+            detail='internal server error',
+            endpoint='instagram_pv_challenge_validate_code',
+            exc=exc,
+            instance_key=instance_key,
+        )
+
+
+@router.post('/instances/{instance_key}/instagram-pv/challenge/resume', response_model=InstagramPvCheckResponse)
+async def instagram_pv_challenge_resume(instance_key: str, db: Session = Depends(get_db)):
+    """Resume a frozen checkpoint after the user approved it in the official app."""
+    try:
+        runtime = _require_instance_runtime(db, instance_key)
+        if runtime.platform_type.key != 'instagram_pv_enterprise':
+            _raise_http_error(
+                status_code=400,
+                detail='not an instagram_pv_enterprise instance',
+                endpoint='instagram_pv_challenge_resume',
+                instance_key=instance_key,
+            )
+        result = await instagram_pv.resume_challenge(instance_key)
+        return InstagramPvCheckResponse(**result)
+    except HTTPException:
+        raise
+    except ValueError as exc:
+        _raise_http_error(
+            status_code=400,
+            detail=str(exc),
+            endpoint='instagram_pv_challenge_resume',
+            instance_key=instance_key,
+        )
+    except Exception as exc:
+        _raise_http_error(
+            status_code=500,
+            detail='internal server error',
+            endpoint='instagram_pv_challenge_resume',
+            exc=exc,
+            instance_key=instance_key,
+        )
+
+
 @router.get('/instances/{instance_key}/bale-pv/contacts', response_model=BalePvContactsResponse)
 async def bale_pv_contacts(instance_key: str, db: Session = Depends(get_db)):
     """Fetch contacts for a Bale PV instance."""
@@ -1250,7 +1427,7 @@ async def _deliver_chatwoot_webhook_background(
             result = await enterprise.receive_chatwoot_webhook(db, resolved_instance_key, payload)
         elif platform_key == 'telegram_enterprise':
             result = await enterprise_telegram.receive_chatwoot_webhook(db, resolved_instance_key, payload)
-        elif platform_key == 'bale_pv_enterprise':
+        elif platform_key in ('bale_pv_enterprise', 'instagram_pv_enterprise'):
             result = await chatwoot_bridge.handle_chatwoot_webhook(db, resolved_instance_key, payload)
         else:
             result = await bridge.receive_chatwoot_webhook(db, resolved_instance_key, payload)
@@ -1398,7 +1575,7 @@ async def simulate_platform_event(instance_key: str, payload: SimulatePlatformEv
                 }
             )
 
-        if runtime.platform_type.key == 'bale_pv_enterprise':
+        if runtime.platform_type.key in ('bale_pv_enterprise', 'instagram_pv_enterprise'):
             result = await chatwoot_bridge.ingest_platform_event(db, instance_key, event)
         else:
             result = await bridge.ingest_platform_event(db, instance_key, event)

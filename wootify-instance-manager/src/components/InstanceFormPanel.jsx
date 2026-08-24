@@ -113,6 +113,7 @@ export default function InstanceFormPanel({
   isStandardBalePlatform,
   isEnterpriseBalePlatform,
   isBalePvPlatform,
+  isInstagramPvPlatform,
   isTelegramPlatform,
   isEnterpriseTelegramPlatform,
   isEnterprisePlatform,
@@ -130,6 +131,17 @@ export default function InstanceFormPanel({
   onBalePvSendCode,
   onBalePvValidateCode,
   onBalePvAuthStatus,
+  instagramCheckLoading,
+  instagramCheckResult,
+  onInstagramPvCheck,
+  onInstagramPvReconnect,
+  instagramChallengeCode,
+  setInstagramChallengeCode,
+  instagramChallengeLoading,
+  instagramChallengeInfo,
+  onInstagramPvChallengeStart,
+  onInstagramPvChallengeValidateCode,
+  onInstagramPvChallengeResume,
 }) {
   return (
     <section className="card section-stack">
@@ -380,6 +392,220 @@ export default function InstanceFormPanel({
           </>
         ) : null}
 
+        {isInstagramPvPlatform ? (
+          <>
+            <h3>Instagram PV (Personal Account)</h3>
+            <div className="row">
+              <label>
+                Username
+                <input
+                  value={form.instagram_username}
+                  onChange={(e) => setForm((s) => ({ ...s, instagram_username: e.target.value }))}
+                  placeholder="e.g. my_instagram_account"
+                  autoComplete="off"
+                />
+              </label>
+              <label>
+                Password
+                <input
+                  type="password"
+                  value={form.instagram_password}
+                  onChange={(e) => setForm((s) => ({ ...s, instagram_password: e.target.value }))}
+                  autoComplete="new-password"
+                />
+              </label>
+            </div>
+            <div className="row">
+              <label style={{ flex: 1 }}>
+                Session cookie (sessionid) — checkpoint bypass
+                <input
+                  type="password"
+                  value={form.instagram_sessionid}
+                  onChange={(e) => setForm((s) => ({ ...s, instagram_sessionid: e.target.value }))}
+                  placeholder="Paste sessionid from instagram.com browser cookies"
+                  autoComplete="off"
+                />
+              </label>
+            </div>
+            <div className="row">
+              <label>
+                2FA Verification Code
+                <input
+                  value={form.instagram_verification_code}
+                  onChange={(e) => setForm((s) => ({ ...s, instagram_verification_code: e.target.value }))}
+                  placeholder="Only if Instagram asks for a code"
+                />
+              </label>
+              <label>
+                TOTP Seed
+                <input
+                  value={form.instagram_totp_seed}
+                  onChange={(e) => setForm((s) => ({ ...s, instagram_totp_seed: e.target.value }))}
+                  placeholder="Base32 seed for automatic 2FA codes"
+                />
+              </label>
+            </div>
+            <div className="row">
+              <label>
+                Poll Interval
+                <input
+                  value={form.instagram_poll_interval}
+                  onChange={(e) => setForm((s) => ({ ...s, instagram_poll_interval: e.target.value }))}
+                />
+              </label>
+              <label>
+                Session Directory
+                <input
+                  value={form.instagram_session_dir}
+                  onChange={(e) => setForm((s) => ({ ...s, instagram_session_dir: e.target.value }))}
+                  placeholder="default: ./data/instagram_pv_sessions"
+                />
+              </label>
+            </div>
+            <div className="row">
+              <label>
+                Display Name
+                <input
+                  value={form.instagram_display_name}
+                  onChange={(e) => setForm((s) => ({ ...s, instagram_display_name: e.target.value }))}
+                />
+              </label>
+              <label>
+                Department
+                <input
+                  value={form.instagram_department}
+                  onChange={(e) => setForm((s) => ({ ...s, instagram_department: e.target.value }))}
+                />
+              </label>
+            </div>
+            <p className="muted" style={{ marginTop: 4 }}>
+              Login happens automatically when the instance is enabled. If Instagram requires a
+              checkpoint challenge, confirm the login in the Instagram app once, then restart the
+              instance.
+            </p>
+
+            {selectedKey ? (
+              <div className="form-section-block" style={{ marginTop: 12 }}>
+                <h4>Connection &amp; Chatwoot</h4>
+                <div className="row">
+                  <button
+                    type="button"
+                    className="btn"
+                    disabled={busy || instagramCheckLoading}
+                    onClick={() => onInstagramPvCheck(selectedKey)}
+                  >
+                    {instagramCheckLoading ? 'Checking…' : 'Check connectivity'}
+                  </button>
+                  <button
+                    type="button"
+                    className="btn secondary"
+                    disabled={busy || instagramCheckLoading}
+                    onClick={() => onInstagramPvReconnect(selectedKey)}
+                  >
+                    {instagramCheckLoading ? 'Connecting…' : 'Reconnect (fresh login)'}
+                  </button>
+                  <button
+                    type="button"
+                    className="btn primary"
+                    disabled={busy}
+                    onClick={() => onCreateInbox(selectedKey)}
+                  >
+                    Auto-create Chatwoot inbox
+                  </button>
+                </div>
+                {instagramCheckResult ? (
+                  <div className="row" style={{ marginTop: 10, alignItems: 'center' }}>
+                    <span className={`status-pill ${instagramCheckResult.connected ? 'good' : 'bad'}`}>
+                      {instagramCheckResult.connected ? 'Connected' : 'Not connected'}
+                    </span>
+                    <span className="small">
+                      {instagramCheckResult.username ? `@${instagramCheckResult.username}` : ''}
+                      {instagramCheckResult.user_id ? ` (id ${instagramCheckResult.user_id})` : ''}
+                      {instagramCheckResult.detail ? ` — ${instagramCheckResult.detail}` : ''}
+                      {instagramCheckResult.rate_limited ? ' — rate limited, backing off' : ''}
+                      {instagramCheckResult.session_file ? ' — session file present' : ''}
+                    </span>
+                  </div>
+                ) : null}
+
+                <h4 style={{ marginTop: 14 }}>Checkpoint challenge (email/SMS code)</h4>
+                <p className="small" style={{ margin: '0 0 8px' }}>
+                  If Instagram answers with a checkpoint instead of an in-app prompt, start the
+                  challenge here — Instagram emails a security code to the account address, then
+                  submit it below (same flow as the Bale SMS code).
+                </p>
+                <div className="row">
+                  <button
+                    type="button"
+                    className="btn"
+                    disabled={busy || instagramChallengeLoading}
+                    onClick={() => onInstagramPvChallengeStart(selectedKey)}
+                  >
+                    {instagramChallengeLoading ? 'Working…' : 'Start challenge (send email code)'}
+                  </button>
+                  {instagramChallengeInfo?.state === 'manual_approval' ? (
+                    <button
+                      type="button"
+                      className="btn primary"
+                      disabled={busy || instagramChallengeLoading}
+                      onClick={() => onInstagramPvChallengeResume(selectedKey)}
+                    >
+                      {instagramChallengeLoading ? 'Resuming…' : 'Resume challenge (after app approval)'}
+                    </button>
+                  ) : null}
+                </div>
+                <div className="row" style={{ marginTop: 8 }}>
+                  <label style={{ flex: 1 }}>
+                    Security Code
+                    <input
+                      value={instagramChallengeCode}
+                      onChange={(e) => setInstagramChallengeCode(e.target.value)}
+                      placeholder="Code from Instagram email"
+                    />
+                  </label>
+                  <button
+                    type="button"
+                    className="btn primary"
+                    disabled={busy || instagramChallengeLoading || !instagramChallengeCode.trim()}
+                    onClick={() => onInstagramPvChallengeValidateCode(selectedKey, instagramChallengeCode.trim())}
+                  >
+                    {instagramChallengeLoading ? 'Validating…' : 'Validate Code'}
+                  </button>
+                </div>
+                {instagramChallengeInfo ? (
+                  <div className="row" style={{ marginTop: 10, alignItems: 'center' }}>
+                    <span
+                      className={`status-pill ${
+                        instagramChallengeInfo.state === 'connected'
+                          ? 'good'
+                          : instagramChallengeInfo.state === 'code_sent' || instagramChallengeInfo.state === 'resolving'
+                            ? 'warn'
+                            : 'bad'
+                      }`}
+                    >
+                      {instagramChallengeInfo.state === 'code_sent'
+                        ? 'Code sent'
+                        : instagramChallengeInfo.state === 'resolving'
+                          ? 'Validating'
+                          : instagramChallengeInfo.state === 'connected'
+                            ? 'Connected'
+                            : instagramChallengeInfo.state === 'manual_approval'
+                              ? 'Approve in app'
+                              : instagramChallengeInfo.state === 'sending'
+                                ? 'Sending code'
+                                : 'Failed'}
+                    </span>
+                    <span className="small">
+                      {instagramChallengeInfo.choice ? `${String(instagramChallengeInfo.choice).toLowerCase()} — ` : ''}
+                      {instagramChallengeInfo.detail || ''}
+                    </span>
+                  </div>
+                ) : null}
+              </div>
+            ) : null}
+          </>
+        ) : null}
+
         {isTelegramPlatform ? (
           <>
             <h3>{isEnterpriseTelegramPlatform ? 'Telegram enterprise metadata' : 'Telegram metadata'}</h3>
@@ -535,7 +761,7 @@ export default function InstanceFormPanel({
           Account ID
           <input value={form.chatwoot_account_id} onChange={(e) => setForm((s) => ({ ...s, chatwoot_account_id: e.target.value }))} />
         </label>
-        {isStandardBalePlatform || isBalePvPlatform ? (
+        {isStandardBalePlatform || isBalePvPlatform || isInstagramPvPlatform ? (
           <>
             <div className="row">
               <label>
@@ -555,7 +781,7 @@ export default function InstanceFormPanel({
               <input type="checkbox" checked={form.chatwoot_reopen_conversation} onChange={(e) => setForm((s) => ({ ...s, chatwoot_reopen_conversation: e.target.checked }))} />
               Reopen resolved Chatwoot conversation on inbound reply
             </label>
-            {isBalePvPlatform && selectedKey ? (
+            {(isBalePvPlatform || isInstagramPvPlatform) && selectedKey ? (
               <button type="button" className="btn" disabled={busy || !selectedKey} onClick={() => onCreateInbox(selectedKey)}>
                 Create or Link Inbox
               </button>

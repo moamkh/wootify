@@ -356,6 +356,31 @@ class BalePvContactsResponse(BaseModel):
     contacts: list[BalePvContact]
 
 
+class InstagramPvCheckResponse(BaseModel):
+    """Response schema for the Instagram PV live connectivity probe."""
+    connected: bool
+    detail: str = ""
+    username: Optional[str] = None
+    user_id: Optional[str] = None
+    session_file: bool = False
+    rate_limited: bool = False
+    challenge_state: Optional[str] = None
+    challenge_detail: str = ""
+    challenge_choice: Optional[str] = None
+
+
+class InstagramPvChallengeStartResponse(BaseModel):
+    """Response schema for starting the Instagram checkpoint challenge flow."""
+    state: str
+    detail: str = ""
+    choice: Optional[str] = None
+
+
+class InstagramPvChallengeCodeRequest(BaseModel):
+    """Request schema for submitting the Instagram checkpoint security code."""
+    code: str
+
+
 class BalePvSyncContactsResponse(BaseModel):
     """Response schema for Bale PV contacts sync operation."""
     message: str

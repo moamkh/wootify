@@ -79,6 +79,11 @@ class Settings(BaseSettings):
         'Commands: /share_phone, /help'
     )
 
+    INSTAGRAM_PV_SESSION_DIR: str = './data/instagram_pv_sessions'
+    INSTAGRAM_PV_POLL_INTERVAL_SECONDS: int = 10
+    INSTAGRAM_PV_LONG_POLL_TIMEOUT_SECONDS: int = 30
+    INSTAGRAM_PV_MEDIA_DOWNLOAD_TIMEOUT_SECONDS: int = 60
+
     DATA_ENCRYPTION_KEY: str = ''
     # Optional previous key, used once to re-encrypt stored secrets after a key
     # change (see app/utils/key_rotation.py). Special value 'dev-fallback' means
@@ -86,6 +91,14 @@ class Settings(BaseSettings):
     # Remove this setting again after a successful rotation.
     DATA_ENCRYPTION_KEY_PREVIOUS: str = ''
     STORE_MESSAGE_PAYLOADS: bool = False
+
+    # Admin panel login. When PANEL_AUTH_PASSWORD is empty the panel API runs
+    # without authentication (development default). Set it in .env to enforce
+    # username/password login with JWT bearer tokens.
+    PANEL_AUTH_USERNAME: str = 'admin'
+    PANEL_AUTH_PASSWORD: str = ''
+    PANEL_AUTH_JWT_SECRET: str = ''
+    PANEL_AUTH_TOKEN_TTL_MINUTES: int = 720
 
     LOG_LEVEL: str = 'INFO'
     LOG_MESSAGE_CONTENT: bool = False

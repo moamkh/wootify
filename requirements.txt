@@ -17,3 +17,4 @@ python-bale-bot
 python-telegram-bot>=22,<23
 websockets>=15.0
 protobuf>=4.0
+instagrapi>=2.1.0

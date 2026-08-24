@@ -7,6 +7,74 @@
 
 export const API_BASE = (import.meta.env.VITE_API_BASE || 'http://localhost:8000').replace(/\/$/, '');
 
+const TOKEN_STORAGE_KEY = 'wootify_panel_token';
+
+export function getPanelToken() {
+  try {
+    return localStorage.getItem(TOKEN_STORAGE_KEY) || '';
+  } catch {
+    return '';
+  }
+}
+
+export function setPanelToken(token) {
+  try {
+    if (token) {
+      localStorage.setItem(TOKEN_STORAGE_KEY, token);
+    } else {
+      localStorage.removeItem(TOKEN_STORAGE_KEY);
+    }
+  } catch {
+    /* storage unavailable */
+  }
+}
+
+export function clearPanelToken() {
+  setPanelToken('');
+}
+
+function authHeaders(extra = {}) {
+  const token = getPanelToken();
+  return token ? { ...extra, Authorization: `Bearer ${token}` } : { ...extra };
+}
+
+function handleUnauthorized(res) {
+  if (res.status === 401) {
+    clearPanelToken();
+    // Notify the app shell so it can show the login screen again.
+    window.dispatchEvent(new CustomEvent('wootify:unauthorized'));
+  }
+}
+
+export async function panelLogin(username, password) {
+  const res = await fetch(withBase('/api/v1/panel/auth/login'), {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ username, password }),
+  });
+  if (!res.ok) {
+    let detail = res.statusText;
+    try {
+      const data = await res.json();
+      detail = data?.detail || detail;
+    } catch {
+      /* non-JSON error body */
+    }
+    throw new Error(detail);
+  }
+  const data = await res.json();
+  setPanelToken(data?.token || '');
+  return data;
+}
+
+export async function panelAuthStatus() {
+  const res = await fetch(withBase('/api/v1/panel/auth/status'), {
+    headers: authHeaders(),
+  });
+  if (!res.ok) return { authenticated: false, auth_enabled: true };
+  return res.json();
+}
+
 function withBase(path) {
   if (!API_BASE) return path;
   if (path.startsWith('http://') || path.startsWith('https://')) return path;
@@ -14,8 +82,10 @@ function withBase(path) {
 }
 
 async function fetchJSON(path, options = {}) {
-  const res = await fetch(withBase(path), options);
+  const headers = authHeaders(options.headers || {});
+  const res = await fetch(withBase(path), { ...options, headers });
   if (!res.ok) {
+    handleUnauthorized(res);
     const text = await res.text();
     throw new Error(text || res.statusText);
   }
@@ -23,8 +93,10 @@ async function fetchJSON(path, options = {}) {
 }
 
 async function fetchFormJSON(path, options = {}) {
-  const res = await fetch(withBase(path), options);
+  const headers = authHeaders(options.headers || {});
+  const res = await fetch(withBase(path), { ...options, headers });
   if (!res.ok) {
+    handleUnauthorized(res);
     const text = await res.text();
     throw new Error(text || res.statusText);
   }
@@ -48,7 +120,10 @@ export async function getInstanceHealth(instanceKey) {
   // The health endpoint answers 503 when the connection is unhealthy, so
   // bypass fetchJSON and map the status code to a boolean instead of throwing.
   try {
-    const res = await fetch(withBase(`/api/v1/instances/${encodeURIComponent(instanceKey)}/health`));
+    const res = await fetch(withBase(`/api/v1/instances/${encodeURIComponent(instanceKey)}/health`), {
+      headers: authHeaders(),
+    });
+    handleUnauthorized(res);
     return res.ok;
   } catch {
     return false;
@@ -291,6 +366,46 @@ export function balePvRemoveChatwootContacts(instanceKey, dryRun = false) {
   const params = new URLSearchParams();
   params.set('dry_run', dryRun ? 'true' : 'false');
   return fetchJSON(`/api/v1/instances/${encodeURIComponent(instanceKey)}/bale-pv/remove-chatwoot-contacts?${params.toString()}`, {
+    method: 'POST',
+  });
+}
+
+
+export function instagramPvCheck(instanceKey) {
+  return fetchJSON(`/api/v1/instances/${encodeURIComponent(instanceKey)}/instagram-pv/check`, {
+    method: 'POST',
+  });
+}
+
+
+export function instagramPvReconnect(instanceKey, fresh = false) {
+  const params = new URLSearchParams();
+  if (fresh) params.set('fresh', 'true');
+  const suffix = params.toString() ? `?${params.toString()}` : '';
+  return fetchJSON(`/api/v1/instances/${encodeURIComponent(instanceKey)}/instagram-pv/reconnect${suffix}`, {
+    method: 'POST',
+  });
+}
+
+
+export function instagramPvChallengeStart(instanceKey) {
+  return fetchJSON(`/api/v1/instances/${encodeURIComponent(instanceKey)}/instagram-pv/challenge/start`, {
+    method: 'POST',
+  });
+}
+
+
+export function instagramPvChallengeValidateCode(instanceKey, code) {
+  return fetchJSON(`/api/v1/instances/${encodeURIComponent(instanceKey)}/instagram-pv/challenge/validate-code`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ code }),
+  });
+}
+
+
+export function instagramPvChallengeResume(instanceKey) {
+  return fetchJSON(`/api/v1/instances/${encodeURIComponent(instanceKey)}/instagram-pv/challenge/resume`, {
     method: 'POST',
   });
 }

@@ -4,6 +4,12 @@ Uses an in-memory SQLite database for fast, isolated tests.
 """
 from __future__ import annotations
 
+import os
+
+# Isolate tests from the developer .env: panel auth must stay disabled so
+# panel endpoints remain reachable without a JWT during the test session.
+os.environ["PANEL_AUTH_PASSWORD"] = ""
+
 import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy import create_engine

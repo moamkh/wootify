@@ -73,7 +73,11 @@ class ChatwootBridgeService:
         chat_id = str(event["chat_id"])
         chat_type = str(event.get("chat_type") or "private").lower()
         from_name = str(event.get("from_name") or "").strip() or chat_id
-        platform_key = "bale_pv_enterprise"
+        # Derive the platform from the instance instead of assuming Bale PV so
+        # adapter-backed platforms (Bale PV, Instagram PV) share this flow.
+        platform_key = str(
+            getattr(getattr(instance, "platform_type", None), "key", "") or ""
+        ).strip().lower() or "bale_pv_enterprise"
 
         # Proactively resolve group/channel titles if the name still looks generic.
         # This handles cases where the connector's title cache missed and the
@@ -186,11 +190,18 @@ class ChatwootBridgeService:
                     sender_avatar_bytes: Optional[bytes] = None
                     sender_avatar_filename = "avatar.jpg"
                     runtime = get_runtime(instance_key)
-                    if runtime and str(runtime.platform_type) == platform_key:
-                        from app.connectors.bale_pv_connector import bale_pv
-                        sender_avatar_bytes, sender_avatar_ct = await bale_pv.get_user_avatar_bytes(
-                            instance_key, int(sender_chat_id)
-                        )
+                    sender_avatar_ct: Optional[str] = None
+                    if runtime and str(runtime.platform_type) == platform_key and sender_chat_id.isdigit():
+                        if platform_key == "bale_pv_enterprise":
+                            from app.connectors.bale_pv_connector import bale_pv
+                            sender_avatar_bytes, sender_avatar_ct = await bale_pv.get_user_avatar_bytes(
+                                instance_key, int(sender_chat_id)
+                            )
+                        elif platform_key == "instagram_pv_enterprise":
+                            from app.instagram.connector import instagram_pv
+                            sender_avatar_bytes, sender_avatar_ct = await instagram_pv.get_user_avatar_bytes(
+                                instance_key, int(sender_chat_id)
+                            )
                         if sender_avatar_ct and "/" in sender_avatar_ct:
                             ext = sender_avatar_ct.split("/")[-1].split("+")[0]
                             if ext in ("jpeg", "jpg", "png", "gif", "webp"):
@@ -205,7 +216,7 @@ class ChatwootBridgeService:
                         account_id=account_id,
                         inbox_id=inbox_id,
                         chat_id=sender_chat_id,
-                        from_name=str(sender_contact.get("name") or "").strip() or f"Bale User {sender_chat_id}",
+                        from_name=str(sender_contact.get("name") or "").strip() or f"User {sender_chat_id}",
                         phone_number=sender_contact.get("phone_number"),
                         chat_type="private",
                         platform_key=platform_key,
