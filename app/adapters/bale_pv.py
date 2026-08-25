@@ -100,6 +100,23 @@ class BalePvAdapter(BasePlatformAdapter):
         )
         return {"ok": True, "result": result}
 
+    async def delete_message(
+        self,
+        peer_id: str,
+        message_id: str,
+    ) -> Dict[str, Any]:
+        """Delete a Bale message via the authenticated session.
+
+        In private chats a userbot can typically delete messages for both
+        sides, so this also removes messages originally sent by the peer.
+        """
+        result = await bale_pv.delete_message(
+            self.instance_key,
+            peer_id,
+            message_id,
+        )
+        return {"ok": True, "result": result}
+
     async def send_media(
         self,
         peer_id: str,

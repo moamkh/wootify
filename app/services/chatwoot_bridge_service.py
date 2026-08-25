@@ -1669,7 +1669,7 @@ class ChatwootBridgeService:
         the platform adapter. Edits to edit-replies are skipped to avoid loops.
         """
         if self._is_chatwoot_message_deleted(payload):
-            return {"ok": True, "ignored": True, "reason": "deleted_message", "detail": "deleted_message"}
+            return await self._handle_chatwoot_message_deleted(db, instance, payload)
 
         content = str(payload.get("content") or "").strip()
         if not content:
@@ -1739,6 +1739,88 @@ class ChatwootBridgeService:
         return {
             "ok": True,
             "status": "edit_propagated",
+            "chatwoot_message_id": str(message_id),
+            "platform_message_id": mapping.platform_message_id,
+            "bale_result": result,
+        }
+
+    async def _handle_chatwoot_message_deleted(
+        self,
+        db: Session,
+        instance: Instance,
+        payload: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """Propagate a Chatwoot message deletion back to the platform.
+
+        Chatwoot's ``destroy`` action fires ``message_updated`` with
+        ``content_attributes.deleted = true``. The local message mapping gives
+        us the platform message id, and the adapter deletes it via the
+        authenticated session (``just_mine=False`` — in private chats a
+        userbot can also delete the peer's messages).
+        """
+        message_id = payload.get("id") or (payload.get("message") or {}).get("id")
+        if not message_id:
+            return {"ok": True, "ignored": True, "reason": "no_message_id", "detail": "no_message_id"}
+
+        mapping = (
+            db.query(MessageMapping)
+            .filter(MessageMapping.chatwoot_message_id == str(message_id))
+            .first()
+        )
+        if not mapping:
+            return {"ok": True, "ignored": True, "reason": "no_mapping", "detail": "no_mapping"}
+
+        # Skip edit-replies we created ourselves; they only exist in Chatwoot.
+        if ":edit:" in str(mapping.platform_message_id or ""):
+            return {"ok": True, "ignored": True, "reason": "edit_reply", "detail": "edit_reply"}
+
+        if not mapping.platform_message_id:
+            return {"ok": True, "ignored": True, "reason": "no_platform_message_id", "detail": "no_platform_message_id"}
+
+        conversation = (
+            db.query(Conversation)
+            .filter(Conversation.id == mapping.conversation_id)
+            .first()
+        )
+        if not conversation:
+            return {"ok": False, "detail": "conversation_not_found"}
+
+        peer_id = conversation.platform_conversation_id
+        if not peer_id:
+            return {"ok": False, "detail": "peer_id_not_found"}
+
+        runtime = get_runtime(instance.instance_key)
+        if not runtime or runtime.status != "open":
+            return {"ok": False, "detail": "instance_not_connected"}
+
+        adapter_delete = getattr(runtime.adapter, "delete_message", None)
+        if adapter_delete is None:
+            return {"ok": True, "ignored": True, "reason": "delete_not_supported", "detail": "delete_not_supported"}
+
+        try:
+            result = await adapter_delete(
+                peer_id=str(peer_id),
+                message_id=mapping.platform_message_id,
+            )
+        except Exception as exc:
+            logger.exception(
+                "chatwoot_bridge.delete_propagation_failed instance=%s chatwoot_message_id=%s platform_message_id=%s error=%s",
+                instance.instance_key,
+                message_id,
+                mapping.platform_message_id,
+                exc,
+            )
+            return {"ok": False, "detail": f"delete_failed: {exc}"}
+
+        logger.info(
+            "chatwoot_bridge.delete_propagated instance=%s chatwoot_message_id=%s platform_message_id=%s",
+            instance.instance_key,
+            message_id,
+            mapping.platform_message_id,
+        )
+        return {
+            "ok": True,
+            "status": "delete_propagated",
             "chatwoot_message_id": str(message_id),
             "platform_message_id": mapping.platform_message_id,
             "bale_result": result,

@@ -961,8 +961,8 @@ async def test_webhook_skips_message_updated_for_edit_reply(db_session):
 
 
 @pytest.mark.anyio
-async def test_webhook_skips_message_updated_deleted(db_session):
-    """Deleted messages (content_attributes.deleted) must not be edited."""
+async def test_webhook_propagates_message_updated_deleted(db_session):
+    """Deleted messages (content_attributes.deleted) propagate to the platform."""
     platform = PlatformType(
         key="bale_pv_enterprise",
         display_name="Bale PV Enterprise",
@@ -1010,6 +1010,7 @@ async def test_webhook_skips_message_updated_deleted(db_session):
 
     adapter = AsyncMock()
     adapter.edit_message = AsyncMock()
+    adapter.delete_message = AsyncMock(return_value={"ok": True, "result": {}})
     runtime = MagicMock()
     runtime.platform_type = "bale_pv_enterprise"
     runtime.status = "open"
@@ -1036,9 +1037,13 @@ async def test_webhook_skips_message_updated_deleted(db_session):
             )
 
     assert result["ok"] is True
-    assert result["ignored"] is True
-    assert result["reason"] == "deleted_message"
+    assert result["status"] == "delete_propagated"
+    assert result["platform_message_id"] == "888"
     adapter.edit_message.assert_not_awaited()
+    adapter.delete_message.assert_awaited_once_with(
+        peer_id="770408072",
+        message_id="888",
+    )
 
 
 @pytest.mark.anyio
