@@ -1216,7 +1216,6 @@ class BalePvConnector:
             response = await runtime.client.delete_message(
                 peer_id=peer_id,
                 message_ids=[rid],
-                just_mine=False,
             )
             self._logger.info(
                 "bale_pv delete_message ok instance=%s chat_id=%s message_id=%s",
