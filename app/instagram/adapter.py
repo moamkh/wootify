@@ -69,7 +69,11 @@ class InstagramPvAdapter(BasePlatformAdapter):
         text: str,
         *,
         reply_to: Optional[str] = None,
+        mirror_echo: bool = True,
     ) -> Dict[str, Any]:
+        # mirror_echo is a Bale-PV-only concern (Bale never echoes own-session
+        # sends); Instagram pushes its own echoes, so it is ignored here.
+        del mirror_echo
         quoted: Optional[Dict[str, Any]] = None
         if reply_to:
             quoted = {"message_id": reply_to}
@@ -99,7 +103,10 @@ class InstagramPvAdapter(BasePlatformAdapter):
         filename: Optional[str] = None,
         caption: Optional[str] = None,
         reply_to: Optional[str] = None,
+        mirror_echo: bool = True,
     ) -> Dict[str, Any]:
+        # See send_text: mirror_echo is Bale-PV-only and ignored here.
+        del mirror_echo
         quoted: Optional[Dict[str, Any]] = None
         if reply_to:
             quoted = {"message_id": reply_to}

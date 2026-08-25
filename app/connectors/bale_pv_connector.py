@@ -39,6 +39,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import random
 import re
 import time
 import uuid
@@ -554,8 +555,18 @@ class BalePvConnector:
         quoted: Optional[Dict] = None,
         reply_markup: Any = None,
         access_hash: Optional[int] = None,
+        mirror_echo: bool = True,
     ) -> Dict:
-        """Send a text message via the userbot."""
+        """Send a text message via the userbot.
+
+        Returns ``{"ok": True, "result": {"rid": ..., "date": ...}}`` where
+        ``rid``/``date`` come from the SendMessage ack (``None`` when the
+        server did not answer). When ``mirror_echo`` is true (default), a
+        synthetic outgoing echo is queued so the message is mirrored into
+        Chatwoot — Bale never pushes own-message echoes back to the
+        originating session. Chatwoot-webhook-originated sends pass
+        ``mirror_echo=False`` because the Chatwoot message already exists.
+        """
         runtime = self._get_runtime(instance)
         if runtime.auth_state != "authenticated":
             raise RuntimeError(f"Instance {instance} is not authenticated")
@@ -584,12 +595,31 @@ class BalePvConnector:
                 reply_to_message_id=reply_to,
                 access_hash=access_hash,
             )
+            ack = self._parse_send_ack(response)
+            rid = ack.get("rid")
+            date = ack.get("date")
+            if mirror_echo:
+                rid = self._enqueue_outgoing_echo(
+                    runtime,
+                    chat_id=chat_id,
+                    rid=rid,
+                    date=date,
+                    text=text,
+                )
             self._logger.info(
-                "bale_pv send_text ok instance=%s chat_id=%s",
+                "bale_pv send_text ok instance=%s chat_id=%s rid=%s",
                 instance,
                 chat_id,
+                rid,
             )
-            return {"ok": True, "result": {"raw_response": response.hex() if response else None}}
+            return {
+                "ok": True,
+                "result": {
+                    "rid": rid,
+                    "date": date,
+                    "raw_response": response.hex() if response else None,
+                },
+            }
         except Exception as exc:
             self._logger.exception(
                 "bale_pv send_text error instance=%s chat_id=%s",
@@ -713,12 +743,18 @@ class BalePvConnector:
         quoted: Optional[Dict] = None,
         reply_markup: Any = None,
         access_hash: Optional[int] = None,
+        mirror_echo: bool = True,
     ) -> Dict:
         """Send media via the userbot.
 
         Uploads the file to Bale's Nasim storage and sends it as a
         DocumentMessage. Raises if the file cannot be downloaded or uploaded
         so the caller knows the message was not delivered.
+
+        When ``mirror_echo`` is true (default), a synthetic outgoing echo of
+        the sent message is queued so it is mirrored into Chatwoot — Bale
+        never pushes own-message echoes back to the originating session.
+        Chatwoot-webhook-originated sends pass ``mirror_echo=False``.
         """
         runtime = self._get_runtime(instance)
         if runtime.auth_state != "authenticated":
@@ -768,7 +804,8 @@ class BalePvConnector:
 
         try:
             uploaded = await self._upload_file_to_nasim(
-                instance, chat_id, file_bytes, filename, caption, quoted, access_hash
+                instance, chat_id, file_bytes, filename, caption, quoted, access_hash,
+                mirror_echo=mirror_echo,
             )
         except Exception as exc:
             self._logger.exception(
@@ -794,6 +831,7 @@ class BalePvConnector:
         caption: Optional[str] = None,
         quoted: Optional[Dict] = None,
         access_hash: Optional[int] = None,
+        mirror_echo: bool = True,
     ) -> Optional[Dict]:
         """Upload file to Bale Nasim storage and send as DocumentMessage."""
         import httpx
@@ -1045,7 +1083,7 @@ class BalePvConnector:
             file_access_hash,
             access_hash,
         )
-        await runtime.client.send_document(
+        send_response = await runtime.client.send_document(
             peer_id=peer_id,
             file_id=file_id,
             file_access_hash=file_access_hash,
@@ -1058,7 +1096,35 @@ class BalePvConnector:
             ext=ext,
             peer_access_hash=access_hash or 0,
         )
-        return {"ok": True, "result": {"file_id": file_id, "name": filename}}
+        ack = self._parse_send_ack(send_response)
+        rid = ack.get("rid")
+        date = ack.get("date")
+        if mirror_echo:
+            rid = self._enqueue_outgoing_echo(
+                runtime,
+                chat_id=chat_id,
+                rid=rid,
+                date=date,
+                text=caption or "",
+                media={
+                    "file_id": file_id,
+                    "access_hash": file_access_hash,
+                    "file_name": filename,
+                    "mime_type": mime_type,
+                    # Own uploads are downloadable with storage version 1 (the
+                    # only version observed for Nasim uploads in live captures).
+                    "file_storage_version": 1,
+                },
+            )
+        return {
+            "ok": True,
+            "result": {
+                "file_id": file_id,
+                "name": filename,
+                "rid": rid,
+                "date": date,
+            },
+        }
 
     async def update_message(
         self,
@@ -1684,84 +1750,194 @@ class BalePvConnector:
         # Detect the media category from the declared MIME type and set the
         # appropriate Bot-API field so _extract_file can route it correctly.
         if media:
-            composite = {
-                "file_id": media.get("file_id"),
-                "access_hash": media.get("access_hash"),
-                "peer_id": peer_id,
-                "file_name": media.get("file_name", ""),
-                "file_storage_version": media.get("file_storage_version", 0),
-            }
-            media["file_id"] = json.dumps(composite, separators=(",", ":"))
-
-            mime = str(media.get("mime_type") or "").strip().lower()
-            file_name = str(media.get("file_name") or "").strip().lower()
-            width = media.get("width")
-            height = media.get("height")
-
-            # Build a base dict that _extract_file will read
-            media_entry = {
-                "file_id": media["file_id"],
-                "file_name": media.get("file_name", ""),
-                "mime_type": media.get("mime_type", ""),
-            }
-            if width is not None:
-                media_entry["width"] = width
-            if height is not None:
-                media_entry["height"] = height
-
-            if mime.startswith("image/"):
-                # Bale sends stickers with mime_type="image/jpeg" but filename
-                # "sticker<id>.png" — the actual bytes are WEBP. Detect by
-                # mime, extension, OR by the "sticker" filename prefix.
-                _is_sticker = (
-                    mime == "image/webp"
-                    or file_name.endswith(".webp")
-                    or file_name.startswith("sticker")
-                )
-                if _is_sticker:
-                    # Treat WEBP as stickers (Bale/Telegram convention).
-                    # We intentionally omit the thumbnail file_id because Bale
-                    # does not expose a separate thumbnail file; including the
-                    # same composite JSON under thumbnail.file_id confuses the
-                    # downstream extractor. Width/height are preserved so UI
-                    # can render the sticker at the right aspect ratio.
-                    sticker_thumb: Dict[str, Any] = {}
-                    if width is not None:
-                        sticker_thumb["width"] = width
-                    if height is not None:
-                        sticker_thumb["height"] = height
-                    message["sticker"] = {
-                        "file_id": media["file_id"],
-                        # Always tag stickers as image/webp regardless of what
-                        # Bale declares (e.g. "image/jpeg" for sticker*.png files).
-                        "mime_type": "image/webp",
-                        "thumbnail": sticker_thumb if sticker_thumb else None,
-                    }
-                else:
-                    # Photos: Bot-API expects a list, last element is used
-                    message["photo"] = [media_entry]
-            elif mime.startswith("video/"):
-                message["video"] = media_entry
-            elif mime.startswith("audio/"):
-                if mime == "audio/ogg" or file_name.endswith(".ogg"):
-                    # Voice messages are typically OGG in Bale
-                    message["voice"] = media_entry
-                else:
-                    message["audio"] = media_entry
-            else:
-                message["document"] = media_entry
-
-            message["mime_type"] = media.get("mime_type", "")
-            message["file_name"] = media.get("file_name", "")
-            if width is not None:
-                message["width"] = width
-            if height is not None:
-                message["height"] = height
+            BalePvConnector._apply_media_to_message(message, media, peer_id)
 
         return {
             "update_id": int(rid or 0),
             "message": message,
         }
+
+    @staticmethod
+    def _apply_media_to_message(
+        message: Dict[str, Any],
+        media: Dict[str, Any],
+        peer_id: Any,
+    ) -> None:
+        """Attach media metadata to a Bot-API-style message dict (in place).
+
+        Wraps the raw Bale file reference into the composite JSON ``file_id``
+        used by ``download_file_by_id`` and routes the media to the correct
+        Bot-API key (photo/video/voice/audio/document/sticker) based on the
+        declared MIME type. Shared by ``_parse_raw_update`` (server-pushed
+        updates) and ``_enqueue_outgoing_echo`` (locally synthesized echoes of
+        own-session sends).
+        """
+        composite = {
+            "file_id": media.get("file_id"),
+            "access_hash": media.get("access_hash"),
+            "peer_id": peer_id,
+            "file_name": media.get("file_name", ""),
+            "file_storage_version": media.get("file_storage_version", 0),
+        }
+        media["file_id"] = json.dumps(composite, separators=(",", ":"))
+
+        mime = str(media.get("mime_type") or "").strip().lower()
+        file_name = str(media.get("file_name") or "").strip().lower()
+        width = media.get("width")
+        height = media.get("height")
+
+        # Build a base dict that _extract_file will read
+        media_entry = {
+            "file_id": media["file_id"],
+            "file_name": media.get("file_name", ""),
+            "mime_type": media.get("mime_type", ""),
+        }
+        if width is not None:
+            media_entry["width"] = width
+        if height is not None:
+            media_entry["height"] = height
+
+        if mime.startswith("image/"):
+            # Bale sends stickers with mime_type="image/jpeg" but filename
+            # "sticker<id>.png" — the actual bytes are WEBP. Detect by
+            # mime, extension, OR by the "sticker" filename prefix.
+            _is_sticker = (
+                mime == "image/webp"
+                or file_name.endswith(".webp")
+                or file_name.startswith("sticker")
+            )
+            if _is_sticker:
+                # Treat WEBP as stickers (Bale/Telegram convention).
+                # We intentionally omit the thumbnail file_id because Bale
+                # does not expose a separate thumbnail file; including the
+                # same composite JSON under thumbnail.file_id confuses the
+                # downstream extractor. Width/height are preserved so UI
+                # can render the sticker at the right aspect ratio.
+                sticker_thumb: Dict[str, Any] = {}
+                if width is not None:
+                    sticker_thumb["width"] = width
+                if height is not None:
+                    sticker_thumb["height"] = height
+                message["sticker"] = {
+                    "file_id": media["file_id"],
+                    # Always tag stickers as image/webp regardless of what
+                    # Bale declares (e.g. "image/jpeg" for sticker*.png files).
+                    "mime_type": "image/webp",
+                    "thumbnail": sticker_thumb if sticker_thumb else None,
+                }
+            else:
+                # Photos: Bot-API expects a list, last element is used
+                message["photo"] = [media_entry]
+        elif mime.startswith("video/"):
+            message["video"] = media_entry
+        elif mime.startswith("audio/"):
+            if mime == "audio/ogg" or file_name.endswith(".ogg"):
+                # Voice messages are typically OGG in Bale
+                message["voice"] = media_entry
+            else:
+                message["audio"] = media_entry
+        else:
+            message["document"] = media_entry
+
+        message["mime_type"] = media.get("mime_type", "")
+        message["file_name"] = media.get("file_name", "")
+        if width is not None:
+            message["width"] = width
+        if height is not None:
+            message["height"] = height
+
+    def _enqueue_outgoing_echo(
+        self,
+        runtime: BalePvInstanceRuntime,
+        *,
+        chat_id: str,
+        rid: Optional[int],
+        date: Optional[int],
+        text: str = "",
+        media: Optional[Dict[str, Any]] = None,
+    ) -> Optional[int]:
+        """Push a synthetic Bot-API-style outgoing update into the poll queue.
+
+        Bale pushes own-message echoes only to the account's *other* sessions,
+        never back to the WebSocket session that sent the message (verified on
+        production: own-session ``sending_document``/``send_text`` calls are
+        never followed by a parsed echo update). Without this, messages sent
+        through our own session (e.g. the panel/API ``send-by-phone`` path)
+        would never be mirrored into Chatwoot.
+
+        ``_parse_raw_update`` passes already-parsed dicts through unchanged,
+        so the synthesized update flows through the standard
+        ``get_updates`` → adapter → bridge pipeline exactly like a
+        server-pushed echo. Webhook-originated sends skip this
+        (``mirror_echo=False``) because the Chatwoot message already exists;
+        the bridge additionally persists a MessageMapping with the returned
+        rid so any late server echo is deduped.
+
+        Returns the rid used for the echo (a random fallback when the
+        SendMessage ack did not disclose one).
+        """
+        try:
+            peer_id = int(chat_id)
+        except (ValueError, TypeError):
+            return None
+
+        if not isinstance(rid, int) or rid <= 0:
+            rid = random.randint(1, 2**63 - 1)
+            self._logger.info(
+                "bale_pv outgoing_echo_fallback_rid instance=%s chat_id=%s rid=%s",
+                runtime.instance_key,
+                chat_id,
+                rid,
+            )
+
+        self_uid = runtime.self_user_id
+        peer_name = runtime.user_cache.get(peer_id) or f"User {peer_id}"
+        message: Dict[str, Any] = {
+            "message_id": str(rid),
+            "date": int(date or time.time()),
+            "chat": {"id": str(peer_id), "type": "private", "title": peer_name},
+            "from": {
+                "id": self_uid,
+                "first_name": "",
+                "username": f"user_{self_uid}" if self_uid else "",
+            },
+            "text": text or "",
+            "_outgoing": True,
+        }
+        if media:
+            self._apply_media_to_message(message, dict(media), peer_id)
+
+        update = {"update_id": int(rid), "message": message}
+        try:
+            runtime.message_queue.put_nowait(update)
+            self._logger.info(
+                "bale_pv outgoing_echo_enqueued instance=%s chat_id=%s rid=%s has_media=%s",
+                runtime.instance_key,
+                chat_id,
+                rid,
+                bool(media),
+            )
+        except Exception as exc:
+            self._logger.warning(
+                "bale_pv outgoing_echo_enqueue_failed instance=%s chat_id=%s error=%s",
+                runtime.instance_key,
+                chat_id,
+                exc,
+            )
+        return rid
+
+    @staticmethod
+    def _parse_send_ack(raw: Optional[bytes]) -> Dict[str, Optional[int]]:
+        """Parse a SendMessage ack into ``{"rid": ..., "date": ...}``."""
+        if not raw:
+            return {"rid": None, "date": None}
+        try:
+            from bale_pv_connector.dialog_parser import parse_send_message_response
+
+            return parse_send_message_response(raw)
+        except Exception as exc:
+            logger.debug("bale_pv send_ack_parse_failed error=%s", exc)
+            return {"rid": None, "date": None}
 
     @staticmethod
     def _extract_url_from_nasim_response(msg: bytes) -> Optional[str]:

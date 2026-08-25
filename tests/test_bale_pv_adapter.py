@@ -309,7 +309,7 @@ async def test_webhook_resolves_phone_to_bale_user(db_session):
 
     assert result["ok"] is True
     assert result["peer_id"] == "12345"
-    adapter.send_text.assert_awaited_once_with("12345", "Hello", reply_to=None)
+    adapter.send_text.assert_awaited_once_with("12345", "Hello", reply_to=None, mirror_echo=False)
 
 
 @pytest.mark.anyio
@@ -453,7 +453,7 @@ async def test_webhook_does_not_resolve_when_identifier_present(db_session):
     assert result["ok"] is True
     assert result["peer_id"] == "770408072"
     adapter.resolve_phone_to_user.assert_not_awaited()
-    adapter.send_text.assert_awaited_once_with("770408072", "Hello", reply_to=None)
+    adapter.send_text.assert_awaited_once_with("770408072", "Hello", reply_to=None, mirror_echo=False)
     client.update_contact.assert_not_awaited()
 
 
@@ -521,7 +521,7 @@ async def test_webhook_outbound_persists_conversation_mapping(db_session):
 
     assert result["ok"] is True
     adapter.send_text.assert_awaited_once_with(
-        "770408072", "Hello from the panel", reply_to=None
+        "770408072", "Hello from the panel", reply_to=None, mirror_echo=False
     )
     mapped = (
         db_session.query(Conversation)
@@ -612,7 +612,7 @@ async def test_webhook_forwards_template_automation_message(db_session):
     assert result["ok"] is True
     assert result["peer_id"] == "770408072"
     adapter.send_text.assert_awaited_once_with(
-        "770408072", "Welcome! How can we help?", reply_to=None
+        "770408072", "Welcome! How can we help?", reply_to=None, mirror_echo=False
     )
 
 
@@ -682,7 +682,7 @@ async def test_webhook_forwards_bot_sender_message(db_session):
     assert result["ok"] is True
     assert result["peer_id"] == "770408072"
     adapter.send_text.assert_awaited_once_with(
-        "770408072", "Bot auto-reply", reply_to=None
+        "770408072", "Bot auto-reply", reply_to=None, mirror_echo=False
     )
 
 

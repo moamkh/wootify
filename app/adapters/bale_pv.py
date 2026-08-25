@@ -71,7 +71,16 @@ class BalePvAdapter(BasePlatformAdapter):
         text: str,
         *,
         reply_to: Optional[str] = None,
+        mirror_echo: bool = True,
     ) -> Dict[str, Any]:
+        """Send a text message via the authenticated Bale session.
+
+        ``mirror_echo`` controls whether the connector queues a synthetic
+        outgoing echo so the message is mirrored into Chatwoot (Bale never
+        echoes own-session sends back to the sender). Chatwoot-webhook-
+        originated sends pass ``mirror_echo=False`` because the Chatwoot
+        message already exists.
+        """
         quoted: Optional[Dict[str, Any]] = None
         if reply_to:
             quoted = {"message_id": reply_to}
@@ -82,6 +91,7 @@ class BalePvAdapter(BasePlatformAdapter):
             text,
             quoted=quoted,
             access_hash=access_hash,
+            mirror_echo=mirror_echo,
         )
         return {"ok": True, "result": result}
 
@@ -125,7 +135,12 @@ class BalePvAdapter(BasePlatformAdapter):
         filename: Optional[str] = None,
         caption: Optional[str] = None,
         reply_to: Optional[str] = None,
+        mirror_echo: bool = True,
     ) -> Dict[str, Any]:
+        """Send media via the authenticated Bale session.
+
+        See ``send_text`` for the ``mirror_echo`` semantics.
+        """
         quoted: Optional[Dict[str, Any]] = None
         if reply_to:
             quoted = {"message_id": reply_to}
@@ -153,6 +168,7 @@ class BalePvAdapter(BasePlatformAdapter):
             caption=caption or None,
             quoted=quoted,
             access_hash=access_hash,
+            mirror_echo=mirror_echo,
         )
         return {"ok": True, "result": result}
 

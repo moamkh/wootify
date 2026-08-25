@@ -79,17 +79,25 @@ class BaleMessagingClient:
         """Close connection."""
         await self.ws.close()
 
+    # How long to wait for the SendMessage ack before giving up. The message
+    # is already sent by then, so a timeout only means "no rid known".
+    SEND_ACK_TIMEOUT_SECONDS = 15.0
+
     async def send_message(
         self,
         peer_id: int,
         text: str,
         reply_to_message_id: Optional[int] = None,
         access_hash: Optional[int] = None,
-    ) -> None:
-        """Send a text message to a peer (fire-and-forget).
+    ) -> Optional[bytes]:
+        """Send a text message to a peer and return the raw ack bytes.
 
-        Bale server acknowledges SendMessage via an update, not a response.
-        Using send_update avoids waiting for a response that never arrives.
+        Bale pushes new own-messages only to the account's *other* sessions,
+        never back to the originating one, so the SendMessage RPC response is
+        this session's only source of the assigned message rid/date. We
+        therefore send it as a unary request and capture the response. If the
+        server never answers (the historical assumption in this codebase), the
+        message is still delivered — we log a warning and return ``None``.
         """
         req = SendMessageRequest(
             peer_id=peer_id,
@@ -97,11 +105,19 @@ class BaleMessagingClient:
             reply_to_message_id=reply_to_message_id,
             access_hash=access_hash,
         )
-        await self.ws.send_update(
-            service_name=self.SERVICE,
-            method="SendMessage",
-            payload=req.serialize(),
-        )
+        try:
+            return await self.ws.send_request(
+                service_name=self.SERVICE,
+                method="SendMessage",
+                payload=req.serialize(),
+                timeout=self.SEND_ACK_TIMEOUT_SECONDS,
+            )
+        except TimeoutError:
+            logger.warning(
+                "SendMessage ack timeout peer_id=%s; message delivered but rid unknown",
+                peer_id,
+            )
+            return None
 
     async def update_message(
         self,
@@ -246,8 +262,8 @@ class BaleMessagingClient:
         thumb: Optional[Any] = None,
         ext: Optional[Any] = None,
         peer_access_hash: int = 0,
-    ) -> None:
-        """Send a document/media message (fire-and-forget).
+    ) -> Optional[bytes]:
+        """Send a document/media message and return the raw ack bytes.
 
         ``file_access_hash`` is the access_hash returned by
         GetNasimFileUploadUrl for this specific file and belongs in the
@@ -255,6 +271,10 @@ class BaleMessagingClient:
         access_hash (used to build an ExPeer in SendMessageRequest) and is
         kept separate so the server can authenticate both the file reference
         and the target peer independently.
+
+        Like ``send_message`` this awaits the SendMessage response (which
+        carries the assigned rid/date); on ack timeout the message is still
+        delivered and ``None`` is returned.
         """
         doc = DocumentMessage(
             file_id=file_id,
@@ -272,11 +292,19 @@ class BaleMessagingClient:
             reply_to_message_id=reply_to_message_id,
             access_hash=peer_access_hash or None,
         )
-        await self.ws.send_update(
-            service_name=self.SERVICE,
-            method="SendMessage",
-            payload=req.serialize(),
-        )
+        try:
+            return await self.ws.send_request(
+                service_name=self.SERVICE,
+                method="SendMessage",
+                payload=req.serialize(),
+                timeout=self.SEND_ACK_TIMEOUT_SECONDS,
+            )
+        except TimeoutError:
+            logger.warning(
+                "SendMessage(document) ack timeout peer_id=%s; message delivered but rid unknown",
+                peer_id,
+            )
+            return None
 
     async def import_contacts(
         self,

@@ -38,8 +38,14 @@ class BasePlatformAdapter(ABC):
         text: str,
         *,
         reply_to: Optional[str] = None,
+        mirror_echo: bool = True,
     ) -> Dict[str, Any]:
-        """Send a text message to a peer."""
+        """Send a text message to a peer.
+
+        ``mirror_echo`` controls whether the platform mirrors the sent message
+        back into Chatwoot as an outgoing echo (only meaningful for platforms
+        whose server does not echo own-session sends, e.g. Bale PV).
+        """
         ...
 
     @abstractmethod
@@ -51,10 +57,12 @@ class BasePlatformAdapter(ABC):
         filename: Optional[str] = None,
         caption: Optional[str] = None,
         reply_to: Optional[str] = None,
+        mirror_echo: bool = True,
     ) -> Dict[str, Any]:
         """Send media to a peer.
 
         ``media`` may be a URL string or bytes.
+        See ``send_text`` for the ``mirror_echo`` semantics.
         """
         ...
 

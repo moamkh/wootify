@@ -55,7 +55,7 @@ class _FakeAdapter:
         self.resolved_phones.append(phone)
         return {'id': 555000111, 'access_hash': '998877', 'name': 'Ali Test'}
 
-    async def send_text(self, peer_id, content, reply_to=None):
+    async def send_text(self, peer_id, content, reply_to=None, mirror_echo=True):
         if self.send_error is not None:
             raise self.send_error
         self.sent_texts.append({'peer_id': peer_id, 'content': content, 'reply_to': reply_to})

@@ -592,11 +592,43 @@ class ChatwootBridgeService:
                         filename=filename,
                         caption=content or None,
                         reply_to=reply_to,
+                        # The Chatwoot message already exists (the agent sent
+                        # it); a synthesized echo would only risk a duplicate.
+                        mirror_echo=False,
                     )
                     sent.append(result)
             else:
-                result = await runtime.adapter.send_text(peer_id, content, reply_to=reply_to)
+                result = await runtime.adapter.send_text(
+                    peer_id,
+                    content,
+                    reply_to=reply_to,
+                    mirror_echo=False,
+                )
                 sent.append(result)
+
+            # Persist the platform rid assigned to each sent message so a
+            # later outgoing echo of the same Bale message (server-pushed or
+            # synthesized) is deduped via duplicate_platform_message_skip
+            # instead of posting a second copy — and so reply-threading can
+            # resolve agent messages to Bale rids.
+            try:
+                outbound_message_id = self._extract_id(payload) or self._extract_id(message_obj)
+                self._persist_outbound_mappings(
+                    db,
+                    instance=instance,
+                    peer_id=peer_id,
+                    chatwoot_message_id=outbound_message_id,
+                    sent=sent,
+                    text=content,
+                    message_kind=MessageKind.media if attachments else MessageKind.text,
+                )
+            except Exception as exc:
+                logger.warning(
+                    "chatwoot_bridge.outbound_message_mapping_failed instance=%s peer_id=%s error=%s",
+                    instance_key,
+                    peer_id,
+                    exc,
+                )
         except Exception as exc:
             # Delivery runs in a background task (the webhook was already
             # acked), so surface the failure to agents as a private note on
@@ -1010,6 +1042,84 @@ class ChatwootBridgeService:
         db.commit()
         db.refresh(mapping)
         return mapping
+
+    @staticmethod
+    def _extract_platform_rid(send_result: Any) -> Optional[str]:
+        """Extract the Bale message rid from a nested adapter/connector result.
+
+        Adapter methods return ``{"ok": True, "result": <connector result>}``
+        and connector sends return ``{"ok": True, "result": {"rid": ...}}``,
+        so the rid lives two levels down.
+        """
+        if not isinstance(send_result, dict):
+            return None
+        result = send_result.get("result")
+        if isinstance(result, dict):
+            rid = result.get("rid")
+            if rid is None and isinstance(result.get("result"), dict):
+                rid = result["result"].get("rid")
+            if rid is not None:
+                return str(rid)
+        return None
+
+    def _persist_outbound_mappings(
+        self,
+        db: Session,
+        *,
+        instance: Instance,
+        peer_id: str,
+        chatwoot_message_id: Optional[int],
+        sent: List[Dict[str, Any]],
+        text: str,
+        message_kind: MessageKind,
+    ) -> None:
+        """Persist MessageMapping rows for Chatwoot-originated outbound sends.
+
+        Links the Chatwoot message id (from the webhook payload) to the
+        platform rid returned by the send ack so that:
+
+        * a later outgoing echo of the same Bale message hits the
+          ``duplicate_platform_message_skip`` path instead of posting a
+          second copy (the stored ``platform_payload_json`` text matches the
+          echo text, so it is not misread as an edit), and
+        * agent replies to this message can be threaded back to the Bale rid.
+        """
+        if not chatwoot_message_id:
+            return
+        conversation = (
+            db.query(Conversation)
+            .filter(
+                Conversation.instance_id == instance.id,
+                Conversation.platform_conversation_id == str(peer_id),
+                Conversation.is_active.is_(True),
+            )
+            .order_by(Conversation.id.desc())
+            .first()
+        )
+        if conversation is None:
+            return
+        for item in sent:
+            rid = self._extract_platform_rid(item)
+            if not rid:
+                continue
+            mapping = self._persist_mapping(
+                db,
+                instance=instance,
+                conversation_id=str(conversation.id),
+                direction=MessageDirection.chatwoot_to_platform,
+                message_kind=message_kind,
+                chatwoot_message_id=str(chatwoot_message_id),
+                platform_message_id=rid,
+                platform_payload_json={"text": text or ""},
+            )
+            if mapping:
+                logger.debug(
+                    "chatwoot_bridge.outbound_mapping_persisted instance=%s conversation_id=%s chatwoot_message_id=%s platform_message_id=%s",
+                    instance.instance_key,
+                    conversation.id,
+                    chatwoot_message_id,
+                    rid,
+                )
 
     async def _handle_platform_message_edit_as_reply(
         self,

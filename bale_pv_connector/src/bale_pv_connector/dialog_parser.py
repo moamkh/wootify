@@ -376,6 +376,57 @@ def parse_message_content(data: bytes) -> Optional[Dict[str, Any]]:
         return None
 
 
+def parse_send_message_response(data: Optional[bytes]) -> Dict[str, Optional[int]]:
+    """Best-effort parse of a ``SendMessage`` RPC response.
+
+    The exact response schema has not been captured in isolation yet, so this
+    parser accepts the two plausible layouts:
+
+    * ``MessageContainer`` — the full sent message:
+      ``{1: sender_uid, 2: rid, 3: date, 4: message, ...}``
+      (same layout as :func:`parse_message_container`).
+    * A compact ack — ``{1: rid, 2: date}`` or similar small message whose
+      integer fields are the assigned rid and the server date.
+
+    Rids observed on the wire are very large int64s (>= 2**60), while dates
+    are unix seconds (~1.7e9) or millis (~1.7e12). Both layouts are
+    disambiguated with those ranges. Returns ``{"rid": ..., "date": ...}``
+    with ``None`` for fields that could not be identified.
+    """
+    result: Dict[str, Optional[int]] = {"rid": None, "date": None}
+    if not data or not isinstance(data, bytes):
+        return result
+    try:
+        fields = ProtobufParser(data).parse()
+    except Exception as exc:
+        logger.debug("parse_send_message_response failed: %s", exc)
+        return result
+
+    # Layout 1: MessageContainer (a nested message body in field 4).
+    if isinstance(fields.get(4, [None])[0], bytes):
+        rid = fields.get(2, [None])[0]
+        date = fields.get(3, [None])[0]
+        if isinstance(rid, int):
+            result["rid"] = rid
+        if isinstance(date, int):
+            result["date"] = date
+        if result["rid"] is not None:
+            return result
+
+    # Layout 2: compact ack — pick plausible values by magnitude.
+    ints: List[int] = []
+    for key in sorted(fields.keys()):
+        for value in fields[key]:
+            if isinstance(value, int):
+                ints.append(value)
+    for value in ints:
+        if result["rid"] is None and value >= 2**60:
+            result["rid"] = value
+        elif result["date"] is None and 10**9 <= value < 10**13:
+            result["date"] = value
+    return result
+
+
 def parse_message_container(data: bytes) -> Optional[Dict[str, Any]]:
     """Parse MessageContainer.
 
