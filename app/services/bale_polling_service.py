@@ -1208,13 +1208,25 @@ class BalePollingService:
                     exc,
                     exc_info=True,
                 )
-                event["attachments"] = []
+                # Raising here routes the update through the bounded retry /
+                # dead-letter path instead of delivering a hollow message.
+                raise RuntimeError(
+                    f"attachment resolution failed for message {event.get('message_id')}"
+                ) from exc
             if original_refs and not event.get("attachments"):
                 self._logger.warning(
                     'bale_pv_adapter_attachments_dropped instance=%s message_id=%s original_count=%s',
                     instance_key,
                     event.get('message_id'),
                     len(original_refs),
+                )
+                # Every attachment download failed (e.g. transient file-gw
+                # 502): refuse to post a hollow message — raise so the update
+                # is retried, then dead-lettered to inbound_event_retries
+                # where the hourly drainer redelivers it.
+                raise RuntimeError(
+                    f"all {len(original_refs)} attachment download(s) failed for "
+                    f"message {event.get('message_id')}; refusing hollow delivery"
                 )
         return event
 

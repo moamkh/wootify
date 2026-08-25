@@ -60,6 +60,13 @@ if _bale_pv_connector_path not in sys.path:
 
 logger = logging.getLogger("app.connectors.bale_pv")
 
+# Bounded retry for transient file-gateway failures when downloading echo
+# attachments (observed 502s from next-file-gw.bale.ai that self-heal within
+# a second or two).
+FILE_DOWNLOAD_MAX_ATTEMPTS = 3
+FILE_DOWNLOAD_RETRY_BACKOFF_SECONDS = 0.5
+FILE_DOWNLOAD_RETRYABLE_STATUSES = frozenset({500, 502, 503, 504})
+
 
 # ---------------------------------------------------------------------------
 # Lazy importers — deferred to avoid heavy gRPC dependencies at module load
@@ -2199,19 +2206,63 @@ class BalePvConnector:
                 download_url[:120],
             )
 
-            # Download the actual file
-            file_resp = await client.get(download_url)
-            if file_resp.status_code != 200:
+            # Download the actual file, with a bounded retry for transient
+            # file-gateway failures (observed 502s from next-file-gw.bale.ai
+            # that self-heal within a second or two). Without this, a single
+            # transient 5xx hollows out an echo media message.
+            content: Optional[bytes] = None
+            content_type: Optional[str] = None
+            last_status: Optional[int] = None
+            last_error: Optional[str] = None
+            for attempt in range(1, FILE_DOWNLOAD_MAX_ATTEMPTS + 1):
+                try:
+                    file_resp = await client.get(download_url)
+                except Exception as exc:
+                    last_status = None
+                    last_error = f"{type(exc).__name__}: {exc}"
+                    self._logger.warning(
+                        "bale_pv file_download_transport_error instance=%s attempt=%s/%s error=%s",
+                        instance,
+                        attempt,
+                        FILE_DOWNLOAD_MAX_ATTEMPTS,
+                        exc,
+                    )
+                else:
+                    last_status = file_resp.status_code
+                    last_error = None
+                    if file_resp.status_code == 200:
+                        content = file_resp.content
+                        content_type = file_resp.headers.get("content-type")
+                        if attempt > 1:
+                            self._logger.info(
+                                "bale_pv file_download_recovered instance=%s attempt=%s",
+                                instance,
+                                attempt,
+                            )
+                        break
+                    if file_resp.status_code not in FILE_DOWNLOAD_RETRYABLE_STATUSES:
+                        break  # 4xx etc. — retrying will not help
+                    self._logger.warning(
+                        "bale_pv file_download_retryable_status instance=%s attempt=%s/%s status=%s url=%s",
+                        instance,
+                        attempt,
+                        FILE_DOWNLOAD_MAX_ATTEMPTS,
+                        file_resp.status_code,
+                        download_url[:80],
+                    )
+                if attempt < FILE_DOWNLOAD_MAX_ATTEMPTS:
+                    await asyncio.sleep(FILE_DOWNLOAD_RETRY_BACKOFF_SECONDS * attempt)
+
+            if content is None:
                 self._logger.warning(
-                    "bale_pv file_download_failed instance=%s status=%s url=%s",
+                    "bale_pv file_download_failed instance=%s status=%s error=%s url=%s",
                     instance,
-                    file_resp.status_code,
+                    last_status,
+                    last_error,
                     download_url[:80],
                 )
                 return b"", None, None
 
-            content = file_resp.content
-            content_type = file_resp.headers.get("content-type")
             self._logger.info(
                 "bale_pv file_downloaded instance=%s size=%s ctype=%s",
                 instance,
