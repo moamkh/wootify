@@ -34,6 +34,7 @@ from app.models import (
     MessageStatus,
 )
 from app.runtime_registry import get_runtime
+from app.services.conversation_mapping_service import ConversationMappingService
 from app.utils.cache_utils import TTLCache
 from app.utils.crypto_utils import encryptor
 
@@ -529,6 +530,35 @@ class ChatwootBridgeService:
                     db, instance, original_peer_id, peer_id
                 )
 
+            # Persist the conversation mapping so an inbound Bale reply is
+            # routed back into THIS Chatwoot conversation. Conversations
+            # opened agent-side (e.g. the Chatvand panel direct-message
+            # "pin", which creates the conversation via the Chatwoot API)
+            # never pass through the inbound ingest path that normally
+            # creates this mapping, so without this the user's reply would
+            # open a duplicate conversation. The upsert is idempotent under
+            # webhook retries and deactivates stale mappings for the peer.
+            conv_obj = payload.get("conversation") if isinstance(payload.get("conversation"), dict) else {}
+            chatwoot_conversation_id = self._extract_id(conv_obj) or payload.get("conversation_id")
+            if chatwoot_conversation_id:
+                try:
+                    ConversationMappingService().upsert(
+                        db,
+                        instance_id=instance.id,
+                        platform_conversation_id=str(peer_id),
+                        chatwoot_conversation_id=str(chatwoot_conversation_id),
+                        chatwoot_contact_id=str(chatwoot_contact_id) if chatwoot_contact_id else None,
+                        chatwoot_inbox_id=str(conv_obj.get("inbox_id") or payload.get("inbox_id") or "") or None,
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        "chatwoot_bridge.outbound_mapping_persist_failed instance=%s chatwoot_conversation_id=%s peer_id=%s error=%s",
+                        instance_key,
+                        chatwoot_conversation_id,
+                        peer_id,
+                        exc,
+                    )
+
             reply_to = None
             parent_id = payload.get("conversation") and payload["conversation"].get("messages") and payload["conversation"]["messages"][0].get("id")
             if parent_id:
@@ -732,7 +762,7 @@ class ChatwootBridgeService:
         # Try remote contact conversations in this inbox, skipping resolved/closed.
         try:
             remote_convs = await client.list_contact_conversations(account_id, contact_id)
-            for item in remote_convs if isinstance(remote_convs, list) else []:
+            for item in self._extract_conversation_list(remote_convs):
                 if str(item.get("inbox_id")) == str(inbox_id):
                     remote_status = str(item.get("status") or "").strip().lower()
                     if remote_status in ("resolved", "closed"):
@@ -764,7 +794,7 @@ class ChatwootBridgeService:
         try:
             remote_convs = await client.list_contact_conversations(account_id, contact_id)
             target = str(chatwoot_conversation_id).strip()
-            for item in remote_convs if isinstance(remote_convs, list) else []:
+            for item in self._extract_conversation_list(remote_convs):
                 if (
                     str(item.get("inbox_id")) == str(inbox_id)
                     and str(self._extract_id(item) or "") == target
@@ -814,6 +844,22 @@ class ChatwootBridgeService:
         db.commit()
         db.refresh(existing)
         return existing
+
+    @staticmethod
+    def _extract_conversation_list(resp: Any) -> List[Dict[str, Any]]:
+        """Normalize the contact-conversations response to a list.
+
+        Chatwoot returns ``{"payload": [...]}`` for
+        ``GET /contacts/:id/conversations``; older code iterated the raw
+        response only when it was a bare list, so the reuse-existing
+        conversation fallback never matched and duplicate conversations
+        were created.
+        """
+        if isinstance(resp, dict):
+            resp = resp.get("payload")
+        if not isinstance(resp, list):
+            return []
+        return [item for item in resp if isinstance(item, dict)]
 
     @staticmethod
     def _attachment_filename(att: Dict[str, Any], data_url: str) -> str:
@@ -1566,7 +1612,7 @@ class ChatwootBridgeService:
         # Try to reuse an existing remote conversation in this inbox first.
         try:
             remote_convs = await client.list_contact_conversations(account_id, contact_id)
-            for item in remote_convs if isinstance(remote_convs, list) else []:
+            for item in self._extract_conversation_list(remote_convs):
                 if str(item.get("inbox_id")) == str(inbox_id):
                     remote_status = str(item.get("status") or "").strip().lower()
                     if remote_status not in ("resolved", "closed"):

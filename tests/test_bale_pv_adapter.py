@@ -458,6 +458,100 @@ async def test_webhook_does_not_resolve_when_identifier_present(db_session):
 
 
 @pytest.mark.anyio
+async def test_webhook_outbound_persists_conversation_mapping(db_session):
+    """Panel-initiated (Chatvand pin) conversations must be mapped locally so
+    the user's Bale reply lands in the same Chatwoot conversation instead of
+    opening a duplicate."""
+    platform = PlatformType(
+        key="bale_pv_enterprise",
+        display_name="Bale PV Enterprise",
+        capabilities_json={},
+        metadata_schema_json={},
+    )
+    db_session.add(platform)
+    db_session.flush()
+
+    instance = Instance(
+        instance_key="bale-pv-pin",
+        platform_type_id=platform.id,
+        is_enabled=True,
+        platform_metadata_encrypted="",
+        chatwoot_config_encrypted='{"account_id": 1}',
+        proxy_config_encrypted="",
+    )
+    db_session.add(instance)
+    db_session.commit()
+
+    adapter = AsyncMock()
+    adapter.send_text = AsyncMock(return_value={"ok": True})
+
+    runtime = MagicMock()
+    runtime.platform_type = "bale_pv_enterprise"
+    runtime.status = "open"
+    runtime.adapter = adapter
+
+    client = AsyncMock()
+
+    payload = {
+        "event": "message_created",
+        "message_type": "outgoing",
+        "content": "Hello from the panel",
+        "conversation": {
+            "id": 70,
+            "inbox_id": 5,
+            "meta": {
+                "sender": {
+                    "id": 42,
+                    "identifier": "BALE_PV:770408072",
+                }
+            },
+            "messages": [],
+        },
+    }
+
+    with patch("app.services.chatwoot_bridge_service.get_runtime", return_value=runtime):
+        with patch.object(
+            chatwoot_bridge,
+            "_chatwoot_client_for_instance",
+            return_value=(instance, {"account_id": 1}, client),
+        ):
+            result = await chatwoot_bridge.handle_chatwoot_webhook(
+                db_session, "bale-pv-pin", payload
+            )
+
+    assert result["ok"] is True
+    adapter.send_text.assert_awaited_once_with(
+        "770408072", "Hello from the panel", reply_to=None
+    )
+    mapped = (
+        db_session.query(Conversation)
+        .filter(
+            Conversation.instance_id == instance.id,
+            Conversation.platform_conversation_id == "770408072",
+        )
+        .first()
+    )
+    assert mapped is not None
+    assert mapped.chatwoot_conversation_id == "70"
+    assert mapped.chatwoot_contact_id == "42"
+    assert mapped.chatwoot_inbox_id == "5"
+    assert mapped.is_active is True
+
+
+def test_extract_conversation_list_unwraps_payload_envelope():
+    """Chatwoot returns {"payload": [...]} for contact conversations; the
+    helper must unwrap it (and tolerate bare lists / garbage)."""
+    from app.services.chatwoot_bridge_service import ChatwootBridgeService
+
+    helper = ChatwootBridgeService._extract_conversation_list
+    assert helper({"payload": [{"id": 1}, {"id": 2}]}) == [{"id": 1}, {"id": 2}]
+    assert helper([{"id": 3}]) == [{"id": 3}]
+    assert helper({"payload": None}) == []
+    assert helper(None) == []
+    assert helper({"payload": [{"id": 1}, "junk"]}) == [{"id": 1}]
+
+
+@pytest.mark.anyio
 async def test_webhook_forwards_template_automation_message(db_session):
     """Chatwoot automation/template messages (welcome, working-hours) must be
     forwarded to the customer as if sent by the authenticated user."""
