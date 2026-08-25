@@ -283,6 +283,26 @@ class ChatwootClient:
             retry_on_read_errors=False,
         )
 
+    @staticmethod
+    def _flatten_multipart_data(data: Dict[str, Any]) -> Dict[str, Any]:
+        """Flatten nested dict values into Rails bracket-notation keys.
+
+        httpx multipart encoding only accepts primitive field values — a
+        nested dict such as ``content_attributes={"in_reply_to": 12}`` raises
+        ``TypeError: Invalid type for value. Expected primitive type`` while
+        encoding. Chatwoot (Rails) expects the bracket form
+        ``content_attributes[in_reply_to]`` in multipart posts, so dict values
+        are flattened here. The JSON ``post_message`` path is unaffected.
+        """
+        flattened: Dict[str, Any] = {}
+        for key, value in (data or {}).items():
+            if isinstance(value, dict):
+                for sub_key, sub_value in value.items():
+                    flattened[f"{key}[{sub_key}]"] = sub_value
+            else:
+                flattened[key] = value
+        return flattened
+
     async def post_message_with_attachments(
         self,
         account_id: int,
@@ -314,7 +334,7 @@ class ChatwootClient:
         return await self._request(
             "POST",
             f"/api/v1/accounts/{account_id}/conversations/{conversation_id}/messages",
-            data=data,
+            data=self._flatten_multipart_data(data),
             files=files,
             retry_on_read_errors=False,
         )
