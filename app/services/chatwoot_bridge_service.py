@@ -1845,10 +1845,10 @@ class ChatwootBridgeService:
             if exc.response is None or exc.response.status_code != 404:
                 raise
             # The locally mapped contact was deleted remotely, so the create
-            # 404s. Clear the stale mapping and re-run the full remote
+            # 404s. Deactivate the stale mapping and re-run the full remote
             # get-or-create-contact + create-conversation flow exactly once.
             logger.warning(
-                "chatwoot_bridge.recreate_contact_missing instance=%s contact_id=%s chat_id=%s; clearing stale mapping and retrying once",
+                "chatwoot_bridge.recreate_contact_missing instance=%s contact_id=%s chat_id=%s; deactivating stale mapping and retrying once",
                 instance.instance_key,
                 contact_id,
                 chat_id,
@@ -1858,12 +1858,19 @@ class ChatwootBridgeService:
                 .filter(
                     Conversation.instance_id == instance.id,
                     Conversation.platform_conversation_id == chat_id,
+                    Conversation.is_active.is_(True),
                 )
                 .first()
             )
             if stale:
-                stale.chatwoot_contact_id = None
-                stale.chatwoot_conversation_id = None
+                # Do NOT null out chatwoot_conversation_id/chatwoot_contact_id
+                # here: chatwoot_conversation_id is NOT NULL, so that UPDATE
+                # dies with IntegrityError and the whole recreate path aborts
+                # (observed on demo after contact deletion). Deactivating the
+                # row is sufficient — the get-or-create helpers only consider
+                # active rows, and _ensure_local_conversation below re-points
+                # this same row at the fresh contact/conversation.
+                stale.is_active = False
                 db.add(stale)
                 db.commit()
             contact_id, _ = await self._get_or_create_contact(

@@ -2470,3 +2470,102 @@ async def test_ingest_outgoing_echo_unaffected_by_flag(db_session):
     assert result["chatwoot_message_id"] == 12345
     client.create_conversation.assert_awaited_once()
     client.post_message.assert_awaited_once()
+
+
+def _chatwoot_404(method: str, url: str) -> httpx.HTTPStatusError:
+    request = httpx.Request(method, url)
+    response = httpx.Response(404, text="Resource could not be found", request=request)
+    return httpx.HTTPStatusError("404", request=request, response=response)
+
+
+@pytest.mark.anyio
+async def test_ingest_recovers_when_remote_contact_deleted(db_session):
+    """Contact deleted in Chatwoot: the recreate path must deactivate the
+    stale local mapping (NOT null the NOT NULL chatwoot_conversation_id),
+    recreate the contact + conversation remotely, and still deliver the
+    message. Regression: the old code committed NULL chatwoot_conversation_id
+    and died with IntegrityError, dropping every inbound message."""
+    platform = PlatformType(
+        key="bale_pv_enterprise",
+        display_name="Bale PV Enterprise",
+        capabilities_json={},
+        metadata_schema_json={},
+    )
+    db_session.add(platform)
+    db_session.flush()
+
+    instance = Instance(
+        instance_key="bale-pv-contact-deleted",
+        platform_type_id=platform.id,
+        is_enabled=True,
+        platform_metadata_encrypted="",
+        chatwoot_config_encrypted='{"account_id": 1, "base_url": "http://chatwoot", "api_access_token": "token", "inbox_id": 5}',
+        proxy_config_encrypted="",
+    )
+    db_session.add(instance)
+    db_session.commit()
+
+    # Stale local mapping: contact 53 + conversation 70 both deleted remotely.
+    conversation = Conversation(
+        instance_id=instance.id,
+        platform_conversation_id="1755271951",
+        chatwoot_conversation_id="70",
+        chatwoot_contact_id="53",
+        chatwoot_inbox_id="5",
+        is_active=True,
+    )
+    db_session.add(conversation)
+    db_session.commit()
+
+    client = AsyncMock()
+    client.post_message = AsyncMock(
+        side_effect=[
+            _chatwoot_404("POST", "http://chatwoot/api/v1/accounts/1/conversations/70/messages"),
+            {"id": 55555},
+        ]
+    )
+    # Contact gone: listing its conversations 404s, search finds nothing,
+    # first create_conversation (with stale contact_id) 404s, then the
+    # recreated contact + conversation succeed.
+    client.list_contact_conversations = AsyncMock(
+        side_effect=_chatwoot_404("GET", "http://chatwoot/api/v1/accounts/1/contacts/53/conversations")
+    )
+    client.search_contacts = AsyncMock(return_value={"payload": []})
+    client.create_contact = AsyncMock(return_value={"id": 99})
+    client.create_conversation = AsyncMock(
+        side_effect=[
+            _chatwoot_404("POST", "http://chatwoot/api/v1/accounts/1/conversations"),
+            {"id": 71},
+        ]
+    )
+
+    event = {
+        "chat_id": "1755271951",
+        "chat_type": "private",
+        "from_name": "pastmaster",
+        "text": "سلام",
+        "message_id": "777",
+        "platform_message_id": "777",
+        "outgoing": False,
+    }
+
+    with patch.object(
+        chatwoot_bridge,
+        "_chatwoot_client_for_instance",
+        return_value=(instance, {"account_id": 1, "inbox_id": 5}, client),
+    ):
+        result = await chatwoot_bridge.ingest_platform_event(
+            db_session, "bale-pv-contact-deleted", event
+        )
+
+    assert result["ok"] is True
+    assert result["chatwoot_conversation_id"] == 71
+    assert result["chatwoot_message_id"] == 55555
+    client.create_contact.assert_awaited_once()
+    assert client.create_conversation.await_count == 2
+    assert client.post_message.await_count == 2
+    # The same local row is re-pointed at the fresh remote objects.
+    db_session.refresh(conversation)
+    assert conversation.is_active is True
+    assert conversation.chatwoot_conversation_id == "71"
+    assert conversation.chatwoot_contact_id == "99"
