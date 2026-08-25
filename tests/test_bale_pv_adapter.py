@@ -551,6 +551,137 @@ def test_extract_conversation_list_unwraps_payload_envelope():
     assert helper({"payload": [{"id": 1}, "junk"]}) == [{"id": 1}]
 
 
+def _mk_dedup_env(db_session, instance_key):
+    """Shared fixture for outbound dedup tests."""
+    platform = PlatformType(
+        key="bale_pv_enterprise",
+        display_name="Bale PV Enterprise",
+        capabilities_json={},
+        metadata_schema_json={},
+    )
+    db_session.add(platform)
+    db_session.flush()
+
+    instance = Instance(
+        instance_key=instance_key,
+        platform_type_id=platform.id,
+        is_enabled=True,
+        platform_metadata_encrypted="",
+        chatwoot_config_encrypted='{"account_id": 1}',
+        proxy_config_encrypted="",
+    )
+    db_session.add(instance)
+    db_session.commit()
+
+    adapter = AsyncMock()
+    adapter.send_text = AsyncMock(
+        return_value={"ok": True, "result": {"result": {"rid": 2**62 + 7}}}
+    )
+
+    runtime = MagicMock()
+    runtime.platform_type = "bale_pv_enterprise"
+    runtime.status = "open"
+    runtime.adapter = adapter
+
+    client = AsyncMock()
+    return instance, adapter, runtime, client
+
+
+def _template_payload(message_id, content="سلام، وقت بخیر 🙏"):
+    return {
+        "event": "message_created",
+        "id": message_id,
+        "message_type": "template",
+        "content": content,
+        "conversation": {
+            "id": 70,
+            "inbox_id": 5,
+            "meta": {"sender": {"id": 42, "identifier": "BALE_PV:770408072"}},
+            "messages": [],
+        },
+    }
+
+
+@pytest.mark.anyio
+async def test_webhook_outbound_dedup_same_chatwoot_message_id(db_session):
+    """A redelivered webhook (same Chatwoot message id) must not send twice."""
+    instance, adapter, runtime, client = _mk_dedup_env(db_session, "bale-pv-dedup-id")
+    payload = _template_payload(9001)
+
+    with patch("app.services.chatwoot_bridge_service.get_runtime", return_value=runtime):
+        with patch.object(
+            chatwoot_bridge,
+            "_chatwoot_client_for_instance",
+            return_value=(instance, {"account_id": 1}, client),
+        ):
+            first = await chatwoot_bridge.handle_chatwoot_webhook(
+                db_session, "bale-pv-dedup-id", payload
+            )
+            second = await chatwoot_bridge.handle_chatwoot_webhook(
+                db_session, "bale-pv-dedup-id", payload
+            )
+
+    assert first["ok"] is True
+    assert second["ok"] is True
+    assert second["ignored"] is True
+    assert second["reason"] == "duplicate_delivery"
+    assert second["detail"] == "chatwoot_message_already_delivered"
+    assert adapter.send_text.await_count == 1
+
+
+@pytest.mark.anyio
+async def test_webhook_outbound_dedup_template_content_window(db_session):
+    """Double-fired greeting (identical template text, different message ids,
+    milliseconds apart) is forwarded only once."""
+    instance, adapter, runtime, client = _mk_dedup_env(db_session, "bale-pv-dedup-tpl")
+
+    with patch("app.services.chatwoot_bridge_service.get_runtime", return_value=runtime):
+        with patch.object(
+            chatwoot_bridge,
+            "_chatwoot_client_for_instance",
+            return_value=(instance, {"account_id": 1}, client),
+        ):
+            first = await chatwoot_bridge.handle_chatwoot_webhook(
+                db_session, "bale-pv-dedup-tpl", _template_payload(9002)
+            )
+            second = await chatwoot_bridge.handle_chatwoot_webhook(
+                db_session, "bale-pv-dedup-tpl", _template_payload(9003)
+            )
+
+    assert first["ok"] is True
+    assert second["ignored"] is True
+    assert second["detail"] == "template_content_recently_delivered"
+    assert adapter.send_text.await_count == 1
+
+
+@pytest.mark.anyio
+async def test_webhook_outbound_no_dedup_for_agent_messages(db_session):
+    """An agent intentionally sending the same text twice must NOT be deduped
+    (only template/bot messages use the content window)."""
+    instance, adapter, runtime, client = _mk_dedup_env(db_session, "bale-pv-dedup-agent")
+    payload_1 = _template_payload(9004)
+    payload_2 = _template_payload(9005)
+    payload_1["message_type"] = "outgoing"
+    payload_2["message_type"] = "outgoing"
+
+    with patch("app.services.chatwoot_bridge_service.get_runtime", return_value=runtime):
+        with patch.object(
+            chatwoot_bridge,
+            "_chatwoot_client_for_instance",
+            return_value=(instance, {"account_id": 1}, client),
+        ):
+            await chatwoot_bridge.handle_chatwoot_webhook(
+                db_session, "bale-pv-dedup-agent", payload_1
+            )
+            result = await chatwoot_bridge.handle_chatwoot_webhook(
+                db_session, "bale-pv-dedup-agent", payload_2
+            )
+
+    assert result["ok"] is True
+    assert result.get("ignored") is not True
+    assert adapter.send_text.await_count == 2
+
+
 @pytest.mark.anyio
 async def test_webhook_forwards_template_automation_message(db_session):
     """Chatwoot automation/template messages (welcome, working-hours) must be

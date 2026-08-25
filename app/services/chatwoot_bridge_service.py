@@ -9,6 +9,7 @@ cleaner pattern from evolution-api/messenger_chatwoot_connector:
 
 from __future__ import annotations
 
+import datetime as dt
 import logging
 import mimetypes
 import os.path
@@ -559,6 +560,38 @@ class ChatwootBridgeService:
                         exc,
                     )
 
+            # Idempotent delivery: skip if this exact Chatwoot message was
+            # already forwarded (webhook redelivery), and suppress duplicate
+            # template/automation bursts — TotalMessenger/Chatvand can create
+            # an inbox greeting twice milliseconds apart (activity-message
+            # hook racing the incoming-message hook across processes), and
+            # each row fires its own webhook. Deliveries are already
+            # serialized per conversation by the controller lock.
+            dup_reason = self._is_duplicate_outbound_delivery(
+                db,
+                instance=instance,
+                peer_id=str(peer_id),
+                payload=payload,
+                content=content,
+                is_template_or_bot=bool(
+                    is_bot_sender
+                    or message_type == "template"
+                    or nested_type == "template"
+                ),
+            )
+            if dup_reason:
+                logger.info(
+                    "chatwoot_bridge.duplicate_outbound_skipped instance=%s reason=%s",
+                    instance_key,
+                    dup_reason,
+                )
+                return {
+                    "ok": True,
+                    "ignored": True,
+                    "reason": "duplicate_delivery",
+                    "detail": dup_reason,
+                }
+
             reply_to = None
             parent_id = payload.get("conversation") and payload["conversation"].get("messages") and payload["conversation"]["messages"][0].get("id")
             if parent_id:
@@ -1042,6 +1075,70 @@ class ChatwootBridgeService:
         db.commit()
         db.refresh(mapping)
         return mapping
+
+    def _is_duplicate_outbound_delivery(
+        self,
+        db: Session,
+        *,
+        instance: Instance,
+        peer_id: str,
+        payload: Dict[str, Any],
+        content: str,
+        is_template_or_bot: bool,
+    ) -> Optional[str]:
+        """Return a reason string if this outbound delivery is a duplicate.
+
+        Two checks, both backed by the outbound MessageMappings written after
+        each successful send (and both race-free thanks to the
+        per-conversation delivery lock in the controller):
+
+        1. Same Chatwoot message id already delivered (webhook redelivery).
+        2. Template/automation double-fire: TotalMessenger/Chatvand can
+           create an inbox greeting twice milliseconds apart (the two rows
+           get different message ids, so check 1 cannot catch it) — skip an
+           identical template/bot text delivered for this conversation in the
+           last 60 seconds.
+        """
+        conversation = (
+            db.query(Conversation)
+            .filter(
+                Conversation.instance_id == instance.id,
+                Conversation.platform_conversation_id == peer_id,
+                Conversation.is_active.is_(True),
+            )
+            .order_by(Conversation.id.desc())
+            .first()
+        )
+        if conversation is None:
+            return None
+
+        outbound = db.query(MessageMapping).filter(
+            MessageMapping.conversation_id == str(conversation.id),
+            MessageMapping.direction == MessageDirection.chatwoot_to_platform,
+        )
+
+        message_obj = payload.get("message") if isinstance(payload.get("message"), dict) else {}
+        chatwoot_message_id = self._extract_id(payload) or self._extract_id(message_obj)
+        if chatwoot_message_id and outbound.filter(
+            MessageMapping.chatwoot_message_id == str(chatwoot_message_id)
+        ).first():
+            return "chatwoot_message_already_delivered"
+
+        if not is_template_or_bot or not content.strip():
+            return None
+        if self._extract_source_id(payload):
+            return None
+        window_start = dt.datetime.utcnow() - dt.timedelta(seconds=60)
+        recent = (
+            outbound.filter(MessageMapping.created_at >= window_start)
+            .order_by(MessageMapping.created_at.desc())
+            .limit(20)
+            .all()
+        )
+        for row in recent:
+            if str((row.platform_payload_json or {}).get("text") or "").strip() == content.strip():
+                return "template_content_recently_delivered"
+        return None
 
     @staticmethod
     def _extract_platform_rid(send_result: Any) -> Optional[str]:
