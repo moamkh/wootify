@@ -14,11 +14,11 @@ def __getattr__(name: str):
 
         return connector_registry
     if name == 'bale':
-        from wootify.connectors.bale_connector import bale
+        from wootify.plugins.bale.connector import bale
 
         return bale
     if name == 'telegram':
-        from wootify.connectors.telegram_connector import telegram
+        from wootify.plugins.telegram.connector import telegram
 
         return telegram
     raise AttributeError(name)

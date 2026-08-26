@@ -15,6 +15,6 @@ from the Bale/Telegram code so it can evolve (or be removed) independently:
 Registered under the platform key ``instagram_pv_enterprise``.
 """
 
-from wootify.instagram.connector import InstagramPvConnector, instagram_pv
+from wootify.plugins.instagram.connector import InstagramPvConnector, instagram_pv
 
 __all__ = ["InstagramPvConnector", "instagram_pv"]

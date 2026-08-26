@@ -28,3 +28,6 @@ class UnitOfWork(Protocol):
 
     def commit(self) -> None:
         """Commit the current transaction."""
+
+    def rollback(self) -> None:
+        """Roll back the current transaction."""

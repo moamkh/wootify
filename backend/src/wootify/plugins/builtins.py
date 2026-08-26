@@ -2,11 +2,11 @@
 
 from __future__ import annotations
 
-from wootify.adapters.bale_pv import BalePvAdapter
-from wootify.instagram.adapter import InstagramPvAdapter
-from wootify.connectors.bale_connector import bale
-from wootify.connectors.bale_pv_connector import bale_pv
-from wootify.connectors.telegram_connector import telegram
+from wootify.plugins.bale.connector import bale
+from wootify.plugins.bale_pv.adapter import BalePvAdapter
+from wootify.plugins.bale_pv.connector import bale_pv
+from wootify.plugins.instagram.adapter import InstagramPvAdapter
+from wootify.plugins.telegram.connector import telegram
 from wootify.plugins.base import PlatformPlugin
 from wootify.plugins.registry import PlatformPluginRegistry
 
@@ -35,7 +35,7 @@ def build_builtin_registry() -> PlatformPluginRegistry:
 
 
 def _instagram_connector():
-    from wootify.instagram.connector import instagram_pv
+    from wootify.plugins.instagram.connector import instagram_pv
 
     return instagram_pv
 

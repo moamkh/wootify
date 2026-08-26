@@ -1,0 +1,122 @@
+"""
+Module Overview
+---------------
+Purpose: Repository-layer data access helpers for persistence operations.
+Documentation Standard: module/class/public-method docstrings.
+"""
+from __future__ import annotations
+
+from typing import Optional
+
+from sqlalchemy.exc import OperationalError
+from sqlalchemy.orm import Session, selectinload
+from tenacity import retry, retry_if_exception_type, stop_after_attempt, wait_exponential
+
+from wootify.infrastructure.persistence.models import Conversation
+
+_DB_RETRY = retry(
+    retry=retry_if_exception_type(OperationalError),
+    stop=stop_after_attempt(5),
+    wait=wait_exponential(multiplier=0.5, min=0.5, max=10),
+    reraise=True,
+)
+
+
+class ConversationRepository:
+    """Repository for conversation persistence operations."""
+    def __init__(self, db: Session):
+        """Initialize the instance."""
+        self.db = db
+
+    def list_by_instance(
+        self,
+        instance_id: str,
+        *,
+        limit: Optional[int] = None,
+        offset: Optional[int] = None,
+        include_messages: bool = False,
+    ) -> list[Conversation]:
+        """List by instance with eagerly loaded relationships."""
+        options = [selectinload(Conversation.runtime_state)]
+        if include_messages:
+            options.append(selectinload(Conversation.message_mappings))
+        query = (
+            self.db.query(Conversation)
+            .filter(Conversation.instance_id == str(instance_id))
+            .options(*options)
+            .order_by(Conversation.is_active.desc(), Conversation.updated_at.desc())
+        )
+        if offset:
+            query = query.offset(int(offset))
+        if limit is not None:
+            query = query.limit(int(limit))
+        return query.all()
+
+    def get_by_id(self, conversation_id: str) -> Optional[Conversation]:
+        """Get by id."""
+        return self.db.get(Conversation, str(conversation_id))
+
+    def get_by_platform_id(self, instance_id: str, platform_conversation_id: str) -> Optional[Conversation]:
+        """Get by platform id."""
+        return (
+            self.db.query(Conversation)
+            .filter(
+                Conversation.instance_id == str(instance_id),
+                Conversation.platform_conversation_id == str(platform_conversation_id),
+                Conversation.is_active.is_(True),
+            )
+            .order_by(Conversation.updated_at.desc())
+            .first()
+        )
+
+    def get_by_chatwoot_id(self, instance_id: str, chatwoot_conversation_id: str) -> Optional[Conversation]:
+        """Get by chatwoot id."""
+        return (
+            self.db.query(Conversation)
+            .filter(
+                Conversation.instance_id == str(instance_id),
+                Conversation.chatwoot_conversation_id == str(chatwoot_conversation_id),
+            )
+            .one_or_none()
+        )
+
+    def list_by_contact(
+        self,
+        instance_id: str,
+        chatwoot_contact_id: str,
+        chatwoot_inbox_id: Optional[str] = None,
+    ) -> list[Conversation]:
+        """List by contact."""
+        query = self.db.query(Conversation).filter(
+            Conversation.instance_id == str(instance_id),
+            Conversation.chatwoot_contact_id == str(chatwoot_contact_id),
+        )
+        if chatwoot_inbox_id is not None:
+            query = query.filter(Conversation.chatwoot_inbox_id == str(chatwoot_inbox_id))
+        return query.order_by(Conversation.is_active.desc(), Conversation.updated_at.desc()).all()
+
+    @_DB_RETRY
+    def deactivate_platform_mappings(
+        self,
+        instance_id: str,
+        platform_conversation_id: str,
+        *,
+        exclude_conversation_id: Optional[str] = None,
+    ) -> None:
+        """Mark every other mapping for the same platform conversation as inactive."""
+        query = self.db.query(Conversation).filter(
+            Conversation.instance_id == str(instance_id),
+            Conversation.platform_conversation_id == str(platform_conversation_id),
+            Conversation.is_active.is_(True),
+        )
+        if exclude_conversation_id:
+            query = query.filter(Conversation.id != str(exclude_conversation_id))
+        query.update({Conversation.is_active: False}, synchronize_session=False)
+
+    @_DB_RETRY
+    def save(self, row: Conversation) -> Conversation:
+        """Save."""
+        self.db.add(row)
+        self.db.flush()
+        return row
+

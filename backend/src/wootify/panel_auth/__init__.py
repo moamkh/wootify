@@ -10,6 +10,6 @@ service endpoints (``/health``) stay unauthenticated — see
 ``app/panel_auth/middleware.py`` for the exact exclusion list.
 """
 
-from wootify.panel_auth.service import PanelAuthService, panel_auth_service
+from wootify.application.auth.service import PanelAuthService, panel_auth_service
 
 __all__ = ["PanelAuthService", "panel_auth_service"]

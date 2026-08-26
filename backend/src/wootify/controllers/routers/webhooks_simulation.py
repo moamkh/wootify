@@ -1,10 +1,3 @@
-"""Public Chatwoot webhook and platform simulation endpoints."""
-
-from fastapi import APIRouter
-
-from ._selection import path_starts_with, select_routes
-
-router = APIRouter()
-router.routes.extend(select_routes(path_starts_with("/api/v1/webhooks/", "/api/v1/simulate/")))
-
-__all__ = ["router"]
+import sys
+from wootify.presentation.http.routers import webhooks_simulation as _implementation
+sys.modules[__name__] = _implementation

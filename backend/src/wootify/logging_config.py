@@ -88,7 +88,7 @@ def configure_logging() -> None:
     fmt = "%(asctime)s %(levelname)s [%(name)s] %(message)s"
     datefmt = "%Y-%m-%d %H:%M:%S"
 
-    # If an external runner didn't configure handlers (e.g., `python app/main.py`),
+    # If an external runner did not configure handlers (for example uvicorn),
     # add a basic handler so logs are visible.
     if not root.handlers:
         root.addHandler(logging.StreamHandler(stream=sys.stderr))
