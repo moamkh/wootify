@@ -4,7 +4,6 @@ One-time data migration helper from the local SQLite database into PostgreSQL.
 from __future__ import annotations
 
 import argparse
-import sys
 from pathlib import Path
 
 from alembic import command
@@ -12,11 +11,10 @@ from alembic.config import Config
 from sqlalchemy import create_engine, inspect, select
 
 repo_root = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(repo_root))
 
-from app.config import settings  # noqa: E402
-from app.db import DATABASE_URL, ensure_database_exists  # noqa: E402
-from app.models import Base  # noqa: E402
+from wootify.config import settings
+from wootify.db import DATABASE_URL, ensure_database_exists
+from wootify.models import Base
 
 
 def _parse_args() -> argparse.Namespace:

@@ -1,18 +1,13 @@
 """End-to-end verification of the per-instance health endpoint (throwaway)."""
 import asyncio
 import sys
-from pathlib import Path
-
-ROOT = Path(__file__).resolve().parent.parent
-sys.path.insert(0, str(ROOT))
-sys.path.insert(0, str(ROOT / "bale_pv_connector" / "src"))
 
 from fastapi.testclient import TestClient
 
-from app.main import app
-from app.connectors.telegram_connector import telegram, TelegramInstanceRuntime, TelegramInstanceConfig
-from app.connectors.bale_connector import bale, BaleInstanceRuntime, BaleInstanceConfig
-from app.connectors.bale_pv_connector import bale_pv, BalePvInstanceRuntime
+from wootify.main import app
+from wootify.connectors.telegram_connector import telegram, TelegramInstanceRuntime, TelegramInstanceConfig
+from wootify.connectors.bale_connector import bale, BaleInstanceRuntime, BaleInstanceConfig
+from wootify.connectors.bale_pv_connector import bale_pv, BalePvInstanceRuntime
 
 failures = []
 
