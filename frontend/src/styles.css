@@ -1,0 +1,2 @@
+/* Compatibility stylesheet entrypoint. The canonical styles live in shared/styles. */
+@import './shared/styles/index.css';

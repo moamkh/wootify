@@ -6,40 +6,44 @@
  */
 
 import React, { Suspense, lazy, useEffect, useMemo, useState } from 'react';
+import { API_BASE } from '../shared/api/client.js';
 import {
-  API_BASE,
   createInbox,
   createEnterpriseRouteInbox,
   createInstance,
+  deleteInstance,
+  listConversationMessages,
+  listConversations,
+  listFeatures,
+  listInstances,
+  listPlatformTypes,
+  getInstanceHealth,
+  updateInstance,
+} from '../shared/api/instances.js';
+import {
   deleteEnterpriseCatalog,
   deleteEnterpriseManual,
   patchEnterpriseManual,
   deleteEnterpriseManualGroup,
-  deleteInstance,
   getEnterpriseSmsSyncConfig,
   getEnterpriseCatalog,
-  listConversationMessages,
-  listConversations,
   listEnterpriseManuals,
   listEnterpriseManualGroups,
   listEnterpriseManualGroupsWithManuals,
   listEnterpriseSessions,
-  listFeatures,
-  listInstances,
-  listPlatformTypes,
   replaceEnterpriseCatalog,
   patchEnterpriseCatalog,
   runEnterpriseSmsSyncNow,
-  simulatePlatformEvent,
   uploadEnterpriseManual,
   updateEnterpriseSmsSyncConfig,
-  updateInstance,
   createEnterpriseManualGroup,
   renameEnterpriseManualGroup,
   addManualToEnterpriseGroup,
   removeManualFromEnterpriseGroup,
+} from '../shared/api/enterprise.js';
+import {
+  simulatePlatformEvent,
   getVersion,
-  getInstanceHealth,
   balePvSendCode,
   balePvValidateCode,
   balePvAuthStatus,
@@ -51,21 +55,30 @@ import {
   instagramPvChallengeValidateCode,
   instagramPvChallengeResume,
   balePvRemoveChatwootContacts,
-} from './api.js';
-import PageLoader from './components/PageLoader.jsx';
-import LoginPage from './components/LoginPage.jsx';
-import { getPanelToken, panelAuthStatus, clearPanelToken } from './api.js';
+} from '../shared/api/platforms.js';
+import PageLoader from '../shared/ui/PageLoader.jsx';
+import LoginPage from '../features/auth/LoginPage.jsx';
+import { clearPanelToken } from '../shared/api/auth.js';
+import { usePanelAuth } from '../features/auth/usePanelAuth.js';
+import {
+  DEFAULT_PLATFORM,
+  PLATFORM_BALE,
+  PLATFORM_BALE_ENTERPRISE,
+  PLATFORM_BALE_PV_ENTERPRISE,
+  PLATFORM_INSTAGRAM_PV_ENTERPRISE,
+  PLATFORM_TELEGRAM,
+  PLATFORM_TELEGRAM_ENTERPRISE,
+} from './platforms.js';
+import { maskTokenValue, buildSaveSuccessMessage } from './feedback.js';
+import { createPayload } from '../features/instances/formPayload.js';
+import { toFeatureMap } from '../features/instances/formModel.js';
+import { useConversationExplorer } from '../features/mappings/useConversationExplorer.js';
+import { useInstanceDirectory } from '../features/instances/useInstanceDirectory.js';
+import { useEnterpriseResources } from '../features/enterprise/useEnterpriseResources.js';
 
-const InstancesPage = lazy(() => import('./pages/InstancesPage.jsx'));
-const InstanceWorkspacePage = lazy(() => import('./pages/InstanceWorkspacePage.jsx'));
+const InstancesPage = lazy(() => import('../features/instances/InstancesPage.jsx'));
+const InstanceWorkspacePage = lazy(() => import('../features/instances/InstanceWorkspacePage.jsx'));
 
-const PLATFORM_BALE = 'bale';
-const PLATFORM_BALE_ENTERPRISE = 'bale_enterprise';
-const PLATFORM_BALE_PV_ENTERPRISE = 'bale_pv_enterprise';
-const PLATFORM_INSTAGRAM_PV_ENTERPRISE = 'instagram_pv_enterprise';
-const PLATFORM_TELEGRAM = 'telegram';
-const PLATFORM_TELEGRAM_ENTERPRISE = 'telegram_enterprise';
-const DEFAULT_PLATFORM = PLATFORM_BALE;
 const ENTERPRISE_DEFAULTS = {
   welcome_text: 'به بازوي دستيار شركت مهندسي پزشكي نوين خوش آمديد.',
   phone_prompt_text: 'لطفا شماره موبایل خود را وارد کنید یا از دکمه زیر برای اشتراک‌گذاری شماره استفاده کنید.',
@@ -95,15 +108,6 @@ const ENTERPRISE_DEFAULTS = {
   enterprise_address_button_label: 'آدرس مراکز خدمات پس از فروش',
   enterprise_back_button_label: 'بازگشت به منو',
 };
-
-function toFeatureMap(overrides = []) {
-  const out = {};
-  for (const item of overrides) {
-    if (!item?.feature_key) continue;
-    out[item.feature_key] = Boolean(item.requested_enabled);
-  }
-  return out;
-}
 
 function defaultForm(features) {
   const featureMap = {};
@@ -210,257 +214,6 @@ function defaultForm(features) {
   };
 }
 
-function createPayload(form, { patch = false } = {}) {
-  const platformMetadata = {};
-  if (form.platform_type_key === PLATFORM_BALE || form.platform_type_key === PLATFORM_BALE_ENTERPRISE) {
-    platformMetadata.bale_api_base_url = form.bale_api_base_url?.trim() || undefined;
-    platformMetadata.bale_file_base_url = form.bale_file_base_url?.trim() || undefined;
-    platformMetadata.bale_poll_interval = Number(form.bale_poll_interval) > 0 ? Number(form.bale_poll_interval) : undefined;
-    platformMetadata.bale_bot_name = form.bale_bot_name?.trim() || undefined;
-    platformMetadata.bale_bot_id = form.bale_bot_id?.trim() || undefined;
-    platformMetadata.bale_department = form.bale_department?.trim() || undefined;
-  }
-  if (form.platform_type_key === PLATFORM_BALE_PV_ENTERPRISE) {
-    platformMetadata.bale_pv_phone_number = form.bale_pv_phone_number?.trim() || undefined;
-    platformMetadata.bale_pv_session_dir = form.bale_pv_session_dir?.trim() || undefined;
-    platformMetadata.bale_pv_poll_interval = Number(form.bale_pv_poll_interval) > 0 ? Number(form.bale_pv_poll_interval) : undefined;
-    platformMetadata.bale_pv_display_name = form.bale_pv_display_name?.trim() || undefined;
-    platformMetadata.bale_pv_department = form.bale_pv_department?.trim() || undefined;
-    platformMetadata.bale_pv_share_phone_prompt_enabled = Boolean(form.bale_pv_share_phone_prompt_enabled);
-    platformMetadata.bale_pv_share_phone_prompt_only_if_missing_phone = Boolean(form.bale_pv_share_phone_prompt_only_if_missing_phone);
-    platformMetadata.bale_pv_share_phone_prompt_text = form.bale_pv_share_phone_prompt_text?.trim() || undefined;
-  }
-  if (form.platform_type_key === PLATFORM_INSTAGRAM_PV_ENTERPRISE) {
-    platformMetadata.instagram_username = form.instagram_username?.trim() || undefined;
-    const instagramPassword = form.instagram_password?.trim();
-    if (instagramPassword && !instagramPassword.includes('***')) {
-      platformMetadata.instagram_password = instagramPassword;
-    }
-    const instagramSessionid = form.instagram_sessionid?.trim();
-    if (instagramSessionid && !instagramSessionid.includes('***')) {
-      platformMetadata.instagram_sessionid = instagramSessionid;
-    }
-    platformMetadata.instagram_verification_code = form.instagram_verification_code?.trim() || undefined;
-    platformMetadata.instagram_totp_seed = form.instagram_totp_seed?.trim() || undefined;
-    platformMetadata.instagram_session_dir = form.instagram_session_dir?.trim() || undefined;
-    platformMetadata.instagram_poll_interval =
-      Number(form.instagram_poll_interval) > 0 ? Number(form.instagram_poll_interval) : undefined;
-    platformMetadata.instagram_display_name = form.instagram_display_name?.trim() || undefined;
-    platformMetadata.instagram_department = form.instagram_department?.trim() || undefined;
-  }
-  if (form.platform_type_key === PLATFORM_TELEGRAM || form.platform_type_key === PLATFORM_TELEGRAM_ENTERPRISE) {
-    platformMetadata.telegram_api_base_url = form.telegram_api_base_url?.trim() || undefined;
-    platformMetadata.telegram_file_base_url = form.telegram_file_base_url?.trim() || undefined;
-    platformMetadata.telegram_poll_interval = Number(form.telegram_poll_interval) > 0 ? Number(form.telegram_poll_interval) : undefined;
-    platformMetadata.telegram_bot_name = form.telegram_bot_name?.trim() || undefined;
-    platformMetadata.telegram_bot_id = form.telegram_bot_id?.trim() || undefined;
-    platformMetadata.telegram_department = form.telegram_department?.trim() || undefined;
-  }
-  if (form.platform_type_key === PLATFORM_BALE) {
-    platformMetadata.bale_share_phone_prompt_enabled = Boolean(form.bale_share_phone_prompt_enabled);
-    platformMetadata.bale_share_phone_prompt_only_if_missing_phone = Boolean(form.bale_share_phone_prompt_only_if_missing_phone);
-    platformMetadata.bale_share_phone_prompt_text = form.bale_share_phone_prompt_text?.trim() || undefined;
-  }
-  if (form.platform_type_key === PLATFORM_BALE_ENTERPRISE) {
-    platformMetadata.enterprise_welcome_text = form.enterprise_welcome_text?.trim() || undefined;
-    platformMetadata.enterprise_phone_prompt_text = form.enterprise_phone_prompt_text?.trim() || undefined;
-    platformMetadata.enterprise_menu_prompt_text = form.enterprise_menu_prompt_text?.trim() || undefined;
-    platformMetadata.enterprise_address_prompt_text = form.enterprise_address_prompt_text?.trim() || undefined;
-    platformMetadata.enterprise_number_not_found_text = form.enterprise_number_not_found_text?.trim() || undefined;
-    platformMetadata.enterprise_no_manuals_text = form.enterprise_no_manuals_text?.trim() || undefined;
-    platformMetadata.enterprise_no_catalog_text = form.enterprise_no_catalog_text?.trim() || undefined;
-    platformMetadata.enterprise_not_configured_text = form.enterprise_not_configured_text?.trim() || undefined;
-    platformMetadata.enterprise_live_mode_resume_text = form.enterprise_live_mode_resume_text?.trim() || undefined;
-    platformMetadata.enterprise_invalid_phone_text = form.enterprise_invalid_phone_text?.trim() || undefined;
-    platformMetadata.enterprise_address_tehran_alborz_text = form.enterprise_address_tehran_alborz_text?.trim() || undefined;
-    platformMetadata.enterprise_address_other_provinces_text =
-      form.enterprise_address_other_provinces_text?.trim() || undefined;
-    platformMetadata.enterprise_user_manual_link_template =
-      form.enterprise_user_manual_link_template?.trim() || undefined;
-    platformMetadata.enterprise_customer_service_inbox_id =
-      Number(form.enterprise_customer_service_inbox_id) > 0 ? Number(form.enterprise_customer_service_inbox_id) : undefined;
-    platformMetadata.enterprise_customer_service_inbox_name =
-      form.enterprise_customer_service_inbox_name?.trim() || undefined;
-    platformMetadata.enterprise_customer_service_auto_create = Boolean(form.enterprise_customer_service_auto_create);
-    platformMetadata.enterprise_customer_service_waiting_text =
-      form.enterprise_customer_service_waiting_text?.trim() || undefined;
-    platformMetadata.enterprise_customer_service_accepted_text =
-      form.enterprise_customer_service_accepted_text?.trim() || undefined;
-    platformMetadata.enterprise_customer_service_unread_text =
-      form.enterprise_customer_service_unread_text?.trim() || undefined;
-    platformMetadata.enterprise_sales_inbox_id =
-      Number(form.enterprise_sales_inbox_id) > 0 ? Number(form.enterprise_sales_inbox_id) : undefined;
-    platformMetadata.enterprise_sales_inbox_name = form.enterprise_sales_inbox_name?.trim() || undefined;
-    platformMetadata.enterprise_sales_auto_create = Boolean(form.enterprise_sales_auto_create);
-    platformMetadata.enterprise_sales_waiting_text = form.enterprise_sales_waiting_text?.trim() || undefined;
-    platformMetadata.enterprise_sales_accepted_text = form.enterprise_sales_accepted_text?.trim() || undefined;
-    platformMetadata.enterprise_sales_unread_text = form.enterprise_sales_unread_text?.trim() || undefined;
-    platformMetadata.enterprise_sms_sync_enabled = Boolean(form.enterprise_sms_sync_enabled);
-    platformMetadata.enterprise_sms_api_url = form.enterprise_sms_api_url?.trim() || undefined;
-    platformMetadata.enterprise_sms_token_header = form.enterprise_sms_token_header?.trim() || undefined;
-    platformMetadata.enterprise_sms_token_prefix = form.enterprise_sms_token_prefix?.trim() || undefined;
-    platformMetadata.enterprise_sms_poll_interval_minutes =
-      Number(form.enterprise_sms_poll_interval_minutes) > 0
-        ? Number(form.enterprise_sms_poll_interval_minutes)
-        : undefined;
-    platformMetadata.enterprise_sms_last_id =
-      Number(form.enterprise_sms_last_id) >= 0
-        ? Number(form.enterprise_sms_last_id)
-        : undefined;
-    platformMetadata.enterprise_sms_http_timeout_seconds =
-      Number(form.enterprise_sms_http_timeout_seconds) > 0
-        ? Number(form.enterprise_sms_http_timeout_seconds)
-        : undefined;
-  }
-  if (form.platform_type_key === PLATFORM_TELEGRAM) {
-    platformMetadata.telegram_share_phone_prompt_enabled = Boolean(form.telegram_share_phone_prompt_enabled);
-    platformMetadata.telegram_share_phone_prompt_only_if_missing_phone = Boolean(
-      form.telegram_share_phone_prompt_only_if_missing_phone,
-    );
-    platformMetadata.telegram_share_phone_prompt_text = form.telegram_share_phone_prompt_text?.trim() || undefined;
-  }
-  if (form.platform_type_key === PLATFORM_TELEGRAM_ENTERPRISE) {
-    platformMetadata.enterprise_welcome_text = form.enterprise_welcome_text?.trim() || undefined;
-    platformMetadata.enterprise_menu_prompt_text = form.enterprise_menu_prompt_text?.trim() || undefined;
-    platformMetadata.enterprise_address_prompt_text = form.enterprise_address_prompt_text?.trim() || undefined;
-    platformMetadata.enterprise_no_manuals_text = form.enterprise_no_manuals_text?.trim() || undefined;
-    platformMetadata.enterprise_no_catalog_text = form.enterprise_no_catalog_text?.trim() || undefined;
-    platformMetadata.enterprise_not_configured_text = form.enterprise_not_configured_text?.trim() || undefined;
-    platformMetadata.enterprise_live_mode_resume_text = form.enterprise_live_mode_resume_text?.trim() || undefined;
-    platformMetadata.enterprise_address_tehran_alborz_text = form.enterprise_address_tehran_alborz_text?.trim() || undefined;
-    platformMetadata.enterprise_address_other_provinces_text =
-      form.enterprise_address_other_provinces_text?.trim() || undefined;
-    platformMetadata.enterprise_user_manual_link_template =
-      form.enterprise_user_manual_link_template?.trim() || undefined;
-    platformMetadata.enterprise_catalog_button_label = form.enterprise_catalog_button_label?.trim() || undefined;
-    platformMetadata.enterprise_manuals_button_label = form.enterprise_manuals_button_label?.trim() || undefined;
-    platformMetadata.enterprise_address_button_label = form.enterprise_address_button_label?.trim() || undefined;
-    platformMetadata.enterprise_back_button_label = form.enterprise_back_button_label?.trim() || undefined;
-    platformMetadata.enterprise_routes = Array.isArray(form.enterprise_routes) ? form.enterprise_routes : [];
-  }
-
-  const payload = {
-    platform_type_key: form.platform_type_key,
-    is_enabled: Boolean(form.is_enabled),
-    platform_metadata: platformMetadata,
-    chatwoot: {
-      base_url: form.chatwoot_base_url?.trim() || undefined,
-      account_id: Number(form.chatwoot_account_id) > 0 ? Number(form.chatwoot_account_id) : undefined,
-      inbox_id:
-        form.platform_type_key === PLATFORM_BALE && Number(form.chatwoot_inbox_id) > 0
-          ? Number(form.chatwoot_inbox_id)
-          : undefined,
-      inbox_name: form.platform_type_key === PLATFORM_BALE ? form.chatwoot_inbox_name?.trim() || undefined : undefined,
-      auto_create: form.platform_type_key === PLATFORM_BALE ? Boolean(form.chatwoot_auto_create) : false,
-      reopen_conversation: form.platform_type_key === PLATFORM_BALE ? Boolean(form.chatwoot_reopen_conversation) : false,
-    },
-    proxy: {
-      enabled: Boolean(form.proxy_enabled),
-      protocol: form.proxy_protocol?.trim() || undefined,
-      host: form.proxy_host?.trim() || undefined,
-      port: Number(form.proxy_port) > 0 ? Number(form.proxy_port) : undefined,
-      username: form.proxy_username?.trim() || undefined,
-      password: form.proxy_password?.trim() || undefined,
-    },
-    feature_overrides: { ...form.feature_overrides },
-  };
-
-  const baleToken = form.bale_token?.trim();
-  if (
-    (form.platform_type_key === PLATFORM_BALE || form.platform_type_key === PLATFORM_BALE_ENTERPRISE) &&
-    baleToken &&
-    !baleToken.includes('***')
-  ) {
-    payload.platform_metadata.bale_token = baleToken;
-  }
-  const enterpriseSmsToken = form.enterprise_sms_api_token?.trim();
-  if (form.platform_type_key === PLATFORM_BALE_ENTERPRISE && enterpriseSmsToken && !enterpriseSmsToken.includes('***')) {
-    payload.platform_metadata.enterprise_sms_api_token = enterpriseSmsToken;
-  }
-  const telegramToken = form.telegram_token?.trim();
-  if (
-    (form.platform_type_key === PLATFORM_TELEGRAM || form.platform_type_key === PLATFORM_TELEGRAM_ENTERPRISE) &&
-    telegramToken &&
-    !telegramToken.includes('***')
-  ) {
-    payload.platform_metadata.telegram_token = telegramToken;
-  }
-
-  if (
-    form.platform_type_key === PLATFORM_BALE_PV_ENTERPRISE ||
-    form.platform_type_key === PLATFORM_INSTAGRAM_PV_ENTERPRISE
-  ) {
-    payload.chatwoot.inbox_id = Number(form.chatwoot_inbox_id) > 0 ? Number(form.chatwoot_inbox_id) : undefined;
-    payload.chatwoot.inbox_name = form.chatwoot_inbox_name?.trim() || undefined;
-    payload.chatwoot.auto_create = Boolean(form.chatwoot_auto_create);
-    payload.chatwoot.reopen_conversation = Boolean(form.chatwoot_reopen_conversation);
-  }
-  const chatwootToken = form.chatwoot_api_access_token?.trim();
-  if (chatwootToken && !chatwootToken.includes('***')) {
-    payload.chatwoot.api_access_token = chatwootToken;
-  }
-  const proxyPassword = form.proxy_password?.trim();
-  if (proxyPassword && proxyPassword.includes('***')) {
-    delete payload.proxy.password;
-  }
-
-  if (!patch) {
-    payload.instance_key = form.instance_key.trim();
-  }
-
-  return payload;
-}
-
-function maskTokenValue(value) {
-  const text = String(value || '').trim();
-  if (!text) return '-';
-  if (text.includes('***')) return text;
-  if (text.length <= 6) return '*'.repeat(text.length);
-  return `${'*'.repeat(Math.max(4, text.length - 6))}${text.slice(-6)}`;
-}
-
-function buildSaveSuccessMessage(saved) {
-  const result = saved?.auto_create_inbox;
-  const enterpriseResults = Array.isArray(saved?.enterprise_auto_create_inboxes)
-    ? saved.enterprise_auto_create_inboxes
-    : [];
-  const enterpriseSummary = enterpriseResults
-    .map((item) => {
-      if (!item?.attempted) return null;
-      if (item.inbox_id && item.created) return `${item.route_key}: created ${item.inbox_id}`;
-      if (item.inbox_id) return `${item.route_key}: linked ${item.inbox_id}`;
-      if (item.detail) return `${item.route_key}: ${item.detail}`;
-      return `${item.route_key}: failed`;
-    })
-    .filter(Boolean)
-    .join(', ');
-
-  if (!result?.attempted && !enterpriseSummary) {
-    return 'Instance saved';
-  }
-  if (!result?.attempted && enterpriseSummary) {
-    return `Instance saved. Enterprise inboxes: ${enterpriseSummary}.`;
-  }
-  if (result.inbox_id && result.created) {
-    return enterpriseSummary
-      ? `Instance saved. Inbox created with ID ${result.inbox_id}. Enterprise inboxes: ${enterpriseSummary}.`
-      : `Instance saved. Inbox created with ID ${result.inbox_id}.`;
-  }
-  if (result.inbox_id) {
-    return enterpriseSummary
-      ? `Instance saved. Existing inbox linked with ID ${result.inbox_id}. Enterprise inboxes: ${enterpriseSummary}.`
-      : `Instance saved. Existing inbox linked with ID ${result.inbox_id}.`;
-  }
-  if (result.detail) {
-    return enterpriseSummary
-      ? `Instance saved, but auto inbox creation failed: ${result.detail}. Enterprise inboxes: ${enterpriseSummary}.`
-      : `Instance saved, but auto inbox creation failed: ${result.detail}`;
-  }
-  return enterpriseSummary
-    ? `Instance saved. Enterprise inboxes: ${enterpriseSummary}.`
-    : 'Instance saved, but auto inbox creation did not complete.';
-}
-
 async function copyTextToClipboard(value) {
   const text = String(value || '').trim();
   if (!text) return;
@@ -482,7 +235,7 @@ async function copyTextToClipboard(value) {
 
 export default function App() {
   // Panel auth: null = still checking, false = login required, true = authed.
-  const [panelAuthed, setPanelAuthed] = useState(getPanelToken() ? null : false);
+  const [panelAuthed, setPanelAuthed] = usePanelAuth();
   const [platformTypes, setPlatformTypes] = useState([]);
   const [features, setFeatures] = useState([]);
   const [instances, setInstances] = useState([]);
@@ -497,9 +250,13 @@ export default function App() {
   const [form, setForm] = useState(defaultForm([]));
 
   const [search, setSearch] = useState('');
-  const [conversations, setConversations] = useState([]);
-  const [selectedConversationId, setSelectedConversationId] = useState('');
-  const [mappings, setMappings] = useState([]);
+  const {
+    conversations,
+    mappings,
+    selectedConversationId,
+    setSelectedConversationId,
+    loadConversations,
+  } = useConversationExplorer({ selectedKey, search });
   const [instanceSearch, setInstanceSearch] = useState('');
   const [instanceStatusFilter, setInstanceStatusFilter] = useState('all');
 
@@ -510,11 +267,14 @@ export default function App() {
     platform_message_id: '',
     parent_platform_message_id: '',
   });
-  const [enterpriseManuals, setEnterpriseManuals] = useState([]);
-  const [enterpriseManualGroups, setEnterpriseManualGroups] = useState([]);
-  const [manualGroupByAssetId, setManualGroupByAssetId] = useState({});
-  const [enterpriseCatalog, setEnterpriseCatalog] = useState(null);
-  const [enterpriseSessions, setEnterpriseSessions] = useState([]);
+  const {
+    enterpriseManuals, setEnterpriseManuals,
+    enterpriseManualGroups, setEnterpriseManualGroups,
+    manualGroupByAssetId, setManualGroupByAssetId,
+    enterpriseCatalog, setEnterpriseCatalog,
+    enterpriseSessions, setEnterpriseSessions,
+    loadEnterpriseResources,
+  } = useEnterpriseResources({ selectedKey, instances });
   const [manualDisplayName, setManualDisplayName] = useState('');
   const [manualLinkUrl, setManualLinkUrl] = useState('');
   const [manualFile, setManualFile] = useState(null);
@@ -537,47 +297,16 @@ export default function App() {
   const [instagramChallengeLoading, setInstagramChallengeLoading] = useState(false);
   const [instagramChallengeInfo, setInstagramChallengeInfo] = useState(null);
 
+  const { instanceMap, filteredInstances } = useInstanceDirectory({
+    instances,
+    instanceSearch,
+    instanceStatusFilter,
+  });
+
   const selectedPlatform = useMemo(
     () => platformTypes.find((item) => item.key === form.platform_type_key) || null,
     [platformTypes, form.platform_type_key],
   );
-
-  const instanceMap = useMemo(() => {
-    const map = {};
-    for (const item of instances) {
-      map[item.instance_key] = item;
-    }
-    return map;
-  }, [instances]);
-
-  const filteredInstances = useMemo(() => {
-    const query = instanceSearch.trim().toLowerCase();
-    return instances.filter((item) => {
-      if (instanceStatusFilter === 'enabled' && !item.is_enabled) return false;
-      if (instanceStatusFilter === 'disabled' && item.is_enabled) return false;
-
-      if (!query) return true;
-      const hay = [
-        item.instance_key,
-        item.platform_type_key,
-        item.platform_metadata?.bale_bot_name,
-        item.platform_metadata?.bale_department,
-        item.platform_metadata?.bale_pv_display_name,
-        item.platform_metadata?.bale_pv_department,
-        item.platform_metadata?.bale_pv_phone_number,
-        item.platform_metadata?.instagram_display_name,
-        item.platform_metadata?.instagram_department,
-        item.platform_metadata?.instagram_username,
-        item.platform_metadata?.telegram_bot_name,
-        item.platform_metadata?.telegram_department,
-        item.chatwoot?.account_id,
-        item.chatwoot?.inbox_id,
-      ]
-        .map((v) => String(v ?? '').toLowerCase())
-        .join(' ');
-      return hay.includes(query);
-    });
-  }, [instances, instanceSearch, instanceStatusFilter]);
 
   const selectedInstance = selectedKey ? instanceMap[selectedKey] : null;
   const isDetailView = viewMode === 'detail';
@@ -636,69 +365,8 @@ export default function App() {
     setHealthByKey(Object.fromEntries(entries));
   }
 
-  async function loadEnterpriseResources(instanceKey) {
-    if (!instanceKey) {
-      setEnterpriseManuals([]);
-      setManualGroupByAssetId({});
-      setEnterpriseCatalog(null);
-      setEnterpriseSessions([]);
-      return;
-    }
-
-    const row = instanceMap[instanceKey];
-    const isEnterprise = row?.platform_type_key === PLATFORM_BALE_ENTERPRISE || row?.platform_type_key === PLATFORM_TELEGRAM_ENTERPRISE;
-    if (!isEnterprise) {
-      setEnterpriseManuals([]);
-      setEnterpriseManualGroups([]);
-      setManualGroupByAssetId({});
-      setEnterpriseCatalog(null);
-      setEnterpriseSessions([]);
-      return;
-    }
-
-    const [manuals, groupsPayload, catalog, sessions] = await Promise.all([
-      listEnterpriseManuals(instanceKey),
-      listEnterpriseManualGroupsWithManuals(instanceKey),
-      getEnterpriseCatalog(instanceKey),
-      listEnterpriseSessions(instanceKey),
-    ]);
-    setEnterpriseManuals(manuals || []);
-    setEnterpriseManualGroups(groupsPayload?.groups || []);
-    setManualGroupByAssetId(groupsPayload?.manual_group_map || {});
-    setEnterpriseCatalog(catalog || null);
-    setEnterpriseSessions(sessions || []);
-  }
-
-  // Resolve panel auth state once: when the backend has no panel password
-  // configured the gate is skipped entirely.
-  useEffect(() => {
-    let cancelled = false;
-    panelAuthStatus()
-      .then((s) => {
-        if (cancelled) return;
-        if (s && s.auth_enabled === false) {
-          setPanelAuthed(true);
-          return;
-        }
-        setPanelAuthed(Boolean(s?.authenticated));
-      })
-      .catch(() => {
-        if (!cancelled) setPanelAuthed(Boolean(getPanelToken()));
-      });
-    return () => {
-      cancelled = true;
-    };
-  }, []);
-
-  // A 401 from any API call drops the stored token; return to the login screen.
-  useEffect(() => {
-    const onUnauthorized = () => setPanelAuthed(false);
-    window.addEventListener('wootify:unauthorized', onUnauthorized);
-    return () => window.removeEventListener('wootify:unauthorized', onUnauthorized);
-  }, []);
-
   // Softnu signature card effect: cursor-tracked radial highlight driven by
-  // --x/--y CSS custom properties (see styles.css .card::before).
+  // --x/--y CSS custom properties (see shared/styles/index.css .card::before).
   useEffect(() => {
     const handler = (e) => {
       const el = e.target?.closest?.('.card, .instance-card');
@@ -732,46 +400,7 @@ export default function App() {
       .catch(() => setVersion(''));
   }, [panelAuthed]);
 
-  async function loadConversations(instanceKey, q = '') {
-    if (!instanceKey) {
-      setConversations([]);
-      setMappings([]);
-      setSelectedConversationId('');
-      return;
-    }
-
-    const rows = await listConversations(instanceKey, q);
-    setConversations(rows);
-    if (!rows.find((item) => item.id === selectedConversationId)) {
-      setSelectedConversationId('');
-      setMappings([]);
-    }
-  }
-
-  useEffect(() => {
-    if (!selectedKey) return;
-    loadConversations(selectedKey, search);
-  }, [selectedKey]);
-
-  useEffect(() => {
-    if (!selectedKey) return;
-    loadEnterpriseResources(selectedKey).catch(() => {
-      setEnterpriseManuals([]);
-      setEnterpriseManualGroups([]);
-      setManualGroupByAssetId({});
-      setEnterpriseCatalog(null);
-      setEnterpriseSessions([]);
-    });
-  }, [selectedKey, instances]);
-
-  useEffect(() => {
-    if (!selectedKey || !selectedConversationId) return;
-    listConversationMessages(selectedKey, selectedConversationId)
-      .then((rows) => setMappings(rows || []))
-      .catch(() => setMappings([]));
-  }, [selectedKey, selectedConversationId]);
-
-  function onSelectInstance(instanceKey) {
+ function onSelectInstance(instanceKey) {
     const row = instanceMap[instanceKey];
     if (!row) return;
 
@@ -1875,5 +1504,3 @@ export default function App() {
     </div>
   );
 }
-
-

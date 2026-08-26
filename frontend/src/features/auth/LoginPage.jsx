@@ -1,5 +1,5 @@
 import React, { useState } from 'react';
-import { panelLogin } from '../api.js';
+import { panelLogin } from '../../shared/api/auth.js';
 
 export default function LoginPage({ onSuccess }) {
   const [username, setUsername] = useState('');

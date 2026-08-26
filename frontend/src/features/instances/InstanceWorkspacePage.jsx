@@ -1,12 +1,12 @@
 import React, { Suspense, lazy } from 'react';
-import InstanceDetailHero from '../components/InstanceDetailHero.jsx';
-import PageLoader from '../components/PageLoader.jsx';
+import InstanceDetailHero from './InstanceDetailHero.jsx';
+import PageLoader from '../../shared/ui/PageLoader.jsx';
 
-const InstanceFormPanel = lazy(() => import('../components/InstanceFormPanel.jsx'));
-const MappingExplorerPanel = lazy(() => import('../components/MappingExplorerPanel.jsx'));
-const EnterpriseAssetsPanel = lazy(() => import('../components/EnterpriseAssetsPanel.jsx'));
-const EnterpriseOperationsPanel = lazy(() => import('../components/EnterpriseOperationsPanel.jsx'));
-const SimulationPanel = lazy(() => import('../components/SimulationPanel.jsx'));
+const InstanceFormPanel = lazy(() => import('./InstanceFormPanel.jsx'));
+const MappingExplorerPanel = lazy(() => import('../mappings/MappingExplorerPanel.jsx'));
+const EnterpriseAssetsPanel = lazy(() => import('../enterprise/EnterpriseAssetsPanel.jsx'));
+const EnterpriseOperationsPanel = lazy(() => import('../enterprise/EnterpriseOperationsPanel.jsx'));
+const SimulationPanel = lazy(() => import('../simulation/SimulationPanel.jsx'));
 
 export default function InstanceWorkspacePage({
   activeTab,
