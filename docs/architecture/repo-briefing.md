@@ -1,60 +1,48 @@
-# Repo Briefing: `wootify_instance_manager`
+# Repository briefing
 
-## What this project is
-Wootify Instance Manager is a FastAPI backend plus a React admin UI for managing Chatwoot connector instances. It supports generic Bale/Telegram bridge flows and a dedicated Bale Enterprise mode with live Chatwoot routing, enterprise asset delivery, and optional external SMS synchronization.
+This is a Python/React monorepo for a Chatwoot-to-messaging-platform bridge.
+The backend is an installable `wootify` package, the admin UI is a Vite app,
+and the Bale PV protocol implementation is an independent workspace package.
 
-## High-signal files/folders to read
-- `README.md`
-- `docs/ARCHITECTURE.md`
-- `docs/API_REFERENCE.md`
-- `docs/DEVELOPMENT.md`
-- `.env.example`
-- `app/main.py`
-- `app/controllers/api_v1_controller.py`
-- `app/services/bridge_service.py`
-- `app/services/enterprise_bale_service.py`
+## Start here
 
-## Tech signals
-- Backend: Python, FastAPI, SQLAlchemy, Alembic, HTTPX
-- Frontend: React + Vite (`wootify-instance-manager/`)
-- Database backends:
-  - SQLite for simple local setups
-  - PostgreSQL via `psycopg2` for persistent multi-user deployments
-- External integrations:
-  - Chatwoot REST API + webhooks
-  - Bale Bot API
-  - Telegram Bot API
-  - Optional Novin enterprise SMS source
+- Backend factory: `backend/src/wootify/bootstrap/app.py`
+- Composition root: `backend/src/wootify/bootstrap/container.py`
+- HTTP presentation: `backend/src/wootify/presentation/http/`
+- Messaging use cases: `backend/src/wootify/application/messaging/`
+- Enterprise use cases: `backend/src/wootify/application/enterprise/`
+- Platform implementations: `backend/src/wootify/plugins/`
+- Persistence: `backend/src/wootify/infrastructure/persistence/`
+- Frontend composition/features: `frontend/src/app/`, `frontend/src/features/`
+- Tests: `backend/tests/`, `packages/bale-pv-client/tests/`
 
-## Top-level layout
-- `app/`: backend application code
-- `alembic/`: schema migrations
-- `docs/`: architecture, API, and development documentation
-- `scripts/`: one-off maintenance/migration utilities
-- `wootify-instance-manager/`: React admin UI
-- `.env.example`: documented runtime configuration template
+## Boundaries
 
-## Likely entrypoints
-- `app/main.py`: FastAPI app bootstrap and lifespan hooks
-- `app/controllers/api_v1_controller.py`: HTTP API surface
-- `app/services/bale_polling_service.py`: inbound Bale polling loop
-- `app/services/telegram_polling_service.py`: inbound Telegram polling loop
+- `domain` contains stable values and no web/database implementation details.
+- `application` owns workflows and declares infrastructure ports.
+- `plugins` own messaging-platform behavior.
+- `infrastructure` owns persistence, security, clients, storage, and logging.
+- `presentation` owns FastAPI contracts and authentication middleware.
+- `bootstrap` is the only layer that composes concrete dependencies.
 
-## Main flows to understand
-1. Generic outbound sync: Chatwoot webhook -> controller -> `BridgeService` -> connector -> Bale/Telegram.
-2. Generic inbound sync: poller -> connector update -> `BridgeService` -> Chatwoot message/conversation APIs.
-3. Enterprise live routing: Bale enterprise update/webhook -> `EnterpriseBaleService` -> Chatwoot enterprise inbox/conversation/contact APIs.
-4. Enterprise SMS sync: scheduler/manual API call -> `EnterpriseBaleService.sync_external_sms_messages()` -> Bale delivery.
+The `services`, `controllers`, `repositories`, `clients`, and `utils`
+directories are compatibility facades. Add new implementation code to its
+owning layer rather than those facades.
 
-## Current database story
-- The backend resolves its runtime DB URL from `.env`.
-- PostgreSQL setups use:
-  - `DATABASE_URL` for the server/credentials
-  - `DATABASE_NAME` for the target database name
-- On startup, `app/db.py` can auto-create the Postgres database when `DATABASE_AUTO_CREATE=true`.
-- `scripts/migrate_sqlite_to_postgres.py` can copy an existing SQLite dataset into the configured PostgreSQL database.
+## Common commands
 
-## Practical next steps
-- Read `.env.example` before changing deployment settings.
-- Verify the active DB with `python -c "from app.config import settings; print(settings.resolved_database_url)"`.
-- Trace one enterprise route flow through `api_v1_controller.py` and `enterprise_bale_service.py` before changing live-chat behavior.
+```powershell
+pip install -r requirements-dev.txt
+python -m pytest -q
+python -m uvicorn wootify.bootstrap.app:app --reload
+cd frontend
+npm run build
+```
+
+Use `alembic upgrade head` for schema upgrades. Runtime files belong under
+`var/`; existing legacy locations continue to work. Preview an optional layout
+migration with `python scripts/migrate_runtime_layout.py`.
+
+Public HTTP routes, settings, database metadata, platform keys, old import
+paths, and frontend request behavior are compatibility surfaces. Update tests
+and `docs/refactor/relocation-ledger.md` whenever responsibility moves.

@@ -17,28 +17,28 @@ It provides multi-instance routing, inbound polling, outbound webhook handling, 
 
 - Backend: Python 3.11+, FastAPI, SQLAlchemy, Alembic, HTTPX
 - Database: SQLite or PostgreSQL
-- Frontend: React + Vite (`wootify-instance-manager/`)
+- Frontend: React + Vite (`frontend/`)
 - Integrations: Chatwoot API, Bale Bot API, Telegram Bot API, Novin SMS API (Bale Enterprise only)
 
 ## Repository Structure
 
 ```text
-app/
-  clients/        # External API clients (Chatwoot, Bale, Novin SMS)
-  connectors/     # Platform connector implementations (Bale, Telegram) + registry
-  controllers/    # FastAPI route handlers
-  repositories/   # Data access layer (SQLAlchemy repositories)
-  schemas/        # Pydantic request/response models
-  services/       # Business flows (bridge, polling, instance management, enterprise)
-  utils/          # Shared helpers (crypto, payload masking, media, logging, proxy, cache)
-  main.py         # FastAPI entrypoint + lifespan
-  models.py       # SQLAlchemy ORM models
-  config.py       # Pydantic settings from environment
-  db.py           # Database engine/session factory
-alembic/          # Database migrations
-docs/             # Project, API, and development documentation
-scripts/          # One-off utilities (SQLite -> PostgreSQL migration)
-wootify-instance-manager/  # React admin UI
+backend/
+  src/wootify/
+    bootstrap/     # App factory, dependency container, lifecycle
+    domain/        # Stable domain values and platform capabilities
+    application/   # Ports and composed messaging/enterprise policies
+    plugins/       # Bale, Telegram, Bale PV, and experimental Instagram registry
+    infrastructure/# SQLAlchemy models/sessions and filesystem adapters
+    controllers/   # Compatibility facade over focused HTTP routers
+  migrations/      # Alembic migrations
+  tests/           # Backend unit, integration, and contract tests
+frontend/          # Feature-oriented React admin UI
+packages/
+  bale-pv-client/  # Independently installable Bale PV protocol client
+docs/              # Architecture, backlog, archive, and refactor audit
+scripts/           # Migration, health, and architecture-audit tools
+var/               # Ignored runtime databases, logs, sessions, assets, temp files
 ```
 
 ## Quick Start
@@ -86,15 +86,17 @@ alembic upgrade head
 ### 4) Start backend
 
 ```bash
-python -m uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
+python -m uvicorn wootify.bootstrap.app:app --reload --host 0.0.0.0 --port 8000
 ```
+
+The legacy `app.main:app` entrypoint remains supported for existing deployments.
 
 Health check: `http://localhost:8000/health`
 
 ### 5) Start frontend (optional, recommended)
 
 ```bash
-cd wootify-instance-manager
+cd frontend
 npm install
 npm run dev
 ```
@@ -104,7 +106,7 @@ Admin UI (dev): `http://localhost:5173`
 Production-like UI build:
 
 ```bash
-cd wootify-instance-manager
+cd frontend
 npm run build
 ```
 
@@ -166,7 +168,9 @@ Full endpoint details: `docs/API_REFERENCE.md`
 
 ## Current Limitations
 
-- No formal automated test suite yet (manual/integration testing is primary).
+- External integrations still require environment-specific end-to-end checks;
+  automated backend, package, route-contract, and frontend build checks cover
+  repository-owned behavior.
 - PostgreSQL is supported, but deployers still need to manage backups, credentials, and operational monitoring themselves.
 
 ## SQLite to PostgreSQL Migration

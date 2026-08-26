@@ -1,12 +1,12 @@
 # Baseline inventory
 
 This document is the human-readable baseline for the behavior-preserving
-refactor. The machine-readable snapshot is intentionally generated from the
-working tree so that it can be repeated immediately before and after each
-move:
+refactor. The machine-readable snapshot was generated from baseline commit
+`91d77c0`, before any structural moves, so it can be compared with the
+completed branch:
 
 ```powershell
-python scripts/inventory_baseline.py --write
+python scripts/inventory_baseline.py --repo-root <baseline-checkout> --output <current-checkout>/docs/refactor/baseline-inventory.json
 ```
 
 That command writes `docs/refactor/baseline-inventory.json` alongside this
@@ -15,11 +15,11 @@ application, open the database, load `.env`, or touch `data/`.
 
 ## Current snapshot
 
-The snapshot currently observed on the refactor branch contains:
+The baseline snapshot contains:
 
 | Surface | Count |
 | --- | ---: |
-| Python source modules | 88 |
+| Python source modules | 85 |
 | FastAPI routes (including `/api/v1` router prefix) | 56 |
 | `BaseSettings` classes | 1 |
 | SQLAlchemy ORM tables | 20 |
@@ -30,7 +30,9 @@ The JSON records each module, top-level function, class and method with source
 location; each route with method/path/handler; settings fields and defaults;
 ORM table/column declarations; platform registry references; and exported
 frontend API function names and line numbers. Counts above are informational;
-the JSON snapshot is the comparison input for the final audit.
+the JSON snapshot is the comparison input for the final audit. A separate final
+inventory records the refactored tree; compatibility wrappers and the
+relocation ledger explain symbols whose qualified owner changed.
 
 ## Scope and exclusions
 

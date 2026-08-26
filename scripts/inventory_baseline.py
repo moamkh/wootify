@@ -271,6 +271,28 @@ def _python_inventory(root: Path) -> dict[str, Any]:
                                     columns.append(column)
                         if table_name:
                             tables.append({"class": node.name, "module": module_entry["module"], "file": rel, "line": node.lineno, "table": table_name, "columns": columns})
+            for call in (item for item in ast.walk(tree) if isinstance(item, ast.Call)):
+                if not _dotted(call.func).endswith("add_api_route") or not call.args:
+                    continue
+                route_path = _literal(call.args[0])
+                if not isinstance(route_path, str):
+                    continue
+                handler = _dotted(call.args[1]) if len(call.args) > 1 else ""
+                methods_node = next((keyword.value for keyword in call.keywords if keyword.arg == "methods"), None)
+                methods = [
+                    item.value
+                    for item in getattr(methods_node, "elts", [])
+                    if isinstance(item, ast.Constant) and isinstance(item.value, str)
+                ] or ["GET"]
+                for method in methods:
+                    routes.append({
+                        "method": method.upper(),
+                        "path": route_path,
+                        "function": handler,
+                        "module": module_entry["module"],
+                        "file": rel,
+                        "line": call.lineno,
+                    })
             # Registry signals are deliberately broad: both seed keys and
             # connector map keys are relevant to a later relocation audit.
             if "registry" in path.name or "platform" in path.name or "connector" in path.name:
@@ -308,9 +330,11 @@ def _frontend_inventory(root: Path) -> dict[str, Any]:
                 continue
             source = path.read_text(encoding="utf-8")
             functions = []
-            pattern = re.compile(r"export\s+(?:async\s+)?function\s+([A-Za-z_$][\w$]*)\s*\(")
+            pattern = re.compile(
+                r"export\s+(?:(?:async\s+)?function\s+([A-Za-z_$][\w$]*)\s*\(|const\s+([A-Za-z_$][\w$]*)\s*=)"
+            )
             for match in pattern.finditer(source):
-                functions.append({"name": match.group(1), "line": source.count("\n", 0, match.start()) + 1})
+                functions.append({"name": match.group(1) or match.group(2), "line": source.count("\n", 0, match.start()) + 1})
             if functions:
                 entries.append({"file": path.relative_to(root).as_posix(), "functions": functions})
     return {"root": frontend.relative_to(root).as_posix() if frontend.exists() else None, "api_functions": entries}
@@ -371,13 +395,21 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--repo-root", type=Path, default=Path(__file__).resolve().parents[1])
     parser.add_argument("--format", choices=("json", "markdown"), default="json")
     parser.add_argument("--write", action="store_true", help="write both baseline files under docs/refactor")
+    parser.add_argument("--output", type=Path, help="write the selected format to this path")
     args = parser.parse_args(argv)
     data = inventory(args.repo_root)
+    if args.write and args.output:
+        parser.error("--write and --output cannot be used together")
     if args.write:
         output_dir = args.repo_root / "docs" / "refactor"
         output_dir.mkdir(parents=True, exist_ok=True)
         (output_dir / "baseline-inventory.json").write_text(json.dumps(data, indent=2, sort_keys=True) + "\n", encoding="utf-8")
         (output_dir / "baseline-inventory.md").write_text(_markdown(data), encoding="utf-8")
+    elif args.output:
+        rendered = json.dumps(data, indent=2, sort_keys=True) + "\n" if args.format == "json" else _markdown(data)
+        destination = args.output if args.output.is_absolute() else args.repo_root / args.output
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.write_text(rendered, encoding="utf-8")
     else:
         if args.format == "json":
             print(json.dumps(data, indent=2, sort_keys=True))

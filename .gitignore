@@ -11,13 +11,14 @@ backend.run.log
 backend.run.err
 frontend.run.log
 frontend.run.err
-wootify-instance-manager/node_modules/
-wootify-instance-manager/dist/
+frontend/node_modules/
+frontend/dist/
 *.db
 *.db-journal
 *.db-shm
 *.db-wal
-wootify-instance-manager/.env
+frontend/.env
+var/
 data/enterprise_assets/
 data/tmp-enterprise-smoke/
 
