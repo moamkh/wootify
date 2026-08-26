@@ -17,16 +17,25 @@ from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 
 from app.config import settings
+# api stuff
 from app.controllers.api_v1_controller import _webhook_delivery_tasks
 from app.controllers.api_v1_controller import router as api_v1_router
 from app.controllers.panel_auth_controller import router as panel_auth_router
+# db stuff
 from app.db import SessionLocal, engine
+# TODO : work on instagram polling service and find out if it works or needs deletion
+# the service object created in the same file for ease of development but still beta for now
 from app.instagram.polling_service import instagram_polling_service
+# logger stuff
 from app.logging_config import configure_logging
+
 from app.models import Base
+# auth middleware and service
 from app.panel_auth.middleware import PanelAuthMiddleware
 from app.services.bale_polling_service import BalePollingService
+# imported to call a static method to ensure supported platforms are registerd
 from app.services.platform_registry_service import PlatformRegistryService
+# security stuff
 from app.utils.crypto_utils import build_previous_encryptor, encryptor
 from app.utils.key_rotation import rotate_instance_encryption
 
