@@ -153,5 +153,3 @@ class MessageMapping(Base):
     )
 
     conversation = relationship("Conversation", back_populates="message_mappings")
-
-

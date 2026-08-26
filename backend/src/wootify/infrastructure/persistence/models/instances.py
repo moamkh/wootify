@@ -221,5 +221,3 @@ class BalePvPhoneResolvedUser(Base):
     )
 
     instance = relationship("Instance", back_populates="bale_pv_phone_resolved_users")
-
-

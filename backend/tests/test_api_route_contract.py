@@ -82,4 +82,3 @@ def test_focused_routers_preserve_complete_route_contract():
         (route.path, route.name) for route in _api_v1_impl.router.routes
     ]
     assert all(isinstance(route, APIRoute) for route in router.routes)
-

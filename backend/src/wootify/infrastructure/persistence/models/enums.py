@@ -67,5 +67,3 @@ class EnterprisePendingMessageStatus(str, enum.Enum):
     pending = "pending"
     delivered = "delivered"
     failed = "failed"
-
-

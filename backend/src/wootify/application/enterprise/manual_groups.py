@@ -53,7 +53,7 @@ class EnterpriseManualGroupService:
         instance = self._get_instance(db, instance_key)
 
         repo = self.group_repository(db)
-        
+
         # Check for duplicate name
         existing = repo.get_by_name(instance.id, name)
         if existing:

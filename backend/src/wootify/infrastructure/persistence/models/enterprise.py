@@ -427,5 +427,3 @@ class EnterpriseTelegramPendingMessage(Base):
     )
 
     session = relationship("EnterpriseTelegramSession", back_populates="pending_messages")
-
-
