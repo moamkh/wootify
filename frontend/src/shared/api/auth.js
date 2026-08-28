@@ -1,5 +1,5 @@
 /** Panel authentication API. */
-import { withBase, authHeaders } from './client.js';
+import { withBase, authHeaders, setPanelToken } from './client.js';
 
 export { getPanelToken, setPanelToken, clearPanelToken } from './client.js';
 
