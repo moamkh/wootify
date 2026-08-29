@@ -968,6 +968,42 @@ async def test_webhook_propagates_message_updated_to_bale(db_session):
 
     from wootify.models import MessageDirection, MessageKind, MessageMapping, MessageStatus
 
+    # Chatwoot message ids are account-local. A different configured instance
+    # may legitimately have the same message and conversation ids, so the
+    # webhook lookup must remain scoped to the current Wootify instance.
+    other_instance = Instance(
+        instance_key="bale-pv-edit-prop-other",
+        platform_type_id=platform.id,
+        is_enabled=True,
+        platform_metadata_encrypted="",
+        chatwoot_config_encrypted='{"account_id": 2}',
+        proxy_config_encrypted="",
+    )
+    db_session.add(other_instance)
+    db_session.flush()
+    other_conversation = Conversation(
+        instance_id=other_instance.id,
+        platform_conversation_id="wrong-peer",
+        chatwoot_conversation_id="116",
+        chatwoot_contact_id="88",
+        chatwoot_inbox_id="6",
+        is_active=True,
+    )
+    db_session.add(other_conversation)
+    db_session.flush()
+    db_session.add(
+        MessageMapping(
+            conversation_id=str(other_conversation.id),
+            direction=MessageDirection.platform_to_chatwoot,
+            message_kind=MessageKind.text,
+            platform_message_id="wrong-message",
+            chatwoot_message_id="999",
+            status=MessageStatus.sent,
+            platform_payload_json={"text": "not this account"},
+        )
+    )
+    db_session.commit()
+
     mapping = MessageMapping(
         conversation_id=str(conversation.id),
         direction=MessageDirection.platform_to_chatwoot,

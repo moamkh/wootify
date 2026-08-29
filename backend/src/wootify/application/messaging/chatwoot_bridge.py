@@ -20,7 +20,10 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from wootify.application.messaging.media_normalizer import MediaNormalizer
-from wootify.application.messaging.payload_parser import ChatwootPayloadParser
+from wootify.application.messaging.payload_parser import (
+    ChatwootPayloadParser,
+    MessagePayloadParser,
+)
 from wootify.infrastructure.chatwoot.client import ChatwootClient
 from wootify.connectors.registry import connector_registry
 from wootify.infrastructure.persistence.models import (
@@ -31,6 +34,12 @@ from wootify.infrastructure.persistence.models import (
     MessageKind,
     MessageMapping,
     MessageStatus,
+)
+from wootify.infrastructure.persistence.repositories.conversation_repository import (
+    ConversationRepository,
+)
+from wootify.infrastructure.persistence.repositories.message_mapping_repository import (
+    MessageMappingRepository,
 )
 from wootify.runtime_registry import get_runtime
 from wootify.application.messaging.conversation_mapping import ConversationMappingService
@@ -1758,6 +1767,50 @@ class ChatwootBridgeService:
             or msg_content_attributes.get("deleted")
         )
 
+    @staticmethod
+    def _mapped_chatwoot_message(
+        db: Session,
+        instance: Instance,
+        payload: Dict[str, Any],
+    ) -> tuple[Optional[MessageMapping], Optional[Conversation]]:
+        """Resolve a webhook message mapping within its instance/conversation."""
+        message_id = MessagePayloadParser.extract_message_id(payload)
+        if not message_id:
+            return None, None
+
+        conversation_id = MessagePayloadParser.extract_conversation_id(payload)
+        conversations = ConversationRepository(db)
+        mappings = MessageMappingRepository(db)
+
+        if conversation_id:
+            conversation = conversations.get_by_chatwoot_id(
+                str(instance.id), conversation_id
+            )
+            if not conversation:
+                return None, None
+            return (
+                mappings.get_by_chatwoot_message_id(
+                    str(conversation.id), message_id
+                ),
+                conversation,
+            )
+
+        # Older webhook fixtures did not include a conversation id. Preserve
+        # compatibility while still preventing mappings from another instance
+        # from being selected.
+        mapping = (
+            db.query(MessageMapping)
+            .join(Conversation, MessageMapping.conversation_id == Conversation.id)
+            .filter(
+                Conversation.instance_id == str(instance.id),
+                MessageMapping.chatwoot_message_id == message_id,
+            )
+            .first()
+        )
+        if not mapping:
+            return None, None
+        return mapping, conversations.get_by_id(str(mapping.conversation_id))
+
     async def _handle_chatwoot_message_updated(
         self,
         db: Session,
@@ -1777,15 +1830,11 @@ class ChatwootBridgeService:
         if not content:
             return {"ok": True, "ignored": True, "reason": "empty_content", "detail": "empty_content"}
 
-        message_id = payload.get("id") or (payload.get("message") or {}).get("id")
+        message_id = MessagePayloadParser.extract_message_id(payload)
         if not message_id:
             return {"ok": True, "ignored": True, "reason": "no_message_id", "detail": "no_message_id"}
 
-        mapping = (
-            db.query(MessageMapping)
-            .filter(MessageMapping.chatwoot_message_id == str(message_id))
-            .first()
-        )
+        mapping, conversation = self._mapped_chatwoot_message(db, instance, payload)
         if not mapping:
             return {"ok": True, "ignored": True, "reason": "no_mapping", "detail": "no_mapping"}
 
@@ -1797,11 +1846,6 @@ class ChatwootBridgeService:
         if old_text == content:
             return {"ok": True, "ignored": True, "reason": "content_unchanged", "detail": "content_unchanged"}
 
-        conversation = (
-            db.query(Conversation)
-            .filter(Conversation.id == mapping.conversation_id)
-            .first()
-        )
         if not conversation:
             return {"ok": False, "detail": "conversation_not_found"}
 
@@ -1857,18 +1901,13 @@ class ChatwootBridgeService:
         Chatwoot's ``destroy`` action fires ``message_updated`` with
         ``content_attributes.deleted = true``. The local message mapping gives
         us the platform message id, and the adapter deletes it via the
-        authenticated session (``just_mine=False`` — in private chats a
-        userbot can also delete the peer's messages).
+        authenticated Bale session.
         """
-        message_id = payload.get("id") or (payload.get("message") or {}).get("id")
+        message_id = MessagePayloadParser.extract_message_id(payload)
         if not message_id:
             return {"ok": True, "ignored": True, "reason": "no_message_id", "detail": "no_message_id"}
 
-        mapping = (
-            db.query(MessageMapping)
-            .filter(MessageMapping.chatwoot_message_id == str(message_id))
-            .first()
-        )
+        mapping, conversation = self._mapped_chatwoot_message(db, instance, payload)
         if not mapping:
             return {"ok": True, "ignored": True, "reason": "no_mapping", "detail": "no_mapping"}
 
@@ -1879,11 +1918,6 @@ class ChatwootBridgeService:
         if not mapping.platform_message_id:
             return {"ok": True, "ignored": True, "reason": "no_platform_message_id", "detail": "no_platform_message_id"}
 
-        conversation = (
-            db.query(Conversation)
-            .filter(Conversation.id == mapping.conversation_id)
-            .first()
-        )
         if not conversation:
             return {"ok": False, "detail": "conversation_not_found"}
 
