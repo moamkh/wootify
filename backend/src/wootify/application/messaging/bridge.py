@@ -71,7 +71,14 @@ class BridgeService:
         payload = inboxes.get('payload') if isinstance(inboxes, dict) else None
         existing = None
         if isinstance(payload, list):
-            existing = next((item for item in payload if item.get('name') == inbox_name), None)
+            configured_inbox_id = chatwoot.get('inbox_id')
+            if configured_inbox_id:
+                existing = next(
+                    (item for item in payload if self._extract_id(item) == int(configured_inbox_id)),
+                    None,
+                )
+            if existing is None:
+                existing = next((item for item in payload if item.get('name') == inbox_name), None)
 
         created = False
         webhook_updated = False

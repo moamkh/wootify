@@ -565,6 +565,36 @@ class ChatwootClient:
                 )
             raise
 
+    async def list_webhooks(self, account_id: int) -> Any:
+        """List account-level webhooks configured in Chatwoot."""
+        return await self._request(
+            "GET",
+            f"/api/v1/accounts/{account_id}/webhooks",
+        )
+
+    async def create_webhook(self, account_id: int, data: Dict[str, Any]) -> Any:
+        """Create an account-level Chatwoot webhook."""
+        return await self._request(
+            "POST",
+            f"/api/v1/accounts/{account_id}/webhooks",
+            json_data={"webhook": data},
+            retry_on_read_errors=False,
+        )
+
+    async def update_webhook(
+        self,
+        account_id: int,
+        webhook_id: int,
+        data: Dict[str, Any],
+    ) -> Any:
+        """Update an account-level Chatwoot webhook."""
+        return await self._request(
+            "PATCH",
+            f"/api/v1/accounts/{account_id}/webhooks/{webhook_id}",
+            json_data={"webhook": data},
+            retry_on_read_errors=False,
+        )
+
     async def delete_message(
         self,
         account_id: int,

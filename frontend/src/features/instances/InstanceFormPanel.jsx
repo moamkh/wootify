@@ -121,6 +121,7 @@ export default function InstanceFormPanel({
   onSave,
   onNewInstance,
   onCreateInbox,
+  onConfigureChatwootWebhook,
   onCreateEnterpriseInbox,
   onSaveEnterpriseSmsSync,
   onRunEnterpriseSmsSyncNow,
@@ -789,27 +790,41 @@ export default function InstanceFormPanel({
           </>
         ) : null}
         {!isEnterprisePlatform ? (
-          <label>
-            Webhook URL
-            <div className="row">
-              <input value={form.chatwoot_webhook_url} readOnly placeholder="Save the instance to generate the webhook URL" />
-              <button
-                type="button"
-                className="btn secondary"
-                disabled={!form.chatwoot_webhook_url}
-                onClick={async () => {
-                  try {
-                    await copyTextToClipboard(form.chatwoot_webhook_url);
-                    alert('Webhook URL copied');
-                  } catch (e) {
-                    alert(e?.message || String(e));
-                  }
-                }}
-              >
-                Copy
-              </button>
-            </div>
-          </label>
+          <div className="form-section-block">
+            <label>
+              Wootify Webhook URL
+              <div className="row">
+                <input value={form.chatwoot_webhook_url} readOnly placeholder="Save the instance to generate the webhook URL" />
+                <button
+                  type="button"
+                  className="btn secondary"
+                  disabled={!form.chatwoot_webhook_url}
+                  onClick={async () => {
+                    try {
+                      await copyTextToClipboard(form.chatwoot_webhook_url);
+                      alert('Webhook URL copied');
+                    } catch (e) {
+                      alert(e?.message || String(e));
+                    }
+                  }}
+                >
+                  Copy
+                </button>
+              </div>
+            </label>
+            <p className="muted">
+              Chatvand needs an account webhook to propagate message edits and deletes. Configure it in
+              Settings → Integrations → Webhooks using this URL and enable all events, especially Message Updated.
+            </p>
+            <button
+              type="button"
+              className="btn"
+              disabled={busy || !selectedKey || !form.chatwoot_webhook_url || !form.chatwoot_api_access_token || !form.chatwoot_account_id}
+              onClick={() => onConfigureChatwootWebhook(selectedKey)}
+            >
+              Configure Chatvand Webhook (All Events)
+            </button>
+          </div>
         ) : null}
 
         {isEnterpriseBalePlatform ? (

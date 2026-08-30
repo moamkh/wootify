@@ -29,6 +29,7 @@ from wootify.presentation.http.schemas.api_v1 import (
     ConversationListResponse,
     ConversationResponse,
     CreateInboxResponse,
+    ChatwootWebhookResponse,
     EnterpriseAutoCreateInboxResponse,
     EnterpriseCatalogResponse,
     EnterpriseDocumentAssetResponse,
@@ -73,6 +74,7 @@ from wootify.application.enterprise.documents import EnterpriseDocumentService
 from wootify.application.enterprise.manual_groups import EnterpriseManualGroupService
 from wootify.application.instances.service import InstanceService
 from wootify.application.messaging.message_mapping import MessageMappingService
+from wootify.application.messaging.chatwoot_webhook import ChatwootWebhookService
 from wootify.plugins.bale_pv.connector import bale_pv
 from wootify.connectors.registry import connector_registry
 from wootify.instagram import instagram_pv
@@ -99,6 +101,7 @@ class HttpApplicationServices:
     enterprise_manual_groups: EnterpriseManualGroupService
     conversations: ConversationMappingService
     messages: MessageMappingService
+    chatwoot_webhooks: ChatwootWebhookService
 
 
 http_services = HttpApplicationServices(
@@ -111,6 +114,7 @@ http_services = HttpApplicationServices(
     enterprise_manual_groups=EnterpriseManualGroupService(),
     conversations=ConversationMappingService(),
     messages=MessageMappingService(),
+    chatwoot_webhooks=ChatwootWebhookService(),
 )
 platform_registry = http_services.platform_registry
 instances = http_services.instances
@@ -121,6 +125,7 @@ enterprise_documents = http_services.enterprise_documents
 enterprise_manual_groups = http_services.enterprise_manual_groups
 conversations = http_services.conversations
 messages = http_services.messages
+chatwoot_webhooks = http_services.chatwoot_webhooks
 logger = logging.getLogger('app.controllers.api_v1')
 
 
@@ -598,6 +603,44 @@ async def create_chatwoot_inbox(instance_key: str, db: Session = Depends(get_db)
             exc=exc,
             instance_key=instance_key,
         )
+
+
+@router.get('/instances/{instance_key}/chatwoot/webhook', response_model=ChatwootWebhookResponse)
+async def get_chatwoot_webhook(instance_key: str, db: Session = Depends(get_db)):
+    """Return the configuration status of an instance account webhook."""
+    try:
+        return ChatwootWebhookResponse(**(await chatwoot_webhooks.get_status(db, instance_key)))
+    except ValueError as exc:
+        _raise_http_error(status_code=400, detail=str(exc), endpoint='get_chatwoot_webhook', exc=exc, instance_key=instance_key)
+    except httpx.HTTPError as exc:
+        _raise_http_error(
+            status_code=502,
+            detail='Could not inspect the Chatwoot webhook',
+            endpoint='get_chatwoot_webhook',
+            exc=exc,
+            instance_key=instance_key,
+        )
+    except Exception as exc:
+        _raise_http_error(status_code=500, detail='internal server error', endpoint='get_chatwoot_webhook', exc=exc, instance_key=instance_key)
+
+
+@router.post('/instances/{instance_key}/chatwoot/webhook', response_model=ChatwootWebhookResponse)
+async def configure_chatwoot_webhook(instance_key: str, db: Session = Depends(get_db)):
+    """Create or update the instance account webhook with all supported events."""
+    try:
+        return ChatwootWebhookResponse(**(await chatwoot_webhooks.configure(db, instance_key)))
+    except ValueError as exc:
+        _raise_http_error(status_code=400, detail=str(exc), endpoint='configure_chatwoot_webhook', exc=exc, instance_key=instance_key)
+    except httpx.HTTPError as exc:
+        _raise_http_error(
+            status_code=502,
+            detail='Could not configure the Chatwoot webhook',
+            endpoint='configure_chatwoot_webhook',
+            exc=exc,
+            instance_key=instance_key,
+        )
+    except Exception as exc:
+        _raise_http_error(status_code=500, detail='internal server error', endpoint='configure_chatwoot_webhook', exc=exc, instance_key=instance_key)
 
 
 @router.post('/webhooks/chatwoot/{instance_key}', response_model=GenericMessageResponse)

@@ -196,6 +196,15 @@ class CreateInboxResponse(BaseModel):
     inbox: Optional[dict[str, Any]] = None
 
 
+class ChatwootWebhookResponse(BaseModel):
+    """Response schema for per-instance Chatwoot webhook operations."""
+    configured: bool
+    created: bool = False
+    webhook_id: Optional[int] = None
+    webhook_url: str
+    subscriptions: list[str] = Field(default_factory=list)
+
+
 class EnterpriseDocumentAssetResponse(BaseModel):
     """Response schema for enterprise document assets."""
     id: str

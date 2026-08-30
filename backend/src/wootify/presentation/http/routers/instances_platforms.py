@@ -14,6 +14,8 @@ _INSTANCE_ENDPOINTS = {
     "patch_instance",
     "delete_instance",
     "create_chatwoot_inbox",
+    "get_chatwoot_webhook",
+    "configure_chatwoot_webhook",
 }
 
 router = APIRouter()

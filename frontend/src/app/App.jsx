@@ -9,6 +9,7 @@ import React, { Suspense, lazy, useEffect, useMemo, useState } from 'react';
 import { API_BASE } from '../shared/api/client.js';
 import {
   createInbox,
+  configureChatwootWebhook,
   createEnterpriseRouteInbox,
   createInstance,
   deleteInstance,
@@ -702,6 +703,18 @@ export default function App() {
     }
   }
 
+  async function onConfigureChatwootWebhook(instanceKey) {
+    setBusy(true);
+    try {
+      const response = await configureChatwootWebhook(instanceKey);
+      alert(response?.created ? 'Chatvand webhook created with all events.' : 'Chatvand webhook updated with all events.');
+    } catch (e) {
+      alert(e?.message || String(e));
+    } finally {
+      setBusy(false);
+    }
+  }
+
   async function onInstagramPvCheck(instanceKey) {
     setInstagramCheckLoading(true);
     setInstagramCheckResult(null);
@@ -1236,6 +1249,7 @@ export default function App() {
     maskTokenValue,
     onToggleEnabled,
     onCreateInbox,
+    onConfigureChatwootWebhook,
     onCreateEnterpriseInbox,
     onBalePvSyncContacts,
     onBalePvSyncDialogs,

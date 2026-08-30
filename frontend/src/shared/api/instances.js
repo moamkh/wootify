@@ -26,6 +26,11 @@ export const updateInstance = (instanceKey, body) => fetchJSON(`/api/v1/instance
 });
 export const deleteInstance = (instanceKey) => fetchJSON(`/api/v1/instances/${encodeURIComponent(instanceKey)}`, { method: 'DELETE' });
 export const createInbox = (instanceKey) => fetchJSON(`/api/v1/instances/${encodeURIComponent(instanceKey)}/chatwoot/inbox`, { method: 'POST' });
+export const getChatwootWebhook = (instanceKey) => fetchJSON(`/api/v1/instances/${encodeURIComponent(instanceKey)}/chatwoot/webhook`);
+export const configureChatwootWebhook = (instanceKey) => fetchJSON(
+  `/api/v1/instances/${encodeURIComponent(instanceKey)}/chatwoot/webhook`,
+  { method: 'POST' },
+);
 export const createEnterpriseRouteInbox = (instanceKey, routeKey) => fetchJSON(
   `/api/v1/instances/${encodeURIComponent(instanceKey)}/enterprise/chatwoot/inboxes/${encodeURIComponent(routeKey)}`,
   { method: 'POST' },
