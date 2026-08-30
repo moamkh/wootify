@@ -789,7 +789,7 @@ export default function InstanceFormPanel({
             ) : null}
           </>
         ) : null}
-        {!isEnterprisePlatform ? (
+        {isBalePlatform || isInstagramPvPlatform || isTelegramPlatform ? (
           <div className="form-section-block">
             <label>
               Wootify Webhook URL
