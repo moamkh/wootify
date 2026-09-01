@@ -435,9 +435,11 @@ class DeleteMessageRequest:
         self,
         peer_id: int,
         message_ids: List[int],
+        just_mine: bool = False,
     ):
         self.peer_id = peer_id
         self.message_ids = message_ids
+        self.just_mine = just_mine
 
     def serialize(self) -> bytes:
         peer = Peer(self.peer_id)
@@ -445,7 +447,14 @@ class DeleteMessageRequest:
         msg.add_message(1, peer)
         # rids field is packed repeated int64
         msg.add_packed_int64(2, self.message_ids)
-        msg.add_message(6, peer)
+        # ``justMine`` is a BoolValue wrapper. Its presence is meaningful even
+        # when false: false revokes the message for everyone, which is the
+        # required behavior for a Chatwoot deletion.
+        msg.add_message(
+            4,
+            ProtobufMessage().add_bool(1, self.just_mine),
+            include_empty=True,
+        )
         return msg.serialize()
 
 

@@ -1817,11 +1817,12 @@ class ChatwootBridgeService:
         instance: Instance,
         payload: Dict[str, Any],
     ) -> Dict[str, Any]:
-        """Propagate a Chatwoot message edit back to Bale PV.
+        """Propagate an edit of a Chatwoot-originated message back to Bale PV.
 
-        Only messages that were originally sent by the Bale account can be edited
-        in Bale, so we look up the local mapping by Chatwoot message id and call
-        the platform adapter. Edits to edit-replies are skipped to avoid loops.
+        The authenticated Bale user's inbound messages have their own platform
+        update flow.  This webhook path is deliberately limited to messages
+        Chatwoot sent through Wootify, because only those mappings identify a
+        Bale message owned by the configured authenticated account.
         """
         if self._is_chatwoot_message_deleted(payload):
             return await self._handle_chatwoot_message_deleted(db, instance, payload)
@@ -1837,6 +1838,14 @@ class ChatwootBridgeService:
         mapping, conversation = self._mapped_chatwoot_message(db, instance, payload)
         if not mapping:
             return {"ok": True, "ignored": True, "reason": "no_mapping", "detail": "no_mapping"}
+
+        if mapping.direction != MessageDirection.chatwoot_to_platform:
+            return {
+                "ok": True,
+                "ignored": True,
+                "reason": "not_chatwoot_outbound",
+                "detail": "not_chatwoot_outbound",
+            }
 
         # Skip edit-replies we created ourselves to avoid edit loops.
         if ":edit:" in str(mapping.platform_message_id or ""):

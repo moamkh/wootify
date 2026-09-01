@@ -791,6 +791,7 @@ export default function InstanceFormPanel({
         ) : null}
         {isBalePlatform || isInstagramPvPlatform || isTelegramPlatform ? (
           <div className="form-section-block">
+            {isBalePvPlatform ? <h3>Bale PV deletion sync</h3> : null}
             <label>
               Wootify Webhook URL
               <div className="row">
@@ -813,8 +814,9 @@ export default function InstanceFormPanel({
               </div>
             </label>
             <p className="muted">
-              Chatvand needs an account webhook to propagate message edits and deletes. Configure it in
-              Settings → Integrations → Webhooks using this URL and enable all events, especially Message Updated.
+              {isBalePvPlatform
+                ? 'Configure the Chatvand account webhook here to propagate message edits and deletes to Bale PV. It subscribes to Message Updated automatically.'
+                : 'Chatvand needs an account webhook to propagate message edits and deletes. Configure it in Settings → Integrations → Webhooks using this URL and enable all events, especially Message Updated.'}
             </p>
             <button
               type="button"
@@ -822,7 +824,7 @@ export default function InstanceFormPanel({
               disabled={busy || !selectedKey || !form.chatwoot_webhook_url || !form.chatwoot_api_access_token || !form.chatwoot_account_id}
               onClick={() => onConfigureChatwootWebhook(selectedKey)}
             >
-              Configure Chatvand Webhook (All Events)
+              {isBalePvPlatform ? 'Configure Bale PV Deletion Sync' : 'Configure Chatvand Webhook (All Events)'}
             </button>
           </div>
         ) : null}

@@ -103,6 +103,16 @@ def test_parse_send_message_response_compact_layout():
     assert parsed["date"] == date
 
 
+def test_parse_send_message_response_does_not_treat_server_date_as_rid():
+    response = ProtobufMessage()
+    response.add_int64(2, 1788282893301)
+    response.add_bytes(4, ProtobufMessage().add_string(1, "metadata").serialize())
+
+    parsed = parse_send_message_response(response.serialize())
+
+    assert parsed == {"rid": None, "date": 1788282893301}
+
+
 def test_parse_send_message_response_garbage_is_safe():
     assert parse_send_message_response(None) == {"rid": None, "date": None}
     assert parse_send_message_response(b"") == {"rid": None, "date": None}
@@ -176,8 +186,8 @@ class _FakeMessagingClient:
         self.ack = ack
         self.sent = []
 
-    async def send_message(self, peer_id, text, reply_to_message_id=None, access_hash=None):
-        self.sent.append({"peer_id": peer_id, "text": text})
+    async def send_message(self, peer_id, text, reply_to_message_id=None, access_hash=None, random_id=None):
+        self.sent.append({"peer_id": peer_id, "text": text, "random_id": random_id})
         return self.ack
 
 
@@ -190,12 +200,12 @@ async def test_connector_send_text_returns_rid_and_enqueues_echo():
 
     result = await connector.send_text("echo-text", "12345", "salam")
     assert result["ok"] is True
-    assert result["result"]["rid"] == 2**62 + 7
+    assert result["result"]["rid"] == runtime.client.sent[0]["random_id"]
     assert result["result"]["date"] == 1756000000
 
     update = runtime.message_queue.get_nowait()
     message = update["message"]
-    assert update["update_id"] == 2**62 + 7
+    assert update["update_id"] == result["result"]["rid"]
     assert message["_outgoing"] is True
     assert message["text"] == "salam"
     assert message["chat"]["id"] == "12345"
@@ -211,7 +221,7 @@ async def test_connector_send_text_mirror_disabled():
     connector._instances["echo-off"] = runtime
 
     result = await connector.send_text("echo-off", "12345", "salam", mirror_echo=False)
-    assert result["result"]["rid"] == 2**62 + 8
+    assert result["result"]["rid"] == runtime.client.sent[0]["random_id"]
     assert runtime.message_queue.empty()
 
 

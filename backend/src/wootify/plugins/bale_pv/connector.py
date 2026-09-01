@@ -583,6 +583,10 @@ class BalePvConnector:
 
         try:
             peer_id = int(chat_id)
+            # Bale uses the request rid as the permanent message ID. The
+            # SendMessage acknowledgement's small integer is a server date,
+            # not the message rid used by UpdateMessage/DeleteMessage.
+            request_rid = random.randint(2**60, 2**63 - 1)
             reply_to = None
             if quoted:
                 reply_to_val = quoted.get("message_id") or quoted.get("id")
@@ -594,9 +598,10 @@ class BalePvConnector:
                 text=text,
                 reply_to_message_id=reply_to,
                 access_hash=access_hash,
+                random_id=request_rid,
             )
             ack = self._parse_send_ack(response)
-            rid = ack.get("rid")
+            rid = request_rid
             date = ack.get("date")
             if mirror_echo:
                 rid = self._enqueue_outgoing_echo(
@@ -1209,6 +1214,7 @@ class BalePvConnector:
             response = await runtime.client.delete_message(
                 peer_id=peer_id,
                 message_ids=[rid],
+                just_mine=False,
             )
             self._logger.info(
                 "bale_pv delete_message ok instance=%s chat_id=%s message_id=%s",

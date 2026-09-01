@@ -89,9 +89,15 @@ class ProtobufMessage:
             self._fields.append((field_number, 0, b"\x01"))
         return self
 
-    def add_message(self, field_number: int, message: "ProtobufMessage") -> "ProtobufMessage":
+    def add_message(
+        self,
+        field_number: int,
+        message: "ProtobufMessage",
+        *,
+        include_empty: bool = False,
+    ) -> "ProtobufMessage":
         encoded = message.serialize()
-        if encoded:
+        if encoded or include_empty:
             self._fields.append((field_number, 2, encoded))
         return self
 

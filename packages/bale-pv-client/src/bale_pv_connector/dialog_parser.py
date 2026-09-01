@@ -402,14 +402,19 @@ def parse_send_message_response(data: Optional[bytes]) -> Dict[str, Optional[int
         logger.debug("parse_send_message_response failed: %s", exc)
         return result
 
-    # Layout 1: MessageContainer (a nested message body in field 4).
+    # Layout 1: MessageContainer (a nested message body in field 4). Bale's
+    # SendMessage response also uses field 4 for metadata while field 2 is a
+    # millisecond server date, so only accept field 2 as a rid when it has the
+    # expected 64-bit rid magnitude.
     if isinstance(fields.get(4, [None])[0], bytes):
         rid = fields.get(2, [None])[0]
         date = fields.get(3, [None])[0]
-        if isinstance(rid, int):
+        if isinstance(rid, int) and rid >= 2**60:
             result["rid"] = rid
         if isinstance(date, int):
             result["date"] = date
+        elif isinstance(rid, int) and 10**9 <= rid < 10**13:
+            result["date"] = rid
         if result["rid"] is not None:
             return result
 

@@ -1006,7 +1006,7 @@ async def test_webhook_propagates_message_updated_to_bale(db_session):
 
     mapping = MessageMapping(
         conversation_id=str(conversation.id),
-        direction=MessageDirection.platform_to_chatwoot,
+        direction=MessageDirection.chatwoot_to_platform,
         message_kind=MessageKind.text,
         platform_message_id="888",
         chatwoot_message_id="999",
@@ -1055,6 +1055,81 @@ async def test_webhook_propagates_message_updated_to_bale(db_session):
 
 
 @pytest.mark.anyio
+async def test_webhook_does_not_edit_authenticated_users_bale_message(db_session):
+    """An edit webhook must not modify an inbound Bale user's message."""
+    platform = PlatformType(
+        key="bale_pv_enterprise",
+        display_name="Bale PV Enterprise",
+        capabilities_json={},
+        metadata_schema_json={},
+    )
+    db_session.add(platform)
+    db_session.flush()
+    instance = Instance(
+        instance_key="bale-pv-inbound-edit-skip",
+        platform_type_id=platform.id,
+        is_enabled=True,
+        platform_metadata_encrypted="",
+        chatwoot_config_encrypted='{"account_id": 1}',
+        proxy_config_encrypted="",
+    )
+    db_session.add(instance)
+    db_session.flush()
+    conversation = Conversation(
+        instance_id=instance.id,
+        platform_conversation_id="770408072",
+        chatwoot_conversation_id="116",
+        chatwoot_contact_id="77",
+        chatwoot_inbox_id="5",
+        is_active=True,
+    )
+    db_session.add(conversation)
+    db_session.flush()
+
+    from wootify.models import MessageDirection, MessageKind, MessageMapping, MessageStatus
+
+    db_session.add(
+        MessageMapping(
+            conversation_id=str(conversation.id),
+            direction=MessageDirection.platform_to_chatwoot,
+            message_kind=MessageKind.text,
+            platform_message_id="888",
+            chatwoot_message_id="999",
+            status=MessageStatus.sent,
+            platform_payload_json={"text": "the Bale user's text"},
+        )
+    )
+    db_session.commit()
+
+    adapter = AsyncMock()
+    runtime = MagicMock(status="open", adapter=adapter)
+    client = AsyncMock()
+    payload = {
+        "event": "message_updated",
+        "id": 999,
+        "content": "must not change Bale user's message",
+        "conversation": {"id": 116},
+    }
+    with patch("wootify.services.chatwoot_bridge_service.get_runtime", return_value=runtime):
+        with patch.object(
+            chatwoot_bridge,
+            "_chatwoot_client_for_instance",
+            return_value=(instance, {"account_id": 1}, client),
+        ):
+            result = await chatwoot_bridge.handle_chatwoot_webhook(
+                db_session, instance.instance_key, payload
+            )
+
+    assert result == {
+        "ok": True,
+        "ignored": True,
+        "reason": "not_chatwoot_outbound",
+        "detail": "not_chatwoot_outbound",
+    }
+    adapter.edit_message.assert_not_awaited()
+
+
+@pytest.mark.anyio
 async def test_webhook_skips_message_updated_when_content_unchanged(db_session):
     """message_updated with the same content must not be forwarded."""
     platform = PlatformType(
@@ -1092,7 +1167,7 @@ async def test_webhook_skips_message_updated_when_content_unchanged(db_session):
 
     mapping = MessageMapping(
         conversation_id=str(conversation.id),
-        direction=MessageDirection.platform_to_chatwoot,
+        direction=MessageDirection.chatwoot_to_platform,
         message_kind=MessageKind.text,
         platform_message_id="888",
         chatwoot_message_id="999",
@@ -1172,7 +1247,7 @@ async def test_webhook_skips_message_updated_for_edit_reply(db_session):
 
     mapping = MessageMapping(
         conversation_id=str(conversation.id),
-        direction=MessageDirection.platform_to_chatwoot,
+        direction=MessageDirection.chatwoot_to_platform,
         message_kind=MessageKind.text,
         platform_message_id="888:edit:123",
         chatwoot_message_id="1000",
@@ -2152,6 +2227,34 @@ async def test_post_message_does_not_retry_on_timeout():
             await client.post_message(1, 5, {"content": "hi"})
 
     assert attempts == 1, "ReadTimeout should not be retried for text messages"
+
+
+@pytest.mark.anyio
+async def test_post_message_retries_connect_error_before_chatwoot_receives_request():
+    """DNS/connection failures are safe to retry for outbound messages."""
+    from wootify.clients.chatwoot_client import ChatwootClient
+
+    client = ChatwootClient(base_url="http://chatwoot", token="token", timeout=1)
+    attempts = 0
+
+    async def fake_request(*args, **kwargs):
+        nonlocal attempts
+        attempts += 1
+        if attempts < 3:
+            raise httpx.ConnectError("name lookup failed", request=MagicMock())
+        return httpx.Response(
+            200,
+            json={"id": 42},
+            request=httpx.Request("POST", "http://chatwoot/api/v1/accounts/1/conversations/5/messages"),
+        )
+
+    with patch.object(client._client, "request", new=fake_request), patch(
+        "asyncio.sleep", new=AsyncMock()
+    ):
+        result = await client.post_message(1, 5, {"content": "hi"})
+
+    assert attempts == 3
+    assert result == {"id": 42}
 
 
 @pytest.mark.anyio

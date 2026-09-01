@@ -89,6 +89,7 @@ class BaleMessagingClient:
         text: str,
         reply_to_message_id: Optional[int] = None,
         access_hash: Optional[int] = None,
+        random_id: Optional[int] = None,
     ) -> Optional[bytes]:
         """Send a text message to a peer and return the raw ack bytes.
 
@@ -104,6 +105,7 @@ class BaleMessagingClient:
             text=text,
             reply_to_message_id=reply_to_message_id,
             access_hash=access_hash,
+            random_id=random_id,
         )
         try:
             return await self.ws.send_request(
@@ -144,14 +146,16 @@ class BaleMessagingClient:
         self,
         peer_id: int,
         message_ids: List[int],
+        just_mine: bool = False,
     ) -> bytes:
-        """Delete one or more messages.
+        """Delete one or more messages for everyone by default.
 
         Returns the raw protobuf response bytes.
         """
         req = DeleteMessageRequest(
             peer_id=peer_id,
             message_ids=message_ids,
+            just_mine=just_mine,
         )
         return await self.ws.send_request(
             service_name=self.SERVICE,

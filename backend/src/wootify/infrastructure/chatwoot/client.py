@@ -237,6 +237,31 @@ class ChatwootClient:
                 )
                 raise
 
+            except (httpx.ConnectError, httpx.ConnectTimeout) as exc:
+                # A connection/DNS failure happens before Chatwoot can receive
+                # the request body, so retrying is safe even for non-idempotent
+                # message POSTs. This is intentionally separate from read
+                # timeout/read error retries: those may happen after Rails has
+                # accepted a message and could create duplicates.
+                last_exc = exc
+                if attempt < 2:
+                    wait = 2 ** attempt
+                    logger.warning(
+                        "chatwoot.request retry connect_error attempt=%s wait=%ss error=%s",
+                        attempt + 1,
+                        wait,
+                        str(exc),
+                    )
+                    await asyncio.sleep(wait)
+                    continue
+                logger.error(
+                    "chatwoot.request CONNECT ERROR target=%s elapsed=%ss error=%s",
+                    target,
+                    round(time.monotonic() - start, 3),
+                    str(exc),
+                )
+                raise
+
             except httpx.HTTPStatusError as e:
                 last_exc = e
                 response = e.response

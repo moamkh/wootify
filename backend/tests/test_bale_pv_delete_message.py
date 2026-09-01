@@ -29,8 +29,8 @@ async def test_delete_message_calls_client_with_supported_signature(connector):
     runtime = _runtime("del-test")
     calls = []
 
-    async def _delete_message(peer_id, message_ids):  # real client signature
-        calls.append((peer_id, message_ids))
+    async def _delete_message(peer_id, message_ids, just_mine=False):  # real client signature
+        calls.append((peer_id, message_ids, just_mine))
         return b"\x01\x02"
 
     runtime.client = type("FakeClient", (), {"delete_message": staticmethod(_delete_message)})()
@@ -41,7 +41,19 @@ async def test_delete_message_calls_client_with_supported_signature(connector):
         connector._instances.pop("del-test", None)
 
     assert result["ok"] is True
-    assert calls == [(12345, [6789012345678901234])]
+    assert calls == [(12345, [6789012345678901234], False)]
+
+
+def test_delete_message_request_revokes_for_everyone():
+    """Bale requires the present ``justMine=false`` wrapper for global delete."""
+    from bale_pv_connector.messaging_messages import DeleteMessageRequest
+    from bale_pv_connector.protobuf_wire import ProtobufParser
+
+    request = DeleteMessageRequest(peer_id=12345, message_ids=[67890]).serialize()
+    fields = ProtobufParser(request).parse()
+
+    assert set(fields) == {1, 2, 4}
+    assert fields[4] == [b""]
 
 
 @pytest.mark.anyio
