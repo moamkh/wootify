@@ -14,13 +14,13 @@ python -m venv .venv
 pip install -r requirements.txt
 copy .env.example .env
 alembic upgrade head
-python -m uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
+python -m uvicorn wootify.bootstrap.app:app --reload --host 0.0.0.0 --port 8000
 ```
 
 ## Frontend Setup
 
 ```bash
-cd wootify-instance-manager
+cd frontend
 npm install
 npm run dev
 ```
@@ -30,6 +30,7 @@ npm run dev
 From `.env.example`:
 
 - `SERVER_BASE_URL`: backend public URL used in webhook/inbox wiring.
+- `WOOTIFY_VAR_DIR`: ignored runtime state root used by new installations.
 - `DATA_ENCRYPTION_KEY`: Fernet key for encrypted config-at-rest.
 - `STORE_MESSAGE_PAYLOADS`: enables payload persistence gate (with feature flag).
 - `DATABASE_URL`: base SQLAlchemy connection URL. For PostgreSQL, this should usually omit the final database name and point at the server itself.
@@ -46,9 +47,9 @@ From `.env.example`:
 
 ## Database and Migrations
 
-- ORM models: `app/models.py`
-- Migration env: `alembic/env.py`
-- Migration scripts: `alembic/versions/`
+- ORM models: `backend/src/wootify/infrastructure/persistence/models/`
+- Migration env: `backend/migrations/env.py`
+- Migration scripts: `backend/migrations/versions/`
 
 Run latest migrations:
 
@@ -71,10 +72,20 @@ Move existing SQLite data into PostgreSQL:
 python scripts/migrate_sqlite_to_postgres.py
 ```
 
+Preview the optional legacy runtime-layout migration after stopping Wootify:
+
+```bash
+python scripts/migrate_runtime_layout.py
+python scripts/migrate_runtime_layout.py --apply
+```
+
+The first command is read-only. The apply command refuses destination
+collisions and never overwrites existing files.
+
 Check which database URL the backend will actually use:
 
 ```bash
-python -c "from app.config import settings; print(settings.resolved_database_url)"
+python -c "from wootify.config import settings; print(settings.resolved_database_url)"
 ```
 
 Create a migration (after model changes):

@@ -130,6 +130,14 @@ Delete an instance and related mappings/runtime state.
 
 Create or discover Chatwoot inbox for that instance, then persist `inbox_id`. Not available for enterprise instances (`bale_enterprise`, `telegram_enterprise`); use the enterprise route inbox endpoint instead.
 
+### `GET /instances/{instance_key}/chatwoot/webhook`
+
+Return the current Chatwoot account-webhook status for an instance.
+
+### `POST /instances/{instance_key}/chatwoot/webhook`
+
+Create or update the instance's Chatwoot account webhook. The registered subscriptions include `message_updated`, so a deleted Chatwoot message is forwarded through Wootify to the mapped Bale PV message.
+
 ## Sync Endpoints
 
 ### `POST /webhooks/chatwoot/{instance_key}`

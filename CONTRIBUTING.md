@@ -22,7 +22,7 @@ uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
 Optional frontend:
 
 ```bash
-cd wootify-instance-manager
+cd frontend
 npm install
 npm run dev
 ```
@@ -60,4 +60,3 @@ npm run dev
 - Connector reliability and retry strategies.
 - Observability improvements (structured logs, metrics).
 - Documentation and onboarding material.
-

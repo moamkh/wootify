@@ -1,168 +1,116 @@
 # Architecture
 
-## High-Level Overview
+Wootify Connector is a modular FastAPI application that synchronizes Chatwoot
+with Bale, Telegram, Bale PV, and an isolated experimental Instagram adapter.
+The refactor keeps the existing HTTP, database, environment, and import
+contracts while giving each concern a clear owner.
 
-Wootify Connector is a modular backend that synchronizes messages between Chatwoot and external messaging platforms.
+## Repository layout
 
-Main direction flows:
+```text
+backend/
+  src/wootify/
+    bootstrap/        application factory, container, and lifecycle
+    domain/           platform identities and capabilities
+    application/      use cases, workflows, policies, and ports
+    plugins/          platform-specific connectors and adapters
+    infrastructure/   persistence, security, networking, storage, observability
+    presentation/     FastAPI schemas, middleware, routers, and controllers
+    services/         compatibility modules for historical imports
+  migrations/         Alembic migrations
+  tests/              behavior and contract tests
+frontend/
+  src/app/             application composition
+  src/features/        feature-owned React views and workflows
+  src/shared/          API transport and reusable UI
+packages/bale-pv-client/ independently installable protocol client
+scripts/               operational and refactor-audit commands
+var/                   ignored runtime state for new installations
+```
 
-1. Chatwoot -> Connector -> Bale/Telegram
-2. Bale/Telegram -> Connector -> Chatwoot
+Historical modules under `wootify.services`, `wootify.controllers`,
+`wootify.repositories`, `wootify.clients`, and `wootify.utils` remain thin
+aliases. They preserve imports and monkeypatch behavior while the
+implementation lives in its new package.
 
-There are three major runtime modes:
+## Dependency direction
 
-- Generic bridge mode for standard Bale/Telegram instances
-- Enterprise Bale mode for route-specific live support/sales sessions, enterprise document delivery, manual groups, GRE validation, and optional external SMS sync
-- Enterprise Telegram mode for dynamic route-based live sessions, enterprise document delivery, manual groups, and customizable menu labels (no GRE validation, no SMS sync)
+```text
+presentation -> application -> domain
+plugins ------> application -> domain
+infrastructure implements application ports
+bootstrap composes all of the above
+```
 
-It keeps persistent mappings for:
+The application layer does not construct FastAPI or SQLAlchemy infrastructure.
+`ApplicationContainer` owns construction, and `SqlAlchemyUnitOfWork` implements
+the transaction boundary declared by the application port.
 
-- Instance configuration and runtime state
-- Conversation identity mapping
-- Message identity + reply-parent mapping
-- Enterprise user state, sessions, pending messages, and document assets
+## Runtime composition
 
-## Runtime Components
+`wootify.bootstrap.app.create_app()` creates the FastAPI application. It mounts
+the API routers and UI, installs middleware and exception handlers, and stores
+the dependency container on `app.state.container`. `ApplicationLifecycle`
+coordinates database initialization, registry seeding, and polling startup and
+shutdown. The module-level `app` and legacy `app.main:app` entrypoint are kept
+for existing deployments.
 
-- `app/main.py`
-  - FastAPI app bootstrap
-  - startup/shutdown lifecycle (logging, DB seed, polling start)
-  - API router mount + static files for the admin UI
-  - Global exception handlers
-- `app/services/bale_polling_service.py`
-  - poll manager per enabled instance
-  - dispatches inbound updates to bridge service or enterprise service
-- `app/services/bridge_service.py`
-  - central orchestration for inbound/outbound sync
-  - resolves destination identities, feature flags, and reply behavior
-  - handles contact/conversation reuse, operator-change notifications, and deleted-conversation recovery
-- `app/services/enterprise_bale_service.py`
-  - enterprise Bale runtime orchestration
-  - handles live-route session state, Chatwoot route inboxes, enterprise assets, manual groups, GRE validation, and SMS sync
-- `app/services/enterprise_telegram_service.py`
-  - enterprise Telegram runtime orchestration
-  - handles dynamic routes, live-session state, Chatwoot route inboxes, enterprise assets, manual groups, and customizable labels
-- `app/services/instance_service.py`
-  - instance lifecycle and normalized decrypted runtime configuration
-  - feature override computation and webhook URL building
-- `app/services/platform_registry_service.py`
-  - seeds platform types and default feature definitions on startup
-- `app/services/conversation_mapping_service.py`
-  - CRUD wrapper for platform↔Chatwoot conversation mappings
-- `app/services/message_mapping_service.py`
-  - CRUD wrapper for message mappings and reply-parent resolution
-- `app/services/enterprise_document_service.py`
-  - upload/replace/delete enterprise PDF assets (manuals & catalog)
-- `app/services/enterprise_manual_group_service.py`
-  - CRUD for manual groups and group↔manual assignments
-- `app/services/enterprise_gre_service.py`
-  - GRE phone eligibility validation via internal API
+The plugin registry describes each platform with a stable key, capabilities,
+and connector factory. Built-ins retain the six existing platform keys.
+Instagram is registered as experimental so it remains available without
+leaking its implementation into the core application.
 
-## Layering
+## Messaging flow
 
-- Controllers: HTTP-level concerns (`app/controllers/`)
-- Services: business rules and orchestration (`app/services/`)
-- Repositories: DB read/write abstraction (`app/repositories/`)
-- Connectors: platform-specific transport (`app/connectors/`)
-- Clients: external API wrappers (`app/clients/`)
-- Schemas: API contracts (`app/schemas/`)
-- Utils: shared helpers (`app/utils/`)
-  - `crypto_utils.py` — Fernet encryption for config-at-rest
-  - `payload_utils.py` — sensitive field masking before storage/logging
-  - `proxy_utils.py` — optional proxy routing per instance
-  - `media_utils.py` — media type detection and processing helpers
-  - `logging_utils.py` — structured logging helpers
-  - `cache.py` — lightweight in-memory caching utilities
+Inbound platform messages are polled by the platform plugin, normalized, and
+passed to `BridgeService`. Dedicated parser, destination, media, notification,
+and Bale PV workflow objects handle detailed policies. The workflow finds or
+creates a Chatwoot contact/conversation and records conversation/message maps.
 
-## Data Model Summary
+Outbound Chatwoot events enter through
+`/api/v1/webhooks/chatwoot/{instance_key}`. The HTTP controller validates the
+event, application services resolve the mapped destination, and the selected
+plugin delivers text or media. Mapping records preserve reply threading and
+idempotency.
 
-Defined in `app/models.py`:
+Enterprise Bale and Telegram orchestration lives under
+`application/enterprise`. Shared policy objects own route lookup, labels,
+session transitions, and Chatwoot payload interpretation. Bale retains GRE and
+optional SMS behavior; Telegram retains dynamic routes without GRE/SMS.
 
-- `PlatformType`: registered platform capabilities + metadata schema
-- `FeatureDefinition`: global feature definitions
-- `Instance`: connector instance (platform/chatwoot/proxy config, encrypted at rest)
-- `InstanceFeatureOverride`: per-instance feature toggles
-- `InstanceRuntimeState`: polling/runtime checkpoint and last error
-- `Conversation`: platform ↔ Chatwoot conversation mapping
-- `ConversationRuntimeState`: per-conversation runtime values (e.g. last operator name)
-- `MessageMapping`: message-level mapping for ids, status, and reply-parent links
-- `EnterpriseBaleUser`: per-user enterprise state, phone number, and GRE status
-- `EnterpriseBaleSession`: enterprise live route sessions tied to Chatwoot contacts/conversations
-- `EnterprisePendingMessage`: operator messages queued while the enterprise user is away from the live session
-- `EnterpriseTelegramUser`: per-user Telegram enterprise state with dynamic string-based state (no GRE, no phone required)
-- `EnterpriseTelegramSession`: Telegram enterprise live route sessions
-- `EnterpriseTelegramPendingMessage`: operator messages queued for Telegram enterprise users
-- `EnterpriseDocumentAsset`: stored manuals / catalog PDFs
-- `EnterpriseManualGroup`: grouping/category for manuals
-- `EnterpriseManualGroupAssignment`: many-to-many link between groups and assets
+## HTTP presentation
 
-## Connectors and Registry
+`presentation/http/routers` partitions the existing API into instance/platform,
+webhook/simulation, Bale PV/Instagram, enterprise, and mapping/system surfaces.
+`HttpApplicationServices` centralizes service construction. The combined router
+retains the original route declaration order, paths, methods, and handler
+behavior. Contract tests compare all 53 API routes.
 
-- `app/connectors/base_connector.py` — `PlatformConnector` protocol
-- `app/connectors/registry.py` — `ConnectorRegistry` singleton mapping platform types to connectors
-- `app/connectors/bale_connector.py` — `BaleBotConnector` via raw HTTPX
-- `app/connectors/telegram_connector.py` — `TelegramBotConnector` via `python-telegram-bot`
+## Persistence
 
-## Inbound Flow (Platform -> Chatwoot)
+SQLAlchemy ownership is under `infrastructure/persistence`:
 
-1. Polling service reads updates from connector (`get_updates`).
-2. Update is normalized into bridge event payload.
-3. Bridge service resolves or creates mapped conversation.
-4. Bridge service posts message/media to Chatwoot.
-5. Message mapping is stored with `platform_to_chatwoot` direction.
+- `session.py` configures engines and sessions.
+- `models/` splits the 20 existing tables by responsibility.
+- `repositories/` contains persistence implementations.
+- `unit_of_work.py` provides commit/rollback transaction semantics.
 
-## Outbound Flow (Chatwoot -> Platform)
+The `wootify.models` and `wootify.db` facades remain compatible. Alembic reads
+migrations from `backend/migrations`; schema names, columns, indexes,
+constraints, and revision history are unchanged.
 
-1. Chatwoot sends webhook event to `/api/v1/webhooks/chatwoot/{instance_key}`.
-2. Bridge service validates event type and instance status.
-3. Conversation destination is resolved from mapping/contact/source metadata.
-4. Connector sends text/media to platform.
-5. Message mapping is stored with `chatwoot_to_platform` direction.
+## Runtime paths and migration
 
-## Enterprise Bale Flow
+New installations place generated databases, logs, sessions, uploads, and
+temporary files below `var/` (or `WOOTIFY_VAR_DIR`). Existing root/data paths
+win when present, preserving deployed installations. Runtime data is never
+moved implicitly. `python scripts/migrate_runtime_layout.py` previews a
+collision-safe migration; `--apply` performs only displayed non-conflicting
+moves.
 
-1. Bale Enterprise polling sends updates to `EnterpriseBaleService.handle_platform_update()`.
-2. The service resolves the enterprise user, GRE status, and current menu/live-session state.
-3. For live routes, the service forwards customer messages into route-specific Chatwoot conversations.
-4. For operator replies, Chatwoot hits `/api/v1/webhooks/chatwoot/{instance_key}/enterprise/{route_key}`.
-5. The enterprise service delivers the accepted notice and operator payload back to Bale, or queues it if the user already left the live session.
-6. If Chatwoot contact/conversation IDs are stale, the service recreates the route session before retrying the forward path.
-7. Pending messages are flushed when the user returns to a live session.
-8. Optional SMS sync polls an external provider and forwards matching SMS to enterprise users.
+## Compatibility and verification
 
-## Enterprise Telegram Flow
-
-1. Telegram Enterprise polling sends updates to `EnterpriseTelegramService.handle_platform_update()`.
-2. The service resolves the enterprise user (no GRE validation needed) and current dynamic state.
-3. Root menu buttons are built dynamically from `enterprise_routes`, plus catalog/manuals/address buttons with customizable labels.
-4. For live routes, the service forwards customer messages into the route's Chatwoot conversation.
-5. For operator replies, Chatwoot hits the route-specific webhook URL.
-6. The enterprise service delivers the accepted notice and operator payload back to Telegram, or queues it if the user left the live session.
-7. Dynamic routes are fully configurable per instance via `enterprise_routes` metadata.
-
-## Feature Flags and Safety Gates
-
-Feature definitions are seeded by `PlatformRegistryService` and evaluated per instance:
-
-- `reply_sync`
-- `media_sync`
-- `payload_debug_store`
-
-`payload_debug_store` is hard-gated by environment variable:
-
-- `STORE_MESSAGE_PAYLOADS=true`
-
-## Security and Data Handling
-
-- Instance/platform/chatwoot/proxy configuration is encrypted at rest using Fernet (`app/utils/crypto_utils.py`).
-- Sensitive payload fields are masked before storage/logging (`app/utils/payload_utils.py`).
-- Optional proxy routing is supported per instance (`app/utils/proxy_utils.py`).
-- Log redaction of secrets is enabled by default (`LOG_REDACT_SECRETS=true`).
-
-## Database Bootstrapping
-
-- The active runtime database URL is resolved in `app/config.py`.
-- `app/db.py` supports both SQLite and PostgreSQL.
-- When PostgreSQL is configured and `DATABASE_AUTO_CREATE=true`, startup performs a best-effort `CREATE DATABASE` against `POSTGRES_ADMIN_DATABASE` before creating the main engine.
-- Alembic migrations always run against the resolved runtime database URL.
-- On first startup, `Base.metadata.create_all` ensures tables exist even before alembic is run.
+The refactor is guarded by characterization tests, the exact API route
+contract, application-factory tests, persistence tests, frontend production
+builds, and before/after static inventories. Baseline snapshots and symbol
+relocation evidence live in `docs/refactor/`.

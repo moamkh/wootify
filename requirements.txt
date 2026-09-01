@@ -1,3 +1,6 @@
+-e ./packages/bale-pv-client
+-e ./backend
+
 fastapi
 uvicorn[standard]
 httpx
