@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "wootify"
-version = "6.0.0"
+version = "6.0.1"
 description = "Chatwoot messaging-platform connector and instance manager"
 requires-python = ">=3.11"
 dependencies = [

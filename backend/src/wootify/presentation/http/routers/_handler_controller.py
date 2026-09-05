@@ -1562,6 +1562,31 @@ async def _handle_chatwoot_webhook(
     """
     try:
         runtime = _resolve_chatwoot_webhook_runtime(db, instance_key, payload)
+        inbox_id, inbox_name = _extract_chatwoot_webhook_inbox(payload)
+        # Chatwoot account webhooks are account-wide.  Every configured
+        # Wootify callback therefore receives every event for that account;
+        # the callback URL alone is not proof that the event belongs to its
+        # instance.  Do not let a message from one inbox be sent/deleted by
+        # the authenticated account of another instance.
+        if (
+            (inbox_id or inbox_name)
+            and not _instance_matches_chatwoot_inbox(
+                runtime,
+                inbox_id=inbox_id,
+                inbox_name=inbox_name,
+            )
+        ):
+            logger.info(
+                'chatwoot webhook ignored for non-owning inbox instance_key=%s inbox_id=%s inbox_name=%s',
+                instance_key,
+                inbox_id,
+                inbox_name,
+            )
+            return GenericMessageResponse(
+                message='ignored',
+                detail='webhook inbox is not assigned to this instance',
+                status='ignored',
+            )
         resolved_instance_key = runtime.instance.instance_key
         task = asyncio.create_task(
             _deliver_chatwoot_webhook_guarded(
@@ -1759,14 +1784,18 @@ def _extract_chatwoot_webhook_inbox(payload: dict[str, Any]) -> tuple[Optional[s
 
 
 def _instance_matches_chatwoot_inbox(
-    row: InstanceResponse,
+    row: Any,
     *,
     inbox_id: Optional[str],
     inbox_name: Optional[str],
 ) -> bool:
     """Check whether an instance references a Chatwoot inbox id or name."""
-    chatwoot = row.chatwoot if isinstance(row.chatwoot, dict) else {}
-    platform_metadata = row.platform_metadata if isinstance(row.platform_metadata, dict) else {}
+    chatwoot_value = getattr(row, 'chatwoot', None)
+    platform_metadata_value = getattr(row, 'platform_metadata', None)
+    chatwoot = chatwoot_value if isinstance(chatwoot_value, dict) else {}
+    platform_metadata = (
+        platform_metadata_value if isinstance(platform_metadata_value, dict) else {}
+    )
     configured_pairs = [
         (
             _normalize_optional_string(chatwoot.get('inbox_id')),
