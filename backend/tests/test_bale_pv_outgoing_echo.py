@@ -132,7 +132,14 @@ class _FakeWs:
         self.updates = []
 
     async def send_request(self, service_name, method, payload, timeout=30.0):
-        self.requests.append({"service": service_name, "method": method, "timeout": timeout})
+        self.requests.append(
+            {
+                "service": service_name,
+                "method": method,
+                "payload": payload,
+                "timeout": timeout,
+            }
+        )
         if self.error is not None:
             raise self.error
         return self.response
@@ -174,6 +181,28 @@ async def test_send_document_awaits_ack():
     )
     assert result == b"\x08\x02"
     assert client.ws.requests[0]["method"] == "SendMessage"
+
+
+@pytest.mark.anyio
+async def test_send_document_preserves_supplied_request_rid():
+    """Static files need the caller's permanent Bale id for later deletion."""
+    from bale_pv_connector.protobuf_wire import ProtobufParser
+
+    client = BaleMessagingClient(jwt_token="t")
+    client.ws = _FakeWs(response=b"\x08\x02")
+    request_rid = 2**62 + 77
+
+    await client.send_document(
+        peer_id=12345,
+        file_id=777,
+        file_access_hash=888,
+        file_size=10,
+        name="voice.ogg",
+        mime_type="audio/ogg",
+        random_id=request_rid,
+    )
+
+    assert ProtobufParser(client.ws.requests[0]["payload"]).parse()[2][0] == request_rid
 
 
 # ---------------------------------------------------------------------------
@@ -406,6 +435,67 @@ async def test_webhook_send_persists_outbound_mapping(db):
     assert mapping.direction == MessageDirection.chatwoot_to_platform
     assert mapping.status == MessageStatus.sent
     assert (mapping.platform_payload_json or {}).get("text") == "Hello"
+
+
+@pytest.mark.anyio
+async def test_webhook_media_delivery_is_deduplicated_and_deletable(db):
+    """A static Chatwoot file keeps one permanent Bale mapping."""
+    instance = _make_bridge_instance(db, "bale-pv-media-map")
+    rid = 2**62 + 102
+    adapter = MagicMock()
+    adapter.send_media = AsyncMock(
+        return_value={"ok": True, "result": {"ok": True, "result": {"rid": rid}}}
+    )
+    adapter.delete_message = AsyncMock(return_value={"ok": True})
+    runtime = MagicMock()
+    runtime.platform_type = "bale_pv_enterprise"
+    runtime.status = "open"
+    runtime.adapter = adapter
+    client = AsyncMock()
+    payload = {
+        "event": "message_created",
+        "message_type": "outgoing",
+        "id": 901,
+        "content": "",
+        "attachments": [
+            {
+                "id": 44,
+                "data_url": "https://chatvand.test/files/44",
+                "filename": "voice.ogg",
+            }
+        ],
+        "conversation": {
+            "id": 78,
+            "meta": {"sender": {"id": 42, "identifier": "BALE_PV:12345"}},
+            "messages": [],
+        },
+    }
+
+    with patch("wootify.services.chatwoot_bridge_service.get_runtime", return_value=runtime):
+        with patch.object(
+            chatwoot_bridge,
+            "_chatwoot_client_for_instance",
+            return_value=(instance, {"account_id": 1}, client),
+        ):
+            await chatwoot_bridge.handle_chatwoot_webhook(db, "bale-pv-media-map", payload)
+            duplicate = await chatwoot_bridge.handle_chatwoot_webhook(
+                db, "bale-pv-media-map", payload
+            )
+            deleted = await chatwoot_bridge.handle_chatwoot_webhook(
+                db,
+                "bale-pv-media-map",
+                {
+                    "event": "message_updated",
+                    "id": 901,
+                    "content_attributes": {"deleted": True},
+                    "conversation": {"id": 78},
+                },
+            )
+
+    adapter.send_media.assert_awaited_once()
+    assert duplicate["reason"] == "duplicate_delivery"
+    assert deleted["status"] == "delete_propagated"
+    adapter.delete_message.assert_awaited_once_with(peer_id="12345", message_id=str(rid))
 
 
 @pytest.mark.anyio

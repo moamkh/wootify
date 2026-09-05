@@ -1642,6 +1642,14 @@ def test_extract_chatwoot_attachments_legacy_conversation():
     assert atts[0]["data_url"].endswith("doc.pdf")
 
 
+def test_unique_chatwoot_attachments_removes_repeated_static_file():
+    attachment = {"id": 7, "data_url": "https://chatvand.test/files/7", "filename": "voice.ogg"}
+
+    assert ChatwootBridgeService._unique_chatwoot_attachments(
+        [attachment, dict(attachment)]
+    ) == [attachment]
+
+
 def test_send_type_for_filename_maps_mime_types():
     from bale_pv_connector.messaging_messages import SendTypeValue
 

@@ -1088,6 +1088,12 @@ class BalePvConnector:
             file_access_hash,
             access_hash,
         )
+        # Bale's request random_id is the permanent message id used by
+        # UpdateMessage/DeleteMessage. The SendMessage response's numeric
+        # value is a server timestamp, not a reliable document message id.
+        # Retain the request id just as send_text does so retries are
+        # deduplicated and the sent file can later be deleted.
+        request_rid = random.randint(2**60, 2**63 - 1)
         send_response = await runtime.client.send_document(
             peer_id=peer_id,
             file_id=file_id,
@@ -1100,9 +1106,10 @@ class BalePvConnector:
             thumb=thumb,
             ext=ext,
             peer_access_hash=access_hash or 0,
+            random_id=request_rid,
         )
         ack = self._parse_send_ack(send_response)
-        rid = ack.get("rid")
+        rid = request_rid
         date = ack.get("date")
         if mirror_echo:
             rid = self._enqueue_outgoing_echo(

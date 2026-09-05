@@ -614,7 +614,9 @@ class ChatwootBridgeService:
                 if mapping and mapping.platform_message_id:
                     reply_to = mapping.platform_message_id
 
-            attachments = self._extract_chatwoot_attachments(payload)
+            attachments = self._unique_chatwoot_attachments(
+                self._extract_chatwoot_attachments(payload)
+            )
 
             sent: List[Dict[str, Any]] = []
             if attachments and isinstance(attachments, list):
@@ -953,6 +955,24 @@ class ChatwootBridgeService:
         backwards compatibility.
         """
         return ChatwootPayloadParser.extract_attachments(payload)
+
+    @staticmethod
+    def _unique_chatwoot_attachments(attachments: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """Keep one copy of each static attachment in a webhook payload."""
+        unique: List[Dict[str, Any]] = []
+        seen: set[str] = set()
+        for attachment in attachments:
+            if not isinstance(attachment, dict):
+                continue
+            identity = attachment.get("id") or attachment.get("data_url") or attachment.get("file_url")
+            if identity is not None:
+                key = str(identity).strip()
+                if key and key in seen:
+                    continue
+                if key:
+                    seen.add(key)
+            unique.append(attachment)
+        return unique
 
     def _persist_mapping(
         self,

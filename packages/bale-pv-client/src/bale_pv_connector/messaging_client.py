@@ -266,6 +266,7 @@ class BaleMessagingClient:
         thumb: Optional[Any] = None,
         ext: Optional[Any] = None,
         peer_access_hash: int = 0,
+        random_id: Optional[int] = None,
     ) -> Optional[bytes]:
         """Send a document/media message and return the raw ack bytes.
 
@@ -293,6 +294,7 @@ class BaleMessagingClient:
         req = SendMessageRequest(
             peer_id=peer_id,
             document=doc.serialize(),
+            random_id=random_id,
             reply_to_message_id=reply_to_message_id,
             access_hash=peer_access_hash or None,
         )
