@@ -37,7 +37,6 @@ PLATFORM_REQUIRED_TOKEN_KEY = {
     'bale': 'bale_token',
     'bale_enterprise': 'bale_token',
     'bale_pv_enterprise': 'bale_pv_phone_number',
-    'instagram_pv_enterprise': 'instagram_username',
     'telegram': 'telegram_token',
     'telegram_enterprise': 'telegram_token',
 }
@@ -292,7 +291,13 @@ class InstanceService:
             for row in self._instance_repo(db).list_all():
                 if not row.is_enabled:
                     continue
-                runtime = self._to_runtime(db, row)
+                try:
+                    runtime = self._to_runtime(db, row)
+                except RuntimeError as exc:
+                    if 'Failed to decrypt config payload' not in str(exc):
+                        raise
+                    logger.error('instance_config_unreadable instance=%s; restore its encryption key or re-save its settings', row.instance_key)
+                    continue
                 required_token_key = self._required_platform_token_key(runtime.platform_type.key)
                 if required_token_key and not runtime.platform_metadata.get(required_token_key):
                     continue
@@ -599,14 +604,17 @@ class InstanceService:
             }
 
         if key == 'instagram_pv_enterprise':
+            sessionid = str(data.get('instagram_sessionid') or '').strip()
+            if not sessionid and not (str(data.get('instagram_username') or '').strip() and data.get('instagram_password')):
+                raise ValueError('Instagram requires username/password or a session cookie')
             return {
                 'instagram_username': str(data.get('instagram_username') or '').strip(),
-                'instagram_password': str(data.get('instagram_password') or '').strip(),
+                'instagram_password': str(data.get('instagram_password') or ''),
                 'instagram_sessionid': str(data.get('instagram_sessionid') or '').strip() or None,
                 'instagram_verification_code': str(data.get('instagram_verification_code') or '').strip() or None,
                 'instagram_totp_seed': str(data.get('instagram_totp_seed') or '').strip() or None,
                 'instagram_session_dir': str(data.get('instagram_session_dir') or '').strip() or None,
-                'instagram_poll_interval': int(data.get('instagram_poll_interval') or settings.INSTAGRAM_PV_POLL_INTERVAL_SECONDS),
+                'instagram_poll_interval': max(5, int(data.get('instagram_poll_interval') or settings.INSTAGRAM_PV_POLL_INTERVAL_SECONDS)),
                 'instagram_display_name': str(data.get('instagram_display_name') or '').strip() or None,
                 'instagram_department': str(data.get('instagram_department') or '').strip() or None,
             }

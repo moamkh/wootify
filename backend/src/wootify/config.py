@@ -86,6 +86,7 @@ class Settings(BaseSettings):
     INSTAGRAM_PV_POLL_INTERVAL_SECONDS: int = 10
     INSTAGRAM_PV_LONG_POLL_TIMEOUT_SECONDS: int = 30
     INSTAGRAM_PV_MEDIA_DOWNLOAD_TIMEOUT_SECONDS: int = 60
+    INSTAGRAM_PV_MEDIA_UPLOAD_TIMEOUT_SECONDS: int = 45
 
     DATA_ENCRYPTION_KEY: str = ''
     # Optional previous key, used once to re-encrypt stored secrets after a key

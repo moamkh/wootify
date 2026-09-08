@@ -29,20 +29,14 @@ class InstagramPvAdapter(BasePlatformAdapter):
     async def connect(self) -> None:
         username = str(self.config.get("instagram_username") or "").strip()
         password = str(self.config.get("instagram_password") or "").strip()
-        if not username or not password:
+        if not self.config.get("instagram_sessionid") and (not username or not password):
             raise RuntimeError(
                 f"Instagram PV instance '{self.instance_key}' missing username/password"
             )
         await instagram_pv.connect(
             self.instance_key,
-            {
-                "instagram_username": username,
-                "instagram_password": password,
-                "instagram_sessionid": self.config.get("instagram_sessionid"),
-                "instagram_session_dir": self.config.get("instagram_session_dir"),
-                "instagram_verification_code": self.config.get("instagram_verification_code"),
-                "instagram_totp_seed": self.config.get("instagram_totp_seed"),
-            },
+            self.config,
+            self.config.get("proxy"),
         )
         self._connected = True
         self._self_id = instagram_pv.get_self_user_id(self.instance_key)
@@ -91,9 +85,12 @@ class InstagramPvAdapter(BasePlatformAdapter):
         message_id: str,
         text: str,
     ) -> Dict[str, Any]:
-        """Instagram DMs do not support editing; always fails."""
+        """The installed Instagram SDK does not expose DM editing."""
         del peer_id, message_id, text
-        raise RuntimeError("Instagram DMs do not support message editing")
+        raise RuntimeError("Message editing is not supported by this Instagram connector")
+
+    async def delete_message(self, peer_id: str, message_id: str) -> Dict[str, Any]:
+        return await instagram_pv.delete_message(self.instance_key, peer_id, message_id)
 
     async def send_media(
         self,
@@ -236,7 +233,7 @@ class InstagramPvAdapter(BasePlatformAdapter):
             "sender_username": sender_username or None,
             "attachments": attachments,
             "contact": None,
-            "reply_to": None,
+            "reply_to": message.get("reply_to_message"),
             "outgoing": is_outgoing,
             "edited": False,
             "raw": raw_update,
@@ -267,7 +264,13 @@ class InstagramPvAdapter(BasePlatformAdapter):
     async def _download_url(self, url: str) -> bytes:
         import httpx
 
-        async with httpx.AsyncClient(follow_redirects=True, timeout=60) as client:
+        # Chatwoot attachments can be served from a local deployment. The
+        # Instagram proxy belongs only to Instagram API traffic; inheriting a
+        # desktop HTTP(S)_PROXY here sends localhost downloads through it and
+        # produces opaque httpx.ReadError failures before upload begins.
+        async with httpx.AsyncClient(
+            follow_redirects=True, timeout=60, trust_env=False
+        ) as client:
             resp = await client.get(url)
             resp.raise_for_status()
             return resp.content
@@ -285,12 +288,7 @@ class InstagramPvAdapter(BasePlatformAdapter):
                     self.instance_key, file_id
                 )
                 if not content:
-                    logger.warning(
-                        "instagram_pv_adapter_empty_attachment instance=%s file_id=%s",
-                        self.instance_key,
-                        str(file_id)[:80],
-                    )
-                    continue
+                    raise RuntimeError("Instagram attachment was empty")
                 filename = att.get("filename") or (
                     str(file_path).split("/")[-1] if file_path else "file"
                 )
@@ -319,6 +317,7 @@ class InstagramPvAdapter(BasePlatformAdapter):
                     str(file_id)[:80],
                     exc,
                 )
+                raise
         return resolved
 
     @staticmethod

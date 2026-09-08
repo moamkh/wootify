@@ -480,9 +480,10 @@ export default function InstanceFormPanel({
               </label>
             </div>
             <p className="muted" style={{ marginTop: 4 }}>
-              Login happens automatically when the instance is enabled. If Instagram requires a
-              checkpoint challenge, confirm the login in the Instagram app once, then restart the
-              instance.
+              Login happens automatically when the instance is enabled. Start challenge only when
+              Instagram explicitly sends an email/SMS code. Native checkpoints do not provide a
+              code or predictable approval request; use a trusted instagram.com sessionid for
+              those. A saved session cookie can be used without a password.
             </p>
 
             {selectedKey ? (
@@ -529,11 +530,11 @@ export default function InstanceFormPanel({
                   </div>
                 ) : null}
 
-                <h4 style={{ marginTop: 14 }}>Checkpoint challenge (email/SMS code)</h4>
+                <h4 style={{ marginTop: 14 }}>Checkpoint challenge (email/SMS code only)</h4>
                 <p className="small" style={{ margin: '0 0 8px' }}>
-                  If Instagram answers with a checkpoint instead of an in-app prompt, start the
-                  challenge here — Instagram emails a security code to the account address, then
-                  submit it below (same flow as the Bale SMS code).
+                  Start this only when Instagram offers an email or SMS verification method. If
+                  the result says native checkpoint, enter the sessionid from a trusted browser
+                  session above and reconnect instead.
                 </p>
                 <div className="row">
                   <button
@@ -542,7 +543,7 @@ export default function InstanceFormPanel({
                     disabled={busy || instagramChallengeLoading}
                     onClick={() => onInstagramPvChallengeStart(selectedKey)}
                   >
-                    {instagramChallengeLoading ? 'Working…' : 'Start challenge (send email code)'}
+                    {instagramChallengeLoading ? 'Working…' : 'Start email/SMS challenge'}
                   </button>
                   {instagramChallengeInfo?.state === 'manual_approval' ? (
                     <button

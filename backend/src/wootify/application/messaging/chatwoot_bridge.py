@@ -55,6 +55,10 @@ class ChatwootBridgeService:
     def __init__(self) -> None:
         """Initialize the instance."""
         self._clients: TTLCache[ChatwootClient] = TTLCache(maxsize=50, ttl=3600)
+        # Chatwoot can emit duplicate account-webhook callbacks for one
+        # outgoing message. Successful sends are covered by their persisted
+        # mapping; failures need this guard to avoid duplicate private notes.
+        self._delivery_failure_notes: TTLCache[bool] = TTLCache(maxsize=5000, ttl=3600)
 
     async def ingest_platform_event(
         self,
@@ -87,6 +91,13 @@ class ChatwootBridgeService:
         platform_key = str(
             getattr(getattr(instance, "platform_type", None), "key", "") or ""
         ).strip().lower() or "bale_pv_enterprise"
+
+        # Instagram polls also return messages sent by the authenticated
+        # account. Chatwoot has already created those messages before the
+        # bridge sends them, so an Instagram echo must never be posted back as
+        # an incoming message or considered an edit from the customer.
+        if platform_key == "instagram_pv_enterprise" and bool(event.get("outgoing")):
+            return {"ok": True, "ignored": True, "reason": "platform_outgoing_echo"}
 
         # Proactively resolve group/channel titles if the name still looks generic.
         # This handles cases where the connector's title cache missed and the
@@ -509,6 +520,7 @@ class ChatwootBridgeService:
                 payload,
                 None,
                 RuntimeError("recipient_not_resolvable: contact has neither identifier nor phone number"),
+                platform_type=runtime.platform_type,
             )
             return {"ok": False, "detail": "peer_id_not_found"}
 
@@ -675,7 +687,14 @@ class ChatwootBridgeService:
             # Delivery runs in a background task (the webhook was already
             # acked), so surface the failure to agents as a private note on
             # the conversation instead of failing silently.
-            await self._notify_delivery_failure(client, account_id, payload, peer_id, exc)
+            await self._notify_delivery_failure(
+                client,
+                account_id,
+                payload,
+                peer_id,
+                exc,
+                platform_type=runtime.platform_type,
+            )
             return {
                 "ok": False,
                 "message": "delivery_failed",
@@ -1137,9 +1156,9 @@ class ChatwootBridgeService:
             return None
         result = send_result.get("result")
         if isinstance(result, dict):
-            rid = result.get("rid")
+            rid = result.get("rid") or result.get("message_id")
             if rid is None and isinstance(result.get("result"), dict):
-                rid = result["result"].get("rid")
+                rid = result["result"].get("rid") or result["result"].get("message_id")
             if rid is not None:
                 return str(rid)
         return None
@@ -1180,20 +1199,33 @@ class ChatwootBridgeService:
         )
         if conversation is None:
             return
+        primary_mapped = False
         for item in sent:
+            result = item.get("result") if isinstance(item, dict) else None
             rid = self._extract_platform_rid(item)
             if not rid:
                 continue
+            connector_result = result.get("result") if isinstance(result, dict) else None
+            additional_message_ids = (
+                [str(mid) for mid in connector_result.get("additional_message_ids", [])]
+                if isinstance(connector_result, dict)
+                else []
+            )
+            # Instagram sends a media caption as a preceding text DM. Keep the
+            # media echo's text empty, otherwise the poller sees it as an edit
+            # of the caption and creates an unnecessary Chatwoot edit-reply.
+            primary_text = "" if message_kind == MessageKind.media and additional_message_ids else text or ""
             mapping = self._persist_mapping(
                 db,
                 instance=instance,
                 conversation_id=str(conversation.id),
                 direction=MessageDirection.chatwoot_to_platform,
                 message_kind=message_kind,
-                chatwoot_message_id=str(chatwoot_message_id),
+                chatwoot_message_id=str(chatwoot_message_id) if not primary_mapped else None,
                 platform_message_id=rid,
-                platform_payload_json={"text": text or ""},
+                platform_payload_json={"text": primary_text, "additional_message_ids": additional_message_ids},
             )
+            primary_mapped = primary_mapped or mapping is not None
             if mapping:
                 logger.debug(
                     "chatwoot_bridge.outbound_mapping_persisted instance=%s conversation_id=%s chatwoot_message_id=%s platform_message_id=%s",
@@ -1201,6 +1233,22 @@ class ChatwootBridgeService:
                     conversation.id,
                     chatwoot_message_id,
                     rid,
+                )
+            # These IDs belong to the caption text, not the attachment. They
+            # need their own platform-only mappings so their Instagram echoes
+            # are deduplicated without violating the one-Chatwoot-message
+            # unique constraint above.
+            for additional_id in additional_message_ids:
+                self._persist_mapping(
+                    db,
+                    instance=instance,
+                    conversation_id=str(conversation.id),
+                    direction=MessageDirection.chatwoot_to_platform,
+                    message_kind=MessageKind.text,
+                    chatwoot_message_id=None,
+                    platform_message_id=additional_id,
+                    platform_parent_message_id=rid,
+                    platform_payload_json={"text": text or ""},
                 )
 
     async def _handle_platform_message_edit_as_reply(
@@ -1356,6 +1404,8 @@ class ChatwootBridgeService:
         payload: Dict[str, Any],
         peer_id: Optional[str],
         exc: Exception,
+        *,
+        platform_type: Any = None,
     ) -> None:
         """Post a private note to the Chatwoot conversation when delivery fails.
 
@@ -1375,15 +1425,47 @@ class ChatwootBridgeService:
             if not conversation_id:
                 return
             recipient = peer_id or "unknown recipient"
+            platform_key = str(getattr(platform_type, "key", platform_type) or "").strip().lower()
+            platform_name = {
+                "instagram_pv_enterprise": "Instagram",
+                "bale_pv_enterprise": "Bale PV",
+            }.get(platform_key, "platform")
+            message_obj = payload.get("message") if isinstance(payload.get("message"), dict) else {}
+            source_message_id = self._extract_id(payload) or self._extract_id(message_obj) or "unknown"
+            note_key = "|".join(
+                (
+                    str(account_id),
+                    str(conversation_id),
+                    str(source_message_id),
+                    platform_key or "platform",
+                    type(exc).__name__,
+                    str(exc)[:160],
+                )
+            )
+            if self._delivery_failure_notes.get(note_key):
+                logger.info(
+                    "chatwoot_bridge.delivery_failure_note_duplicate_skipped account_id=%s conversation_id=%s message_id=%s",
+                    account_id,
+                    conversation_id,
+                    source_message_id,
+                )
+                return
+            self._delivery_failure_notes.set(note_key, True)
             note = (
-                f"\u26a0\ufe0f Delivery to Bale failed for {recipient}: "
+                f"\u26a0\ufe0f Delivery to {platform_name} failed for {recipient}: "
                 f"{type(exc).__name__}: {exc}"
             )[:900]
-            await client.post_message(
-                account_id,
-                int(conversation_id),
-                {"content": note, "private": True, "message_type": "outgoing"},
-            )
+            try:
+                await client.post_message(
+                    account_id,
+                    int(conversation_id),
+                    {"content": note, "private": True, "message_type": "outgoing"},
+                )
+            except Exception:
+                # If Chatwoot rejects the note, allow a later retry to notify
+                # the agent instead of permanently suppressing the failure.
+                self._delivery_failure_notes.pop(note_key)
+                raise
             logger.info(
                 "chatwoot_bridge.delivery_failure_note_posted account_id=%s conversation_id=%s recipient=%s",
                 account_id,
@@ -1837,9 +1919,9 @@ class ChatwootBridgeService:
         instance: Instance,
         payload: Dict[str, Any],
     ) -> Dict[str, Any]:
-        """Propagate an edit of a Chatwoot-originated message back to Bale PV.
+        """Propagate an edit of a Chatwoot-originated message back to its platform.
 
-        The authenticated Bale user's inbound messages have their own platform
+        The authenticated platform user's inbound messages have their own platform
         update flow.  This webhook path is deliberately limited to messages
         Chatwoot sent through Wootify, because only those mappings identify a
         Bale message owned by the configured authenticated account.
@@ -1930,7 +2012,7 @@ class ChatwootBridgeService:
         Chatwoot's ``destroy`` action fires ``message_updated`` with
         ``content_attributes.deleted = true``. The local message mapping gives
         us the platform message id, and the adapter deletes it via the
-        authenticated Bale session.
+        authenticated platform session.
         """
         message_id = MessagePayloadParser.extract_message_id(payload)
         if not message_id:
@@ -1946,6 +2028,10 @@ class ChatwootBridgeService:
 
         if not mapping.platform_message_id:
             return {"ok": True, "ignored": True, "reason": "no_platform_message_id", "detail": "no_platform_message_id"}
+
+        payload_state = mapping.platform_payload_json
+        if isinstance(payload_state, dict) and payload_state.get("deleted") is True:
+            return {"ok": True, "ignored": True, "reason": "already_deleted", "detail": "already_deleted"}
 
         if not conversation:
             return {"ok": False, "detail": "conversation_not_found"}
@@ -1976,6 +2062,15 @@ class ChatwootBridgeService:
                 exc,
             )
             return {"ok": False, "detail": f"delete_failed: {exc}"}
+
+        if isinstance(result, dict) and result.get("ok") is False:
+            return {"ok": False, "detail": "delete_failed: platform rejected delete"}
+
+        mapping.platform_payload_json = {
+            **(payload_state if isinstance(payload_state, dict) else {}),
+            "deleted": True,
+        }
+        db.commit()
 
         logger.info(
             "chatwoot_bridge.delete_propagated instance=%s chatwoot_message_id=%s platform_message_id=%s",

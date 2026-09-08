@@ -30,7 +30,11 @@ class ChatwootClient:
         """Initialize the instance."""
         self.base_url = base_url.rstrip("/")
         self.token = (token or "").strip()
-        self._client = httpx.AsyncClient(timeout=timeout)
+        # Chatwoot is commonly local to Wootify. Do not inherit desktop or
+        # shell proxy settings here: platform proxies belong only to their
+        # respective connectors and must not send localhost Chatwoot traffic
+        # through an external proxy.
+        self._client = httpx.AsyncClient(timeout=timeout, trust_env=False)
 
     # -------------------------
     # helpers

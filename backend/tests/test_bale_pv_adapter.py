@@ -623,6 +623,27 @@ async def test_webhook_outbound_dedup_same_chatwoot_message_id(db_session):
 
 
 @pytest.mark.anyio
+async def test_delivery_failure_note_is_deduplicated_and_uses_platform_name():
+    service = ChatwootBridgeService()
+    client = AsyncMock()
+    platform = MagicMock()
+    platform.key = "instagram_pv_enterprise"
+    payload = {"id": 9002, "conversation": {"id": 77}}
+    failure = ValueError("unsupported media")
+
+    await service._notify_delivery_failure(
+        client, 1, payload, "123", failure, platform_type=platform
+    )
+    await service._notify_delivery_failure(
+        client, 1, payload, "123", failure, platform_type=platform
+    )
+
+    client.post_message.assert_awaited_once()
+    note = client.post_message.await_args.args[2]["content"]
+    assert "Delivery to Instagram failed" in note
+
+
+@pytest.mark.anyio
 async def test_webhook_outbound_dedup_template_content_window(db_session):
     """Double-fired greeting (identical template text, different message ids,
     milliseconds apart) is forwarded only once."""
@@ -1373,6 +1394,26 @@ async def test_webhook_propagates_message_updated_deleted(db_session):
         peer_id="770408072",
         message_id="888",
     )
+    db_session.refresh(mapping)
+    assert mapping.platform_payload_json == {"text": "old text", "deleted": True}
+
+    with patch("wootify.services.chatwoot_bridge_service.get_runtime", return_value=runtime):
+        with patch.object(
+            chatwoot_bridge,
+            "_chatwoot_client_for_instance",
+            return_value=(instance, {"account_id": 1}, client),
+        ):
+            duplicate = await chatwoot_bridge.handle_chatwoot_webhook(
+                db_session, "bale-pv-edit-del", payload
+            )
+
+    assert duplicate == {
+        "ok": True,
+        "ignored": True,
+        "reason": "already_deleted",
+        "detail": "already_deleted",
+    }
+    adapter.delete_message.assert_awaited_once()
 
 
 @pytest.mark.anyio

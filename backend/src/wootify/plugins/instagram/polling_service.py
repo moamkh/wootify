@@ -12,7 +12,7 @@ Responsibilities
 * Normalize inbound updates through the adapter and resolve attachments.
 * Deliver events to ``ChatwootBridgeService``.
 * Failure handling with a per-instance in-memory retry queue (head-of-line
-  blocking, bounded attempts). Connector watermarks are only committed after
+  blocking, bounded backoff). Connector watermarks are only committed after
   successful delivery, so a restart re-fetches anything not yet delivered
   (at-least-once semantics without touching the shared ``inbound_event_retries``
   table, which the Bale drainer owns).
@@ -55,7 +55,7 @@ class InstagramPollingService:
 
     PLATFORM_KEY = "instagram_pv_enterprise"
 
-    # How many times a failing update is redelivered before it is dropped.
+    # How many failures trigger the maximum retry backoff (never a drop).
     _MAX_UPDATE_ATTEMPTS = 3
     # Backoff between retry-queue drain attempts after a failure.
     _RETRY_BACKOFF_BASE_SECONDS = 15.0
@@ -115,6 +115,9 @@ class InstagramPollingService:
         while not self._stop.is_set():
             try:
                 enabled = self._list_enabled_instance_keys()
+                for key, task in list(self._poll_tasks.items()):
+                    if task.done():
+                        self._poll_tasks.pop(key)
                 existing = set(self._poll_tasks.keys())
 
                 disabled_tasks = []
@@ -191,7 +194,7 @@ class InstagramPollingService:
 
                 try:
                     await runtime_registry.connect_instance(
-                        instance_key, self.PLATFORM_KEY, cfg
+                        instance_key, self.PLATFORM_KEY, {**cfg, "proxy": runtime.proxy}
                     )
                 except Exception as exc:
                     self._logger.warning(
@@ -262,14 +265,7 @@ class InstagramPollingService:
                     # update plus the rest of the batch for redelivery and stop
                     # the batch so per-chat ordering is preserved.
                     batch_ok = False
-                    if self._record_update_failure(instance_key, processed_update_id):
-                        self._logger.error(
-                            "instagram_update_dropped instance=%s update_id=%s attempts=%s",
-                            instance_key,
-                            processed_update_id,
-                            self._MAX_UPDATE_ATTEMPTS,
-                        )
-                        continue
+                    self._record_update_failure(instance_key, processed_update_id)
                     queue = self._pending_events.setdefault(instance_key, deque())
                     queue.append(update)
                     for remaining in updates[index + 1 :]:
@@ -348,7 +344,7 @@ class InstagramPollingService:
                     exc,
                     exc_info=True,
                 )
-                event["attachments"] = []
+                return False
         with SessionLocal() as db:
             result = await chatwoot_bridge.ingest_platform_event(db, instance_key, event)
         return bool(result.get("ok"))
@@ -385,13 +381,16 @@ class InstagramPollingService:
             if not delivered:
                 if self._record_update_failure(instance_key, processed_update_id):
                     self._logger.error(
-                        "instagram_update_dropped instance=%s update_id=%s attempts=%s",
+                        "instagram_update_retrying instance=%s update_id=%s attempts=%s",
                         instance_key,
                         processed_update_id,
                         self._MAX_UPDATE_ATTEMPTS,
                     )
-                    queue.popleft()
-                    continue
+                    # Preserve the failed event and its watermark. A long
+                    # outage must not turn into silent permanent message loss.
+                    self._retry_not_before[instance_key] = time.monotonic() + self._RETRY_BACKOFF_MAX_SECONDS
+                    await self._update_runtime_state_with_retry(runtime_instance_id, last_error="Instagram delivery blocked; retrying", touch_sync=False)
+                    return False
                 attempts = sum(self._update_fail_counts.get(instance_key, {}).values())
                 backoff = min(
                     self._RETRY_BACKOFF_BASE_SECONDS * max(attempts, 1),

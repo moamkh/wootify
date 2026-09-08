@@ -41,6 +41,8 @@ import re
 import struct
 import threading
 import time
+from uuid import uuid4
+from urllib.parse import quote
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Optional
@@ -48,6 +50,7 @@ from typing import Any, Optional
 import httpx
 
 from wootify.config import settings
+from wootify.paths import PROJECT_ROOT, VAR_ROOT
 
 logger = logging.getLogger("app.instagram.connector")
 
@@ -97,8 +100,13 @@ class InstagramPvInstanceRuntime:
     watermarks: dict[str, str] = field(default_factory=dict)
     # thread_id -> newest emitted-but-uncommitted message id
     pending_watermarks: dict[str, str] = field(default_factory=dict)
+    # Number of Chatwoot-to-Instagram sends waiting for exclusive client access.
+    # Inbox polling yields before its optional pending-inbox fetch while this is
+    # non-zero, so an agent reply is not needlessly held behind that extra read.
+    outbound_waiters: int = 0
     last_fetch_at: float = 0.0
     rate_limited_until: float = 0.0
+    sync_since: float = field(default_factory=time.time)
     # Proxy URL applied to the current client; used to detect proxy changes.
     proxy_url: Optional[str] = None
     # Checkpoint challenge flow state: None | 'sending' | 'code_sent' |
@@ -108,6 +116,9 @@ class InstagramPvInstanceRuntime:
     challenge_choice: Optional[str] = None
     challenge_code: Optional[str] = None
     challenge_event: Any = None  # threading.Event while a flow is active
+    # Native checkpoints are not code challenges. Instagram requires a
+    # trusted session or an approval it chooses to issue.
+    challenge_native_flow: bool = False
     # Frozen client kept when Instagram requires manual app approval, so the
     # challenge can be resumed without dropping device/session bindings.
     challenge_client: Any = None
@@ -146,13 +157,11 @@ class InstagramPvConnector:
         if ".." in Path(raw).parts:
             raise ValueError(f"instagram_session_dir must not contain '..' components: {raw}")
         session_dir = Path(raw)
-        data_root = Path("./data").resolve()
-        resolved = (Path.cwd() / session_dir).resolve() if not session_dir.is_absolute() else session_dir.resolve()
-        try:
-            resolved.relative_to(data_root)
-        except ValueError:
-            raise ValueError(f"instagram_session_dir must be under {data_root}: {session_dir}")
-        return session_dir
+        resolved = (PROJECT_ROOT / session_dir).resolve() if not session_dir.is_absolute() else session_dir.resolve()
+        roots = ((PROJECT_ROOT / "data").resolve(), VAR_ROOT.resolve())
+        if not any(resolved.is_relative_to(root) for root in roots):
+            raise ValueError("instagram_session_dir must be under the project data or runtime directory")
+        return resolved
 
     @staticmethod
     def _proxy_url(proxy: Optional[dict[str, Any]]) -> Optional[str]:
@@ -166,7 +175,7 @@ class InstagramPvConnector:
         port = str(proxy.get("port") or "").strip()
         username = str(proxy.get("username") or "").strip()
         password = str(proxy.get("password") or "")
-        auth = f"{username}:{password}@" if username else ""
+        auth = f"{quote(username, safe='')}:{quote(password, safe='')}@" if username else ""
         return f"{protocol}://{auth}{host}:{port}" if port else f"{protocol}://{auth}{host}"
 
     async def connect(
@@ -199,7 +208,7 @@ class InstagramPvConnector:
             ) from exc
 
         username = str(params.get("instagram_username") or "").strip()
-        password = str(params.get("instagram_password") or "").strip()
+        password = str(params.get("instagram_password") or "")
         sessionid = str(params.get("instagram_sessionid") or "").strip()
         if sessionid and "***" in sessionid:
             sessionid = ""  # masked placeholder leaked back from the panel
@@ -213,7 +222,12 @@ class InstagramPvConnector:
         if runtime is None:
             runtime = InstagramPvInstanceRuntime(instance=instance, params=params)
             self._runtimes[instance] = runtime
-        runtime.params = params
+        old_params = runtime.params
+        runtime.params = dict(params)
+        credentials_unchanged = all(old_params.get(k) == params.get(k) for k in (
+            "instagram_username", "instagram_password", "instagram_sessionid",
+            "instagram_verification_code", "instagram_totp_seed",
+        ))
 
         if runtime.challenge_state in ("sending", "code_sent", "resolving", "manual_approval"):
             raise RuntimeError(
@@ -222,8 +236,14 @@ class InstagramPvConnector:
             )
 
         proxy_url = self._proxy_url(proxy or params.get("proxy"))
+        if credentials_unchanged and runtime.proxy_url == proxy_url and runtime.auth_detail.startswith((
+            "challenge_required:", "two_factor_required:", "bad_password:",
+        )):
+            # Wait for a panel action or changed credentials instead of
+            # attempting another login every time the poller wakes up.
+            raise RuntimeError(runtime.auth_detail)
         if runtime.authenticated and runtime.client is not None:
-            if runtime.proxy_url == proxy_url:
+            if runtime.proxy_url == proxy_url and credentials_unchanged:
                 return
             # Proxy configuration changed: drop the existing client so the
             # reconnect goes through the new proxy instead of the old route.
@@ -240,7 +260,7 @@ class InstagramPvConnector:
         runtime.session_path = session_path
 
         async with runtime.lock:
-            client = Client()
+            client = self._new_client()
             # Small random delays between requests reduce ban risk.
             try:
                 client.delay_range = [1, 3]
@@ -256,9 +276,7 @@ class InstagramPvConnector:
                         proxy_url.split(":", 1)[0],
                     )
                 except Exception as exc:
-                    self._logger.warning(
-                        "instagram_pv set_proxy_failed instance=%s error=%s", instance, exc
-                    )
+                    raise RuntimeError("Instagram proxy configuration failed") from exc
 
             if session_path.exists():
                 try:
@@ -271,21 +289,31 @@ class InstagramPvConnector:
                         "instagram_pv session_load_failed instance=%s error=%s", instance, exc
                     )
 
+            # ``load_settings`` restores retry settings from the session file,
+            # including the old 20-second request pacing used by earlier
+            # Wootify versions. Apply the intended pacing *after* loading so
+            # an existing session cannot silently reintroduce that delay.
+            client.set_retry_config(request_timeout=1)
+
             def _login() -> None:
                 if sessionid:
                     # Verified web-session cookie: skips the login endpoint
                     # entirely, so no checkpoint can be triggered.
-                    client.login_by_sessionid(sessionid)
+                    if not client.login_by_sessionid(sessionid):
+                        raise RuntimeError("Instagram rejected the session")
                     return
                 verification_code = str(params.get("instagram_verification_code") or "").strip()
                 totp_seed = str(params.get("instagram_totp_seed") or "").strip()
                 try:
-                    client.login(username, password)
+                    code = verification_code or (_totp_code(totp_seed) if totp_seed else "")
+                    if not client.login(username, password, verification_code=code):
+                        raise RuntimeError("Instagram login returned false")
                 except TwoFactorRequired:
                     code = verification_code or (_totp_code(totp_seed) if totp_seed else "")
                     if not code:
                         raise
-                    client.login(username, password, verification_code=code)
+                    if not client.login(username, password, verification_code=code):
+                        raise RuntimeError("Instagram two-factor login returned false")
 
             try:
                 await asyncio.to_thread(_login)
@@ -302,18 +330,36 @@ class InstagramPvConnector:
                 await self._dump_device_fingerprint(client, session_path, instance)
                 runtime.client = None
                 runtime.authenticated = False
-                runtime.auth_detail = (
-                    "challenge_required: Instagram requires a checkpoint verification; "
-                    "open the Instagram app with this account and confirm the login, "
-                    "then click 'Check connectivity' again (the device fingerprint is "
-                    "now persisted, so the retry comes from the same device)"
+                native_flow = bool(
+                    ((client.last_json or {}).get("challenge") or {}).get("native_flow")
                 )
+                if native_flow:
+                    runtime.auth_detail = (
+                        "native_checkpoint_required: Instagram did not issue a code or approval "
+                        "request for this login. Use the sessionid from a trusted instagram.com "
+                        "browser session, then reconnect."
+                    )
+                else:
+                    runtime.auth_detail = (
+                        "challenge_required: Instagram requires a checkpoint verification. "
+                        "Start the email/SMS challenge only if Instagram offers a code; the device "
+                        "fingerprint is persisted for a later retry."
+                    )
                 raise RuntimeError(runtime.auth_detail)
             except BadPassword:
                 runtime.client = None
                 runtime.authenticated = False
                 runtime.auth_detail = "bad_password: Instagram rejected the credentials"
                 raise RuntimeError(runtime.auth_detail)
+            except Exception as exc:
+                await self._dump_device_fingerprint(client, session_path, instance)
+                runtime.client = None
+                runtime.authenticated = False
+                runtime.auth_detail = f"connect_failed: {type(exc).__name__}"
+                raise
+
+            if not client.user_id:
+                raise RuntimeError("Instagram login did not return an authenticated user")
 
             runtime.client = client
             runtime.authenticated = True
@@ -325,7 +371,11 @@ class InstagramPvConnector:
                 account = await asyncio.to_thread(client.account_info)
                 runtime.self_username = str(getattr(account, "username", "") or "") or None
             except Exception as exc:
-                self._logger.debug("instagram_pv account_info_failed instance=%s error=%s", instance, exc)
+                await self._dump_device_fingerprint(client, session_path, instance)
+                runtime.client = None
+                runtime.authenticated = False
+                runtime.auth_detail = f"session_verification_failed: {type(exc).__name__}"
+                raise RuntimeError(runtime.auth_detail) from exc
 
             await self._load_watermarks(runtime)
             await self._dump_settings(runtime)
@@ -335,6 +385,29 @@ class InstagramPvConnector:
                 runtime.self_user_id,
                 runtime.self_username,
             )
+
+    @staticmethod
+    def _new_client() -> Any:
+        from instagrapi import Client
+        from instagrapi.exceptions import ChallengeRequired
+
+        # Library DEBUG logs include session material. Never inherit the app's
+        # verbose logging or let the library prompt on the server's stdin.
+        sdk_logger = logging.getLogger("wootify.instagram.sdk")
+        sdk_logger.setLevel(logging.WARNING)
+        # ``request_timeout`` is unfortunately named in instagrapi: it is a
+        # synchronous pause before every private request, not an HTTP timeout.
+        # Twenty seconds here made each send wait at least twenty seconds before
+        # it reached Instagram. Keep the SDK's conservative one-second default;
+        # ``delay_range`` supplies the additional anti-abuse jitter.
+        client = Client(logger=sdk_logger, request_timeout=1)
+
+        def checkpoint(data: Any) -> bool:
+            raise ChallengeRequired("Instagram checkpoint requires panel verification")
+
+        client.challenge_resolve = checkpoint
+        client.challenge_code_handler = lambda *args: None
+        return client
 
     async def disconnect(self, instance: str) -> None:
         """Stop the runtime for an instance and persist its session."""
@@ -410,6 +483,9 @@ class InstagramPvConnector:
         try:
             data = await asyncio.to_thread(_read)
             if isinstance(data, dict):
+                if data.get("version") == 2:
+                    runtime.sync_since = float(data["sync_since"])
+                    data = data["watermarks"]
                 runtime.watermarks = {str(k): str(v) for k, v in data.items()}
         except Exception as exc:
             self._logger.warning(
@@ -426,7 +502,8 @@ class InstagramPvConnector:
 
         def _write() -> None:
             tmp = path.with_suffix(path.suffix + ".tmp")
-            tmp.write_text(json.dumps(runtime.watermarks), encoding="utf-8")
+            tmp.write_text(json.dumps({"version": 2, "sync_since": runtime.sync_since,
+                                       "watermarks": runtime.watermarks}), encoding="utf-8")
             tmp.replace(path)
 
         try:
@@ -516,6 +593,8 @@ class InstagramPvConnector:
             users = cached.get("users") or {}
             other = next((pk for pk in users if pk != str(runtime.self_user_id)), None)
             return str(chat_id), other
+        if str(chat_id) in runtime.watermarks or str(chat_id) in runtime.pending_watermarks:
+            return str(chat_id), None
         # Unknown chat_id: treat as a user pk.
         return None, str(chat_id)
 
@@ -524,6 +603,9 @@ class InstagramPvConnector:
     ) -> Optional[str]:
         """Resolve the direct thread id for a 1-on-1 chat with a user pk."""
         client = self._require_client(runtime.instance)
+        for tid, thread in runtime.thread_cache.items():
+            if not thread.get("is_group") and user_pk in (thread.get("users") or {}):
+                return tid
 
         def _lookup() -> Optional[str]:
             try:
@@ -541,9 +623,18 @@ class InstagramPvConnector:
                 return str(thread["thread_id"])
             if isinstance(data, dict) and data.get("thread_id"):
                 return str(data["thread_id"])
+            if getattr(data, "id", None):
+                return str(data.id)
             return None
 
         return await asyncio.to_thread(_lookup)
+
+    async def _approve_pending_thread(self, runtime: InstagramPvInstanceRuntime, thread_id: Optional[str]) -> None:
+        cached = runtime.thread_cache.get(str(thread_id)) or {}
+        if cached.get("pending"):
+            if not await asyncio.to_thread(runtime.client.direct_pending_approve, int(thread_id)):
+                raise RuntimeError("Instagram could not accept the message request")
+            cached["pending"] = False
 
     async def send_text(
         self,
@@ -562,46 +653,55 @@ class InstagramPvConnector:
         runtime = self._get_runtime(instance)
         client = self._require_client(instance)
 
-        async with runtime.lock:
-            thread_id, user_pk = self._resolve_thread_id(runtime, chat_id)
-            if thread_id is None and user_pk:
-                thread_id = await self._thread_for_user(runtime, user_pk)
+        runtime.outbound_waiters += 1
+        try:
+            async with runtime.lock:
+                thread_id, user_pk = self._resolve_thread_id(runtime, chat_id)
+                if thread_id is None and user_pk:
+                    thread_id = await self._thread_for_user(runtime, user_pk)
+                await self._approve_pending_thread(runtime, thread_id)
 
-            reply_to_message = None
-            quoted_id = str((quoted or {}).get("message_id") or "").strip()
-            reply_thread_id, reply_item_id = self._split_message_id(quoted_id)
-            if reply_thread_id and reply_item_id:
-                reply_to_message = await self._fetch_direct_message(
-                    runtime, reply_thread_id, reply_item_id
-                )
+                reply_to_message = None
+                quoted_id = str((quoted or {}).get("message_id") or "").strip()
+                reply_thread_id, reply_item_id = self._split_message_id(quoted_id)
+                if reply_thread_id and reply_item_id:
+                    reply_to_message = await self._fetch_direct_message(
+                        runtime, reply_thread_id, reply_item_id
+                    )
 
-            def _send() -> Any:
-                kwargs: dict[str, Any] = {}
-                if reply_to_message is not None:
-                    kwargs["reply_to_message"] = reply_to_message
-                if thread_id:
-                    return client.direct_send(text, thread_ids=[int(thread_id)], **kwargs)
-                return client.direct_send(text, user_ids=[int(user_pk)], **kwargs)
+                def _send() -> Any:
+                    kwargs: dict[str, Any] = {}
+                    if reply_to_message is not None:
+                        kwargs["reply_to_message"] = reply_to_message
+                    if thread_id:
+                        return client.direct_send(text, thread_ids=[int(thread_id)], **kwargs)
+                    return client.direct_send(text, user_ids=[int(user_pk)], **kwargs)
 
-            try:
-                result = await asyncio.to_thread(_send)
-                await self._dump_settings(runtime)
-                self._logger.info(
-                    "instagram_pv send_text ok instance=%s chat_id=%s", instance, chat_id
-                )
-                return {
-                    "ok": True,
-                    "message_id": str(getattr(result, "id", "") or ""),
-                    "thread_id": thread_id,
-                }
-            except Exception as exc:
-                self._logger.warning(
-                    "instagram_pv send_text error instance=%s chat_id=%s error=%s",
-                    instance,
-                    chat_id,
-                    exc,
-                )
-                raise
+                try:
+                    try:
+                        result = await asyncio.wait_for(
+                            asyncio.to_thread(_send),
+                            timeout=settings.INSTAGRAM_PV_MEDIA_UPLOAD_TIMEOUT_SECONDS,
+                        )
+                    except asyncio.TimeoutError as exc:
+                        raise TimeoutError(
+                            "Instagram media upload timed out before Instagram acknowledged it"
+                        ) from exc
+                    await self._dump_settings(runtime)
+                    self._logger.info(
+                        "instagram_pv send_text ok instance=%s chat_id=%s", instance, chat_id
+                    )
+                    return self._send_result(result, thread_id)
+                except Exception as exc:
+                    self._logger.warning(
+                        "instagram_pv send_text error instance=%s chat_id=%s error=%s",
+                        instance,
+                        chat_id,
+                        exc,
+                    )
+                    raise
+        finally:
+            runtime.outbound_waiters = max(0, runtime.outbound_waiters - 1)
 
     async def _fetch_direct_message(
         self, runtime: InstagramPvInstanceRuntime, thread_id: str, item_id: str
@@ -611,7 +711,7 @@ class InstagramPvConnector:
 
         def _fetch() -> Any:
             try:
-                return client.direct_message(int(thread_id), int(item_id))
+                return client.direct_message(int(thread_id), int(item_id), amount=0)
             except Exception as exc:
                 self._logger.debug(
                     "instagram_pv fetch_reply_target_failed instance=%s thread=%s item=%s error=%s",
@@ -623,6 +723,14 @@ class InstagramPvConnector:
                 return None
 
         return await asyncio.to_thread(_fetch)
+
+    @staticmethod
+    def _send_result(result: Any, thread_id: Optional[str]) -> dict[str, Any]:
+        item_id = str(getattr(result, "id", "") or "")
+        tid = str(getattr(result, "thread_id", None) or thread_id or "")
+        if not item_id or not tid:
+            raise RuntimeError("Instagram send acknowledgement is missing message/thread ID")
+        return {"ok": True, "message_id": f"{tid}|{item_id}", "thread_id": tid}
 
     async def send_media(
         self,
@@ -643,13 +751,15 @@ class InstagramPvConnector:
         runtime = self._get_runtime(instance)
         client = self._require_client(instance)
 
+        content_type = self._sniff_media_type(media_bytes, filename)
+        self._validate_outbound_media(content_type, filename)
+        caption_result = None
         if caption:
-            await self.send_text(instance, chat_id, caption, quoted=quoted)
-            quoted = None
+            caption_result = await self.send_text(instance, chat_id, caption, quoted=quoted)
 
         suffix = Path(filename or "file").suffix or ""
         tmp_dir = (runtime.session_path.parent / "tmp") if runtime.session_path else Path("./data")
-        tmp_path = tmp_dir / f"ig_{re.sub(r'[^A-Za-z0-9_.-]+', '_', instance)}_{int(time.time() * 1000)}{suffix}"
+        tmp_path = tmp_dir / f"ig_{uuid4().hex}{suffix}"
 
         def _write_tmp() -> None:
             tmp_dir.mkdir(parents=True, exist_ok=True)
@@ -657,11 +767,13 @@ class InstagramPvConnector:
 
         await asyncio.to_thread(_write_tmp)
 
+        runtime.outbound_waiters += 1
         try:
             async with runtime.lock:
                 thread_id, user_pk = self._resolve_thread_id(runtime, chat_id)
                 if thread_id is None and user_pk:
                     thread_id = await self._thread_for_user(runtime, user_pk)
+                await self._approve_pending_thread(runtime, thread_id)
 
                 target_kwargs: dict[str, Any]
                 if thread_id:
@@ -680,7 +792,7 @@ class InstagramPvConnector:
                         return client.direct_send_video(tmp_path, **target_kwargs)
                     if content_type.startswith("audio/"):
                         return client.direct_send_voice(tmp_path, **target_kwargs)
-                    return client.direct_send_file(tmp_path, **target_kwargs)
+                    raise ValueError("Unsupported Instagram media type")
 
                 try:
                     result = await asyncio.to_thread(_send)
@@ -691,11 +803,10 @@ class InstagramPvConnector:
                         chat_id,
                         content_type,
                     )
-                    return {
-                        "ok": True,
-                        "message_id": str(getattr(result, "id", "") or ""),
-                        "thread_id": thread_id,
-                    }
+                    ack = self._send_result(result, thread_id)
+                    if caption_result:
+                        ack["additional_message_ids"] = [caption_result["message_id"]]
+                    return ack
                 except Exception as exc:
                     self._logger.warning(
                         "instagram_pv send_media error instance=%s chat_id=%s error=%s",
@@ -705,6 +816,7 @@ class InstagramPvConnector:
                     )
                     raise
         finally:
+            runtime.outbound_waiters = max(0, runtime.outbound_waiters - 1)
             try:
                 await asyncio.to_thread(tmp_path.unlink, True)
             except Exception:
@@ -722,6 +834,8 @@ class InstagramPvConnector:
         if len(content) > 12 and content[:4] == b"RIFF" and content[8:12] == b"WEBP":
             return "image/webp"
         if len(content) > 8 and content[4:8] == b"ftyp":
+            if content[8:12] in (b"M4A ", b"M4B ") or Path(filename).suffix.lower() in (".m4a", ".m4b"):
+                return "audio/mp4"
             return "video/mp4"
         if content.startswith(b"OggS"):
             return "audio/ogg"
@@ -732,6 +846,46 @@ class InstagramPvConnector:
         guessed = mimetypes.guess_type(str(filename or ""))[0]
         return guessed or "application/octet-stream"
 
+    @staticmethod
+    def _validate_outbound_media(content_type: str, filename: str) -> None:
+        """Reject types the Instagram SDK cannot send as a direct attachment.
+
+        ``direct_send_file`` is only a photo/video convenience method.  Voice
+        messages must be AAC in an M4A container, and the photo/video helpers
+        have the extension and codec constraints below.  Validate before a
+        caption is sent so an invalid attachment never leaves a partial DM.
+        """
+        suffix = Path(filename or "").suffix.lower()
+        if content_type in {"image/jpeg", "image/png", "image/webp"} and suffix in {
+            ".jpg", ".jpeg", ".png", ".webp",
+        }:
+            return
+        if content_type == "video/mp4" and suffix == ".mp4":
+            return
+        if content_type == "audio/mp4" and suffix == ".m4a":
+            return
+
+        if content_type == "image/gif":
+            raise ValueError(
+                "Instagram DMs do not accept GIF files through this connector; "
+                "send a JPG, PNG, WebP photo or an MP4 video instead"
+            )
+        if content_type in {"audio/mpeg", "audio/ogg"} or content_type.startswith("audio/"):
+            raise ValueError(
+                "Instagram DMs require AAC/M4A voice messages; MP3, Ogg and other audio formats are unsupported"
+            )
+        if content_type.startswith("video/"):
+            raise ValueError(
+                "Instagram DMs require an MP4 video encoded with H.264 video and AAC audio"
+            )
+        if content_type.startswith("image/"):
+            raise ValueError(
+                "Instagram DMs support JPG/JPEG, PNG and WebP photos; this image format is unsupported"
+            )
+        raise ValueError(
+            "Instagram DMs support JPG/JPEG, PNG and WebP photos, MP4 videos and M4A/AAC voice messages; this file type is unsupported"
+        )
+
     async def update_message(
         self,
         instance: str,
@@ -739,7 +893,7 @@ class InstagramPvConnector:
         message_id: str,
         text: str,
     ) -> dict[str, Any]:
-        """Instagram DMs cannot be edited; kept for protocol parity."""
+        """The installed SDK lacks DM editing; kept for protocol parity."""
         del instance, chat_id, message_id, text
         return {"ok": False, "description": "instagram_dm_edit_not_supported"}
 
@@ -798,6 +952,10 @@ class InstagramPvConnector:
 
         deadline = now + max(int(timeout or 0), 0)
         while True:
+            interval = max(float(runtime.params.get("instagram_poll_interval") or settings.INSTAGRAM_PV_POLL_INTERVAL_SECONDS), _MIN_FETCH_GAP_SECONDS)
+            remaining = interval - (time.monotonic() - runtime.last_fetch_at)
+            if runtime.last_fetch_at and remaining > 0:
+                await asyncio.sleep(remaining)
             try:
                 updates = await self._fetch_new_messages(runtime)
             except Exception as exc:
@@ -808,12 +966,12 @@ class InstagramPvConnector:
                     name,
                     exc,
                 )
-                if name in ("PleaseWaitFewMinutes", "RateLimitError", "FeedbackRequired"):
+                if name in ("PleaseWaitFewMinutes", "RateLimitError", "FeedbackRequired", "ClientThrottledError"):
                     runtime.rate_limited_until = time.monotonic() + _RATE_LIMIT_COOLDOWN_SECONDS
-                    return {"ok": True, "result": []}
-                if name == "LoginRequired":
+                    return {"ok": False, "description": "Instagram rate limited; polling is paused"}
+                if name in ("LoginRequired", "ChallengeRequired"):
                     runtime.authenticated = False
-                    runtime.auth_detail = "login_required: session expired"
+                    runtime.auth_detail = f"{name}: session needs authentication"
                 return {"ok": False, "description": f"{name}: {exc}"}
 
             if updates:
@@ -832,19 +990,35 @@ class InstagramPvConnector:
     ) -> list[dict[str, Any]]:
         """Fetch the DM inbox once and return updates newer than watermarks."""
         client = self._require_client(runtime.instance)
+        # ``amount=0`` means *all pages* in instagrapi. That turns a routine
+        # inbox poll into an unbounded series of API calls for accounts with a
+        # long DM history, each one holding the send lock. A newly active thread
+        # is at the top of the inbox; its own history is still expanded below
+        # until its watermark is found, preserving at-least-once delivery.
         async with runtime.lock:
             threads = await asyncio.to_thread(
-                client.direct_threads, amount=20, thread_message_limit=10
+                client.direct_threads, amount=20, thread_message_limit=20
             )
-            runtime.last_fetch_at = time.monotonic()
-            await self._dump_settings(runtime)
+
+        pending: list[Any] = []
+        # Pending requests are an auxiliary inbox. Do not make an agent reply
+        # wait behind this second remote request when it is already queued.
+        if runtime.outbound_waiters == 0:
+            async with runtime.lock:
+                if runtime.outbound_waiters == 0:
+                    pending = await asyncio.to_thread(
+                        client.direct_pending_inbox, amount=20
+                    )
+        threads = list({str(t.id): t for t in [*(threads or []), *pending]}.values())
+        runtime.last_fetch_at = time.monotonic()
+        await self._dump_settings(runtime)
 
         updates: list[dict[str, Any]] = []
         self_pk = str(runtime.self_user_id or "")
-        seeded = False
+        staged_watermarks = dict(runtime.pending_watermarks)
 
         for thread in threads or []:
-            thread_id = str(getattr(thread, "thread_id", "") or "")
+            thread_id = str(getattr(thread, "id", None) or getattr(thread, "thread_id", "") or "")
             if not thread_id:
                 continue
 
@@ -867,6 +1041,7 @@ class InstagramPvConnector:
 
             runtime.thread_cache[thread_id] = {
                 "is_group": is_group,
+                "pending": bool(getattr(thread, "pending", False)),
                 "title": title,
                 "users": users,
             }
@@ -888,38 +1063,53 @@ class InstagramPvConnector:
                 return 0
 
             messages.sort(key=_msg_key)
-            newest_id = str(getattr(messages[-1], "id", "") or "")
 
             # Seen baseline = committed watermark or anything already staged
             # by an earlier fetch that the caller has not confirmed yet.
-            pending = runtime.pending_watermarks.get(thread_id)
+            pending = staged_watermarks.get(thread_id)
             watermark = pending or runtime.watermarks.get(thread_id)
-            if watermark is None:
-                # First time we see this thread: record the watermark without
-                # emitting history, so Chatwoot is not flooded with old
-                # messages on (re)start. Seeding is committed immediately.
-                runtime.watermarks[thread_id] = newest_id
-                seeded = True
-                continue
-
             watermark_key = int(watermark) if str(watermark).isdigit() else 0
+            # Expand the window until it includes the delivery checkpoint.
+            # direct_messages paginates internally; amount=0 means all history.
+            def newer(msg: Any) -> bool:
+                if watermark is not None:
+                    return _msg_key(msg) > watermark_key
+                ts = getattr(msg, "timestamp", None)
+                return ts is None or ts.timestamp() >= runtime.sync_since
+
+            limit = max(len(messages) * 2, 40)
+            while messages and newer(messages[0]):
+                async with runtime.lock:
+                    expanded = await asyncio.to_thread(client.direct_messages, int(thread_id), amount=limit)
+                expanded = sorted(expanded or [], key=_msg_key)
+                messages = expanded
+                if len(expanded) < limit:
+                    break
+                limit *= 2
+
             for msg in messages:
                 msg_id = str(getattr(msg, "id", "") or "")
                 if not msg_id:
                     continue
-                if _msg_key(msg) <= watermark_key:
+                if not newer(msg):
+                    if watermark is None:
+                        staged_watermarks[thread_id] = msg_id
                     continue
                 item_type = str(getattr(msg, "item_type", "") or "").strip()
                 if item_type in _SKIP_ITEM_TYPES:
-                    runtime.pending_watermarks[thread_id] = msg_id
+                    staged_watermarks[thread_id] = msg_id
                     continue
                 update = self._build_update(runtime, thread_id, is_group, title, users, msg, self_pk)
-                runtime.pending_watermarks[thread_id] = msg_id
+                staged_watermarks[thread_id] = msg_id
                 if update is not None:
                     updates.append(update)
 
-        if seeded:
-            await self._persist_watermarks(runtime)
+        # A later thread can fail during catch-up. Do not stage any message
+        # until the complete batch can be returned to the delivery service.
+        runtime.pending_watermarks = staged_watermarks
+        # Persist the initial cutoff even for an empty inbox. Unknown threads
+        # arriving later (including after restart) are then delivered normally.
+        await self._persist_watermarks(runtime)
 
         if updates:
             updates.sort(key=lambda item: int(item.get("update_id") or 0))
@@ -938,7 +1128,7 @@ class InstagramPvConnector:
         """Convert an instagrapi DirectMessage into a Bot-API-style update."""
         msg_id = str(getattr(msg, "id", "") or "")
         sender_pk = str(getattr(msg, "user_id", "") or "")
-        is_outgoing = bool(self_pk and sender_pk == self_pk)
+        is_outgoing = bool(getattr(msg, "is_sent_by_viewer", False) or (self_pk and sender_pk == self_pk))
         item_type = str(getattr(msg, "item_type", "") or "").strip()
 
         text = str(getattr(msg, "text", "") or "").strip()
@@ -983,6 +1173,9 @@ class InstagramPvConnector:
             "_outgoing": is_outgoing,
         }
         message.update(attachments)
+        reply = getattr(msg, "reply", None)
+        if reply is not None and getattr(reply, "id", None):
+            message["reply_to_message"] = {"message_id": f"{thread_id}|{reply.id}"}
 
         return {"update_id": update_id, "message": message}
 
@@ -998,6 +1191,15 @@ class InstagramPvConnector:
             return json.dumps({"kind": kind, "url": url})
 
         media = getattr(msg, "media", None)
+        if media is not None:
+            for attr, kind, ct in (("audio_url", "voice", "audio/mp4"),
+                                   ("video_url", "video", "video/mp4"),
+                                   ("thumbnail_url", "photo", "image/jpeg")):
+                url = str(getattr(media, attr, None) or "")
+                if url:
+                    ref = {"file_id": _file_id(kind, url), "mime_type": ct}
+                    refs[kind] = [ref] if kind == "photo" else ref
+                    break
         if item_type == "media" and media is not None:
             media_type = getattr(media, "media_type", None)
             video_versions = getattr(media, "video_versions", None) or []
@@ -1021,6 +1223,12 @@ class InstagramPvConnector:
                 refs["voice"] = {"file_id": _file_id("voice", url), "mime_type": "audio/mp4"}
 
         animated = getattr(msg, "animated_media", None)
+        if isinstance(animated, dict):
+            fixed = (animated.get("images") or {}).get("fixed_height") or {}
+            url = fixed.get("mp4") or fixed.get("url")
+            if url:
+                kind = "video" if fixed.get("mp4") else "document"
+                refs[kind] = {"file_id": _file_id(kind, url), "mime_type": "video/mp4" if kind == "video" else "image/gif", "file_name": "animation.mp4" if kind == "video" else "animation.gif"}
         if item_type == "animated_media" and animated is not None:
             images = getattr(animated, "images", None)
             fixed = getattr(images, "fixed_height", None) if images is not None else None
@@ -1033,6 +1241,9 @@ class InstagramPvConnector:
             shared = getattr(msg, attr, None)
             if shared is None:
                 continue
+            url = str(getattr(shared, "thumbnail_url", None) or "")
+            if url:
+                refs.setdefault("photo", [{"file_id": _file_id("photo", url)}])
             image_versions = getattr(shared, "image_versions2", None)
             candidates = getattr(image_versions, "candidates", None) or [] if image_versions else []
             if candidates:
@@ -1091,7 +1302,7 @@ class InstagramPvConnector:
         file_id: str,
     ) -> tuple[bytes, Optional[str], Optional[str]]:
         """Download a DM media payload by its JSON file id."""
-        self._get_runtime(instance)  # ensure instance exists
+        runtime = self._get_runtime(instance)
         try:
             ref = json.loads(str(file_id))
         except (TypeError, ValueError):
@@ -1113,6 +1324,7 @@ class InstagramPvConnector:
             async with httpx.AsyncClient(
                 follow_redirects=True,
                 timeout=settings.INSTAGRAM_PV_MEDIA_DOWNLOAD_TIMEOUT_SECONDS,
+                proxy=runtime.proxy_url,
             ) as client:
                 resp = await client.get(url, headers=headers)
                 resp.raise_for_status()
@@ -1127,7 +1339,7 @@ class InstagramPvConnector:
                 url[:80],
                 exc,
             )
-            return b"", None, None
+            raise RuntimeError("Instagram attachment download failed") from exc
 
     async def get_user_avatar_bytes(
         self,
@@ -1253,15 +1465,14 @@ class InstagramPvConnector:
         Must be called from the worker thread; performs only quick attribute
         writes plus the settings dump.
         """
+        account = client.account_info()
+        if not client.user_id:
+            raise RuntimeError("Instagram checkpoint did not establish a session")
         runtime.client = client
         runtime.authenticated = True
         runtime.auth_detail = "authenticated"
-        runtime.self_user_id = str(getattr(client, "user_id", "") or "") or None
-        try:
-            account = client.account_info()
-            runtime.self_username = str(getattr(account, "username", "") or "") or None
-        except Exception:
-            pass
+        runtime.self_user_id = str(client.user_id)
+        runtime.self_username = str(getattr(account, "username", "") or "") or None
         try:
             client.dump_settings(session_path)
         except Exception:
@@ -1281,13 +1492,17 @@ class InstagramPvConnector:
         ``submit_challenge_code`` to provide the code.
         """
         choice_name = getattr(choice, "name", str(choice))
+        event = runtime.challenge_event
+        if event is None:
+            return None
+        event.clear()
+        runtime.challenge_code = None
         runtime.challenge_state = "code_sent"
         runtime.challenge_choice = choice_name
         runtime.challenge_detail = (
             f"Security code sent via {choice_name.lower()}; enter it in the panel"
         )
-        event = runtime.challenge_event
-        if event is None or not event.wait(timeout=300):
+        if not event.wait(timeout=300):
             return None
         return runtime.challenge_code
 
@@ -1318,7 +1533,7 @@ class InstagramPvConnector:
             ) from exc
 
         username = str(params.get("instagram_username") or "").strip()
-        password = str(params.get("instagram_password") or "").strip()
+        password = str(params.get("instagram_password") or "")
         sessionid = str(params.get("instagram_sessionid") or "").strip()
         if sessionid and "***" in sessionid:
             sessionid = ""  # masked placeholder leaked back from the panel
@@ -1351,7 +1566,8 @@ class InstagramPvConnector:
         proxy_url = self._proxy_url(proxy or params.get("proxy"))
 
         async with runtime.lock:
-            client = Client()
+            client = self._new_client()
+            await self._load_watermarks(runtime)
             try:
                 client.delay_range = [1, 3]
             except Exception:
@@ -1404,6 +1620,13 @@ class InstagramPvConnector:
                         raise RuntimeError(
                             "auth_platform challenge is not supported automatically"
                         )
+                    if ((client.last_json or {}).get("challenge") or {}).get("native_flow"):
+                        runtime.challenge_native_flow = True
+                        self._logger.info(
+                            "instagram_pv native_checkpoint instance=%s", instance
+                        )
+                        return "manual"
+                    runtime.challenge_native_flow = False
                     challenge_context = ((client.last_json or {}).get("challenge") or {}).get(
                         "challenge_context"
                     )
@@ -1527,14 +1750,16 @@ class InstagramPvConnector:
                             client.login_by_sessionid(sessionid)
                             return
                         try:
-                            client.login(username, password)
+                            if not client.login(username, password):
+                                raise RuntimeError("Instagram login returned false")
                         except TwoFactorRequired:
                             verification_code = str(params.get("instagram_verification_code") or "").strip()
                             totp_seed = str(params.get("instagram_totp_seed") or "").strip()
                             code = verification_code or (_totp_code(totp_seed) if totp_seed else "")
                             if not code:
                                 raise
-                            client.login(username, password, verification_code=code)
+                            if not client.login(username, password, verification_code=code):
+                                raise RuntimeError("Instagram two-factor login returned false")
                         except BadPassword:
                             raise RuntimeError("bad_password: Instagram rejected the credentials")
 
@@ -1547,10 +1772,10 @@ class InstagramPvConnector:
                             break
                         except _ManualApprovalPending:
                             _freeze_manual(
-                                "Instagram requires approving this login in the official app "
-                                "(open the app with this account and tap 'It was me', or complete "
-                                "the checkpoint during an instagram.com login), then click "
-                                "'Resume challenge' here — the session is kept frozen for resumption."
+                                "Instagram returned a native checkpoint. It did not issue an "
+                                "email/SMS code or an approval notification for this login. Sign in "
+                                "on instagram.com from a trusted browser, then update this instance "
+                                "with that browser's sessionid and reconnect."
                             )
                             return
                         except ChallengeRequired:
@@ -1590,10 +1815,10 @@ class InstagramPvConnector:
                         last = client.last_json or {}
                         if last.get("bloks_action") and last.get("challenge_context"):
                             _freeze_manual(
-                                "Instagram keeps re-challenging logins for this account "
-                                "(programmatic acknowledge is not enough). Approve the login "
-                                "in the official Instagram app — or complete the checkpoint "
-                                "during an instagram.com login — then click 'Resume challenge'."
+                                "Instagram returned a native checkpoint and did not issue an "
+                                "email/SMS code or an approval notification for this login. Sign in "
+                                "on instagram.com from a trusted browser, then update this instance "
+                                "with that browser's sessionid and reconnect."
                             )
                             return
                         raise RuntimeError(
@@ -1615,7 +1840,13 @@ class InstagramPvConnector:
                     return
 
                 # Success: adopt the client as the live session.
-                self._adopt_client(runtime, client, session_path)
+                try:
+                    self._adopt_client(runtime, client, session_path)
+                except Exception as exc:
+                    runtime.authenticated = False
+                    runtime.challenge_state = "failed"
+                    runtime.challenge_detail = f"Session verification failed: {type(exc).__name__}"
+                    return
                 self._logger.info(
                     "instagram_pv challenge_flow_connected instance=%s self_id=%s",
                     instance,
@@ -1677,6 +1908,8 @@ class InstagramPvConnector:
         client (instagrapi PR #2652) so device/session bindings survive, then
         re-runs the login to fetch the final session cookies.
         """
+        from instagrapi.exceptions import ChallengeRequired
+
         runtime = self._runtimes.get(instance)
         client = runtime.challenge_client if runtime else None
         if (
@@ -1689,7 +1922,7 @@ class InstagramPvConnector:
             )
         params = runtime.params
         username = str(params.get("instagram_username") or "").strip()
-        password = str(params.get("instagram_password") or "").strip()
+        password = str(params.get("instagram_password") or "")
         sessionid = str(params.get("instagram_sessionid") or "").strip()
         if sessionid and "***" in sessionid:
             sessionid = ""
@@ -1698,6 +1931,20 @@ class InstagramPvConnector:
         runtime.challenge_state = "resolving"
         runtime.challenge_detail = "acknowledging the approved checkpoint"
 
+        if runtime.challenge_native_flow and not sessionid:
+            # Native checkpoints do not expose an action that this connector
+            # can safely complete. Retrying private challenge endpoints merely
+            # creates additional invisible checkpoints.
+            runtime.challenge_state = "manual_approval"
+            runtime.challenge_detail = (
+                "Instagram did not issue an approval request or security code for this "
+                "native checkpoint. Update the instance with the sessionid from its trusted "
+                "instagram.com browser session, then use Reconnect."
+            )
+            state = await self.get_connection_state(instance)
+            state["session_file"] = bool(session_path and session_path.exists())
+            return state
+
         def _refresh_bloks_context() -> bool:
             """Reload a live Bloks challenge context onto the frozen client.
 
@@ -1705,10 +1952,10 @@ class InstagramPvConnector:
             (the probe login succeeded outright).
             """
             if sessionid:
-                client.login_by_sessionid(sessionid)
-                return True
+                return bool(client.login_by_sessionid(sessionid))
             try:
-                client.login(username, password)
+                if not client.login(username, password):
+                    raise RuntimeError("Instagram login returned false")
                 return True
             except ChallengeRequired:
                 pass
@@ -1741,15 +1988,17 @@ class InstagramPvConnector:
                 if _refresh_bloks_context():
                     return  # account unlocked already; login done
             client.challenge_bloks_redirect_dismiss()
-            client.login(username, password)
+            if not client.login(username, password):
+                raise RuntimeError("Instagram login returned false")
 
         try:
             await asyncio.to_thread(_resume)
+            await asyncio.to_thread(self._adopt_client, runtime, client, session_path)
         except Exception as exc:
             # Restore a live context so the next Resume click still works.
             try:
-                if _refresh_bloks_context():
-                    self._adopt_client(runtime, client, session_path)
+                if await asyncio.to_thread(_refresh_bloks_context):
+                    await asyncio.to_thread(self._adopt_client, runtime, client, session_path)
                     state = await self.get_connection_state(instance)
                     state["session_file"] = bool(session_path and session_path.exists())
                     return state
@@ -1769,7 +2018,6 @@ class InstagramPvConnector:
             state["session_file"] = bool(session_path and session_path.exists())
             return state
 
-        self._adopt_client(runtime, client, session_path)
         self._logger.info(
             "instagram_pv challenge_resumed_connected instance=%s self_id=%s",
             instance,
@@ -1825,6 +2073,7 @@ class InstagramPvConnector:
                 }
             try:
                 account = await asyncio.to_thread(runtime.client.account_info)
+                await asyncio.to_thread(runtime.client.direct_threads, amount=1, thread_message_limit=1)
             except LoginRequired:
                 runtime.authenticated = False
                 runtime.auth_detail = "login_required: session expired"

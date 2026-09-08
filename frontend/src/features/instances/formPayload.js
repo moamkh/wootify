@@ -30,7 +30,7 @@ export function createPayload(form, { patch = false } = {}) {
   }
   if (form.platform_type_key === PLATFORM_INSTAGRAM_PV_ENTERPRISE) {
     platformMetadata.instagram_username = form.instagram_username?.trim() || undefined;
-    const instagramPassword = form.instagram_password?.trim();
+    const instagramPassword = form.instagram_password;
     if (instagramPassword && !instagramPassword.includes('***')) platformMetadata.instagram_password = instagramPassword;
     const instagramSessionid = form.instagram_sessionid?.trim();
     if (instagramSessionid && !instagramSessionid.includes('***')) platformMetadata.instagram_sessionid = instagramSessionid;

@@ -24,6 +24,7 @@ data/tmp-enterprise-smoke/
 
 # Bale PV session files (contain auth tokens — never commit)
 data/bale_pv_sessions/
+data/instagram_pv_sessions/
 
 # AI-agent debug/diagnostic scripts (safe to delete manually)
 _tmp_check_self.py

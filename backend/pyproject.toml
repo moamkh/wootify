@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "wootify"
-version = "6.0.2"
+version = "6.0.3"
 description = "Chatwoot messaging-platform connector and instance manager"
 requires-python = ">=3.11"
 dependencies = [
@@ -27,7 +27,7 @@ dependencies = [
   "python-telegram-bot>=22,<23",
   "websockets>=15.0",
   "protobuf>=4.0",
-  "instagrapi>=2.1.0",
+  "instagrapi==2.18.17",
 ]
 
 [tool.hatch.build.targets.wheel]

@@ -40,6 +40,8 @@ BALE_PV_ENTERPRISE_CAPABILITIES = {
     'reply_sync': True,
     'inbound_polling': True,
     'mark_as_read': False,
+    'edit_message': True,
+    'delete_message': True,
 }
 
 INSTAGRAM_PV_ENTERPRISE_CAPABILITIES = {
@@ -48,6 +50,9 @@ INSTAGRAM_PV_ENTERPRISE_CAPABILITIES = {
     'reply_sync': True,
     'inbound_polling': True,
     'mark_as_read': False,
+    # Instagram's personal-DM SDK supports unsend, but has no edit endpoint.
+    'edit_message': False,
+    'delete_message': True,
 }
 
 TELEGRAM_CAPABILITIES = {
@@ -100,7 +105,7 @@ BALE_PV_ENTERPRISE_METADATA_SCHEMA: dict[str, Any] = {
 
 INSTAGRAM_PV_ENTERPRISE_METADATA_SCHEMA: dict[str, Any] = {
     'type': 'object',
-    'required': ['instagram_username', 'instagram_password'],
+    'anyOf': [{'required': ['instagram_username', 'instagram_password']}, {'required': ['instagram_sessionid']}],
     'properties': {
         'instagram_username': {'type': 'string'},
         'instagram_password': {'type': 'string'},

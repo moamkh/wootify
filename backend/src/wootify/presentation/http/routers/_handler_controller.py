@@ -644,7 +644,11 @@ async def configure_chatwoot_webhook(instance_key: str, db: Session = Depends(ge
 
 
 @router.post('/webhooks/chatwoot/{instance_key}', response_model=GenericMessageResponse)
-async def webhook_chatwoot(instance_key: str, payload: dict[str, Any], db: Session = Depends(get_db)):
+async def webhook_chatwoot(
+    instance_key: str,
+    payload: dict[str, Any],
+    db: Session = Depends(get_db),
+):
     """Webhook chatwoot."""
     return await _handle_chatwoot_webhook(db, instance_key, payload, route_key=None)
 
@@ -1500,6 +1504,21 @@ async def _deliver_chatwoot_webhook_background(
             result = await chatwoot_bridge.handle_chatwoot_webhook(db, resolved_instance_key, payload)
         else:
             result = await bridge.receive_chatwoot_webhook(db, resolved_instance_key, payload)
+        # The endpoint acknowledges callbacks before platform delivery. Record
+        # the result without message content so an ignored outbound webhook is
+        # distinguishable from a successful Instagram/Bale send in local logs.
+        logger.info(
+            'endpoint=webhook_chatwoot background_delivery_result instance_key=%s route_key=%s event=%s message_id=%s conversation_id=%s message_type=%s ok=%s ignored=%s reason=%s',
+            resolved_instance_key,
+            route_key,
+            payload.get('event'),
+            payload.get('id') or (payload.get('message') or {}).get('id'),
+            (payload.get('conversation') or {}).get('id') or payload.get('conversation_id'),
+            payload.get('message_type') or (payload.get('message') or {}).get('message_type'),
+            result.get('ok') if isinstance(result, dict) else None,
+            result.get('ignored') if isinstance(result, dict) else None,
+            result.get('reason') if isinstance(result, dict) else None,
+        )
         _log_delivery_result(resolved_instance_key, route_key, result)
     except Exception as exc:
         logger.exception(
@@ -1563,6 +1582,15 @@ async def _handle_chatwoot_webhook(
     try:
         runtime = _resolve_chatwoot_webhook_runtime(db, instance_key, payload)
         inbox_id, inbox_name = _extract_chatwoot_webhook_inbox(payload)
+        logger.info(
+            'endpoint=webhook_chatwoot received instance_key=%s event=%s message_id=%s conversation_id=%s message_type=%s inbox_id=%s',
+            instance_key,
+            payload.get('event'),
+            payload.get('id') or (payload.get('message') or {}).get('id'),
+            (payload.get('conversation') or {}).get('id') or payload.get('conversation_id'),
+            payload.get('message_type') or (payload.get('message') or {}).get('message_type'),
+            inbox_id,
+        )
         # Chatwoot account webhooks are account-wide.  Every configured
         # Wootify callback therefore receives every event for that account;
         # the callback URL alone is not proof that the event belongs to its
@@ -1588,6 +1616,10 @@ async def _handle_chatwoot_webhook(
                 status='ignored',
             )
         resolved_instance_key = runtime.instance.instance_key
+        # Instagram polling owns the same stateful client and can temporarily
+        # hold its lock while an inbox request finishes. Acknowledge Chatwoot
+        # first, then retain the guarded task until it has delivered or timed
+        # out. The persisted mapping makes Chatwoot retries idempotent.
         task = asyncio.create_task(
             _deliver_chatwoot_webhook_guarded(
                 runtime.platform_type.key,
