@@ -99,6 +99,19 @@ class ChatwootBridgeService:
         if platform_key == "instagram_pv_enterprise" and bool(event.get("outgoing")):
             return {"ok": True, "ignored": True, "reason": "platform_outgoing_echo"}
 
+        # A first-party Bale security notice is not a customer message.  Drop it
+        # before contact lookup: Chatwoot contact search is fuzzy, so allowing a
+        # short system peer ID through could attach the notice to a real customer
+        # and fire that inbox's automations.
+        if platform_key == "bale_pv_enterprise" and bool(event.get("system_notice")):
+            logger.info(
+                "chatwoot_bridge.system_notice_ignored instance=%s message_id=%s chat_id=%s",
+                instance_key,
+                event.get("message_id"),
+                event.get("chat_id"),
+            )
+            return {"ok": True, "ignored": True, "reason": "bale_system_notice"}
+
         # Proactively resolve group/channel titles if the name still looks generic.
         # This handles cases where the connector's title cache missed and the
         # on-demand resolution in get_updates also failed or was skipped.
@@ -782,11 +795,18 @@ class ChatwootBridgeService:
         try:
             found = await client.search_contacts(account_id, prefixed_identifier)
             payload = found.get("payload") if isinstance(found, dict) else None
-            if isinstance(payload, list) and payload:
-                first = payload[0] if isinstance(payload[0], dict) else {}
-                cid = self._extract_id(first)
-                if cid:
-                    return int(cid), False
+            if isinstance(payload, list):
+                # Chatwoot contact search is fuzzy. A lookup for ``BALE_PV:10``
+                # can return ``BALE_PV:1026491874``; never treat that as an
+                # identity match just because it is the first result.
+                for candidate in payload:
+                    if not isinstance(candidate, dict):
+                        continue
+                    if str(candidate.get("identifier") or "") != prefixed_identifier:
+                        continue
+                    cid = self._extract_id(candidate)
+                    if cid:
+                        return int(cid), False
         except Exception:
             pass
 

@@ -1467,7 +1467,7 @@ async def test_ingest_recovers_from_missing_conversation(db_session):
     )
     client.list_contact_conversations = AsyncMock(return_value=[])
     client.create_conversation = AsyncMock(return_value={"id": new_conv_id})
-    client.search_contacts = AsyncMock(return_value={"payload": [{"id": contact_id}]})
+    client.search_contacts = AsyncMock(return_value={"payload": [{"id": contact_id, "identifier": "BALE_PV:770408072"}]})
 
     event = {
         "chat_id": "770408072",
@@ -2108,7 +2108,7 @@ async def test_ingest_skips_duplicate_platform_message_before_posting(db_session
     client = AsyncMock()
     client.post_message = AsyncMock(return_value={"id": 12345})
     client.post_message_with_attachments = AsyncMock(return_value={"id": 12345})
-    client.search_contacts = AsyncMock(return_value={"payload": [{"id": contact_id}]})
+    client.search_contacts = AsyncMock(return_value={"payload": [{"id": contact_id, "identifier": "BALE_PV:770408072"}]})
 
     event = {
         "chat_id": "770408072",
@@ -2193,7 +2193,7 @@ async def test_ingest_posts_edit_as_reply_when_text_changes(db_session):
     client = AsyncMock()
     client.post_message = AsyncMock(return_value={"id": 1111})
     client.post_message_with_attachments = AsyncMock(return_value={"id": 1111})
-    client.search_contacts = AsyncMock(return_value={"payload": [{"id": contact_id}]})
+    client.search_contacts = AsyncMock(return_value={"payload": [{"id": contact_id, "identifier": "BALE_PV:770408072"}]})
 
     event = {
         "chat_id": "770408072",
@@ -2478,6 +2478,32 @@ def test_parse_raw_update_text_message_not_flagged():
     assert parsed["message"]["text"] == "hello"
 
 
+def test_parse_raw_update_text_from_bale_system_peer_is_flagged():
+    """Text-bearing Bale security notices must not look like customer traffic."""
+    from bale_pv_connector.messaging_messages import Peer, TextMessage
+    from bale_pv_connector.protobuf_wire import ProtobufMessage
+    from bale_pv_connector.update_parser import BaleUpdateType
+
+    msg = ProtobufMessage()
+    msg.add_message(15, TextMessage("New login to your Bale account"))
+    update = ProtobufMessage()
+    update.add_bytes(1, Peer(10).serialize())
+    update.add_int32(2, 10)
+    update.add_int64(4, 1001)
+    update.add_bytes(5, msg.serialize())
+    wrapper = ProtobufMessage()
+    wrapper.add_bytes(BaleUpdateType.NEW_MESSAGE, update.serialize())
+    inner = ProtobufMessage()
+    inner.add_bytes(1, wrapper.serialize())
+    outer = ProtobufMessage()
+    outer.add_bytes(1, inner.serialize())
+
+    parsed = BalePvConnector._parse_raw_update(outer.serialize(), user_cache={10: "Bale"}, self_user_id=999)
+    assert parsed is not None
+    assert parsed["message"]["_system_notice"] is True
+    assert parsed["message"]["text"] == "New login to your Bale account"
+
+
 def test_adapter_normalize_marks_service_notice():
     adapter = BalePvAdapter("test", {"bale_pv_phone_number": "989136421196"})
     raw = {
@@ -2496,6 +2522,23 @@ def test_adapter_normalize_marks_service_notice():
     assert event["service_notice"] is True
     assert event["from_name"] == "Sara"
     assert event["outgoing"] is False
+
+
+def test_adapter_normalize_marks_system_notice():
+    adapter = BalePvAdapter("test", {"bale_pv_phone_number": "989136421196"})
+    event = adapter.normalize_incoming_update({
+        "update_id": 128,
+        "message": {
+            "message_id": "1001",
+            "date": 1,
+            "chat": {"id": "10", "type": "private", "title": "Bale"},
+            "from": {"id": 10, "first_name": "Bale"},
+            "text": "New login",
+            "_system_notice": True,
+        },
+    })
+    assert event is not None
+    assert event["system_notice"] is True
 
 
 def test_adapter_normalize_normal_message_not_service_notice():
@@ -2583,12 +2626,67 @@ async def test_ingest_service_notice_creates_contact_only(db_session):
 
 
 @pytest.mark.anyio
+async def test_ingest_bale_system_notice_skips_contact_and_conversation(db_session):
+    """Bale's own security messages must never trigger customer automations."""
+    instance = _make_bridge_instance(db_session, "bale-pv-system-notice")
+    client = AsyncMock()
+    event = {
+        "chat_id": "10",
+        "chat_type": "private",
+        "from_name": "Bale",
+        "text": "New login to your Bale account",
+        "message_id": "1003",
+        "platform_message_id": "1003",
+        "outgoing": False,
+        "system_notice": True,
+    }
+
+    with patch.object(
+        chatwoot_bridge,
+        "_chatwoot_client_for_instance",
+        return_value=(instance, {"account_id": 1, "inbox_id": 5}, client),
+    ):
+        result = await chatwoot_bridge.ingest_platform_event(
+            db_session, "bale-pv-system-notice", event
+        )
+
+    assert result == {"ok": True, "ignored": True, "reason": "bale_system_notice"}
+    client.search_contacts.assert_not_awaited()
+    client.create_contact.assert_not_awaited()
+    client.create_conversation.assert_not_awaited()
+    client.post_message.assert_not_awaited()
+
+
+@pytest.mark.anyio
+async def test_contact_lookup_requires_exact_platform_identifier():
+    """A fuzzy Chatwoot result must not attach a short Bale ID to another user."""
+    client = AsyncMock()
+    client.search_contacts = AsyncMock(return_value={
+        "payload": [
+            {"id": 4445, "identifier": "BALE_PV:1026491874"},
+            {"id": 77, "identifier": "BALE_PV:10"},
+        ]
+    })
+
+    contact_id, created = await chatwoot_bridge._get_or_create_contact(
+        client,
+        account_id=1,
+        inbox_id=5,
+        chat_id="10",
+        from_name="Bale",
+    )
+
+    assert (contact_id, created) == (77, False)
+    client.create_contact.assert_not_awaited()
+
+
+@pytest.mark.anyio
 async def test_ingest_service_notice_repeated_does_not_duplicate(db_session):
     """Retransmitted notices for a known contact stay conversation-free."""
     instance = _make_bridge_instance(db_session, "bale-pv-notice2")
 
     client = AsyncMock()
-    client.search_contacts = AsyncMock(return_value={"payload": [{"id": 77}]})
+    client.search_contacts = AsyncMock(return_value={"payload": [{"id": 77, "identifier": "BALE_PV:456"}]})
 
     event = {
         "chat_id": "456",
@@ -2622,7 +2720,7 @@ async def test_ingest_outgoing_echo_unaffected_by_flag(db_session):
     instance = _make_bridge_instance(db_session, "bale-pv-notice3")
 
     client = AsyncMock()
-    client.search_contacts = AsyncMock(return_value={"payload": [{"id": 77}]})
+    client.search_contacts = AsyncMock(return_value={"payload": [{"id": 77, "identifier": "BALE_PV:456"}]})
     client.list_contact_conversations = AsyncMock(return_value=[])
     client.create_conversation = AsyncMock(return_value={"id": 116})
     client.post_message = AsyncMock(return_value={"id": 12345})

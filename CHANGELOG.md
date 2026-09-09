@@ -1,5 +1,17 @@
 # Changelog
 
+## 6.0.4 — 2026-09-09
+
+### Bale PV hotfix
+
+- Prevented Bale first-party security notices (login-code and connected-device
+  alerts) from being created as customer messages in Chatwoot.
+- Required an exact platform contact identifier after Chatwoot's fuzzy contact
+  search, preventing short Bale system IDs from being attached to unrelated
+  customer contacts and triggering inbox automations.
+- Added regression coverage for system notices, normal customer text, and
+  exact-identifier contact resolution.
+
 ## 6.0.3 — 2026-09-09
 
 ### Instagram PV

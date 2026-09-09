@@ -303,6 +303,9 @@ class BalePvAdapter(BasePlatformAdapter):
             # "<name> joined Bale" contact-registered notice). The bridge uses
             # this to create/refresh the contact without opening a conversation.
             "service_notice": bool(message.get("_service_notice")),
+            # True only for first-party Bale notices (OTP/device-login alerts).
+            # These must not be represented as a customer contact or message.
+            "system_notice": bool(message.get("_system_notice")),
             "raw": raw_update,
         }
 

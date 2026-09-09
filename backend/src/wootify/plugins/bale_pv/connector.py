@@ -60,6 +60,12 @@ FILE_DOWNLOAD_MAX_ATTEMPTS = 3
 FILE_DOWNLOAD_RETRY_BACKOFF_SECONDS = 0.5
 FILE_DOWNLOAD_RETRYABLE_STATUSES = frozenset({500, 502, 503, 504})
 
+# Bale's first-party service account. Security notices (OTP warnings and
+# connected-device alerts) arrive as ordinary-looking private text messages
+# from this peer, but they are not customer messages and must not enter a
+# Chatwoot customer conversation.
+BALE_SYSTEM_USER_IDS = frozenset({10})
+
 
 # ---------------------------------------------------------------------------
 # Lazy importers — deferred to avoid heavy gRPC dependencies at module load
@@ -1707,6 +1713,14 @@ class BalePvConnector:
         # the empty conversation fires inbox automations (greeting/auto-message)
         # toward the user.
         service_notice = not text and not media
+        # Bale security notices are text-bearing messages from its own reserved
+        # direct peer.  Keep this distinct from generic service notices: the
+        # bridge must not create even a contact for a platform system message.
+        system_notice = (
+            peer_type == 1
+            and sender_uid in BALE_SYSTEM_USER_IDS
+            and peer_id == sender_uid
+        )
         if service_notice:
             logger.info(
                 "bale_pv service_notice_detected sender_uid=%s peer_type=%s chat_id=%s rid=%s outgoing=%s edited=%s",
@@ -1733,6 +1747,8 @@ class BalePvConnector:
             message["_sender_access_hash"] = sender_access_hash
         if service_notice:
             message["_service_notice"] = True
+        if system_notice:
+            message["_system_notice"] = True
         if is_outgoing:
             message["_outgoing"] = True
         if is_edited:
