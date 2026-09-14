@@ -132,6 +132,12 @@ export default function InstanceFormPanel({
   onBalePvSendCode,
   onBalePvValidateCode,
   onBalePvAuthStatus,
+  eitaaPvAuthCode,
+  setEitaaPvAuthCode,
+  eitaaPvAuthLoading,
+  onEitaaPvSendCode,
+  onEitaaPvValidateCode,
+  onEitaaPvAuthStatus,
   instagramCheckLoading,
   instagramCheckResult,
   onInstagramPvCheck,
@@ -390,6 +396,54 @@ export default function InstanceFormPanel({
                 onChange={(e) => setForm((s) => ({ ...s, bale_pv_share_phone_prompt_text: e.target.value }))}
               />
             </label>
+          </>
+        ) : null}
+
+        {form.platform_type_key === 'eitaa_pv_enterprise' ? (
+          <>
+            <h3>Eitaa PV (Personal Account)</h3>
+            <p className="muted">Uses Eitaa Web's TL-over-HTTPS session protocol. Save the instance, then use the Eitaa authentication controls in the instance workspace.</p>
+            <div className="row">
+              <label>
+                Phone Number
+                <input value={form.eitaa_pv_phone_number} onChange={(e) => setForm((s) => ({ ...s, eitaa_pv_phone_number: e.target.value }))} placeholder="e.g. 09123456711" />
+              </label>
+              <label>
+                Poll Interval
+                <input value={form.eitaa_pv_poll_interval} onChange={(e) => setForm((s) => ({ ...s, eitaa_pv_poll_interval: e.target.value }))} />
+              </label>
+            </div>
+            <div className="row">
+              <label>
+                Display Name
+                <input value={form.eitaa_pv_display_name} onChange={(e) => setForm((s) => ({ ...s, eitaa_pv_display_name: e.target.value }))} />
+              </label>
+              <label>
+                Department
+                <input value={form.eitaa_pv_department} onChange={(e) => setForm((s) => ({ ...s, eitaa_pv_department: e.target.value }))} />
+              </label>
+            </div>
+            <label>
+              Endpoint Override (optional)
+              <input value={form.eitaa_pv_endpoint} onChange={(e) => setForm((s) => ({ ...s, eitaa_pv_endpoint: e.target.value }))} placeholder="Uses Eitaa's production pool by default" />
+            </label>
+            {selectedKey ? (
+              <div className="form-section-block">
+                <h4>Authentication</h4>
+                <div className="row">
+                  <button type="button" className="btn" disabled={busy || eitaaPvAuthLoading} onClick={() => onEitaaPvSendCode(selectedKey)}>
+                    {eitaaPvAuthLoading ? 'Sending...' : 'Send Eitaa Code'}
+                  </button>
+                  <button type="button" className="btn secondary" disabled={busy || eitaaPvAuthLoading} onClick={() => onEitaaPvAuthStatus(selectedKey)}>Check Status</button>
+                </div>
+                <div className="row" style={{ marginTop: 8 }}>
+                  <label style={{ flex: 1 }}>Code<input value={eitaaPvAuthCode} onChange={(e) => setEitaaPvAuthCode(e.target.value)} placeholder="Enter Eitaa code" /></label>
+                  <button type="button" className="btn primary" disabled={busy || eitaaPvAuthLoading || !eitaaPvAuthCode.trim()} onClick={() => onEitaaPvValidateCode(selectedKey, eitaaPvAuthCode.trim())}>
+                    {eitaaPvAuthLoading ? 'Validating...' : 'Validate Code'}
+                  </button>
+                </div>
+              </div>
+            ) : null}
           </>
         ) : null}
 
@@ -763,7 +817,7 @@ export default function InstanceFormPanel({
           Account ID
           <input value={form.chatwoot_account_id} onChange={(e) => setForm((s) => ({ ...s, chatwoot_account_id: e.target.value }))} />
         </label>
-        {isStandardBalePlatform || isBalePvPlatform || isInstagramPvPlatform ? (
+        {isStandardBalePlatform || isBalePvPlatform || form.platform_type_key === 'eitaa_pv_enterprise' || isInstagramPvPlatform ? (
           <>
             <div className="row">
               <label>
@@ -783,14 +837,14 @@ export default function InstanceFormPanel({
               <input type="checkbox" checked={form.chatwoot_reopen_conversation} onChange={(e) => setForm((s) => ({ ...s, chatwoot_reopen_conversation: e.target.checked }))} />
               Reopen resolved Chatwoot conversation on inbound reply
             </label>
-            {(isBalePvPlatform || isInstagramPvPlatform) && selectedKey ? (
+            {(isBalePvPlatform || form.platform_type_key === 'eitaa_pv_enterprise' || isInstagramPvPlatform) && selectedKey ? (
               <button type="button" className="btn" disabled={busy || !selectedKey} onClick={() => onCreateInbox(selectedKey)}>
                 Create or Link Inbox
               </button>
             ) : null}
           </>
         ) : null}
-        {isBalePlatform || isInstagramPvPlatform || isTelegramPlatform ? (
+        {isBalePlatform || form.platform_type_key === 'eitaa_pv_enterprise' || isInstagramPvPlatform || isTelegramPlatform ? (
           <div className="form-section-block">
             {isBalePvPlatform ? <h3>Bale PV deletion sync</h3> : null}
             <label>

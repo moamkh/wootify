@@ -3,6 +3,7 @@ import {
   PLATFORM_BALE,
   PLATFORM_BALE_ENTERPRISE,
   PLATFORM_BALE_PV_ENTERPRISE,
+  PLATFORM_EITAA_PV_ENTERPRISE,
   PLATFORM_INSTAGRAM_PV_ENTERPRISE,
   PLATFORM_TELEGRAM,
   PLATFORM_TELEGRAM_ENTERPRISE,
@@ -27,6 +28,14 @@ export function createPayload(form, { patch = false } = {}) {
     platformMetadata.bale_pv_share_phone_prompt_enabled = Boolean(form.bale_pv_share_phone_prompt_enabled);
     platformMetadata.bale_pv_share_phone_prompt_only_if_missing_phone = Boolean(form.bale_pv_share_phone_prompt_only_if_missing_phone);
     platformMetadata.bale_pv_share_phone_prompt_text = form.bale_pv_share_phone_prompt_text?.trim() || undefined;
+  }
+  if (form.platform_type_key === PLATFORM_EITAA_PV_ENTERPRISE) {
+    platformMetadata.eitaa_pv_phone_number = form.eitaa_pv_phone_number?.trim() || undefined;
+    platformMetadata.eitaa_pv_session_dir = form.eitaa_pv_session_dir?.trim() || undefined;
+    platformMetadata.eitaa_pv_poll_interval = Number(form.eitaa_pv_poll_interval) > 0 ? Number(form.eitaa_pv_poll_interval) : undefined;
+    platformMetadata.eitaa_pv_display_name = form.eitaa_pv_display_name?.trim() || undefined;
+    platformMetadata.eitaa_pv_department = form.eitaa_pv_department?.trim() || undefined;
+    platformMetadata.eitaa_pv_endpoint = form.eitaa_pv_endpoint?.trim() || undefined;
   }
   if (form.platform_type_key === PLATFORM_INSTAGRAM_PV_ENTERPRISE) {
     platformMetadata.instagram_username = form.instagram_username?.trim() || undefined;
@@ -111,7 +120,7 @@ export function createPayload(form, { patch = false } = {}) {
   if (form.platform_type_key === PLATFORM_BALE_ENTERPRISE && enterpriseSmsToken && !enterpriseSmsToken.includes('***')) payload.platform_metadata.enterprise_sms_api_token = enterpriseSmsToken;
   const telegramToken = form.telegram_token?.trim();
   if ((form.platform_type_key === PLATFORM_TELEGRAM || form.platform_type_key === PLATFORM_TELEGRAM_ENTERPRISE) && telegramToken && !telegramToken.includes('***')) payload.platform_metadata.telegram_token = telegramToken;
-  if (form.platform_type_key === PLATFORM_BALE_PV_ENTERPRISE || form.platform_type_key === PLATFORM_INSTAGRAM_PV_ENTERPRISE) {
+  if (form.platform_type_key === PLATFORM_BALE_PV_ENTERPRISE || form.platform_type_key === PLATFORM_EITAA_PV_ENTERPRISE || form.platform_type_key === PLATFORM_INSTAGRAM_PV_ENTERPRISE) {
     payload.chatwoot.inbox_id = Number(form.chatwoot_inbox_id) > 0 ? Number(form.chatwoot_inbox_id) : undefined;
     payload.chatwoot.inbox_name = form.chatwoot_inbox_name?.trim() || undefined;
     payload.chatwoot.auto_create = Boolean(form.chatwoot_auto_create);

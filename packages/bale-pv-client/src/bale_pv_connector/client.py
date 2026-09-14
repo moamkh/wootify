@@ -297,6 +297,12 @@ class BaleClient:
             raise BaleConnectionError("Client is not connected/authenticated")
         return await self._messaging_client.message_read(peer_id, max_id)
 
+    async def stop_typing(self, peer_id: int) -> None:
+        """Clear a peer typing indicator through the messaging service."""
+        if not self._messaging_client:
+            raise BaleConnectionError("Client is not connected/authenticated")
+        await self._messaging_client.stop_typing(peer_id)
+
     # ------------------------------------------------------------------
     # Updates
     # ------------------------------------------------------------------

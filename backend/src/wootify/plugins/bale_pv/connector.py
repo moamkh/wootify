@@ -132,10 +132,14 @@ class BalePvInstanceRuntime:
     transaction_hash: Optional[str] = None
     session_id: Optional[str] = None  # UUID that scopes the on-disk session file
     user_cache: Dict[int, str] = field(default_factory=dict)  # uid -> display name
+    contact_name_cache: Dict[int, str] = field(default_factory=dict)
+    name_lookup_retry_at: Dict[int, float] = field(default_factory=dict)
     chat_title_cache: Dict[int, str] = field(default_factory=dict)  # peer_id -> title
     group_access_hash_cache: Dict[int, int] = field(default_factory=dict)  # group_id -> access_hash
     self_user_id: Optional[int] = None  # extracted from JWT payload after login
     last_user_cache_refresh: float = 0.0  # unix timestamp of last bulk user refresh
+    pending_read_message_ids: Dict[str, int] = field(default_factory=dict)
+    read_message_ids: Dict[str, int] = field(default_factory=dict)
 
 
 class BalePvConnector:
@@ -638,6 +642,23 @@ class BalePvConnector:
                 chat_id,
             )
             raise RuntimeError(f"send_text failed: {exc}") from exc
+
+    async def prepare_outbound(self, instance: str, chat_id: str) -> None:
+        """Acknowledge pending inbound messages once before an agent reply."""
+        runtime = self._get_runtime(instance)
+        max_id = runtime.pending_read_message_ids.get(str(chat_id), 0)
+        if not max_id or runtime.read_message_ids.get(str(chat_id), 0) >= max_id:
+            return
+        if runtime.client is None:
+            raise RuntimeError("Bale PV messaging client is not connected")
+        await runtime.client.mark_read(int(chat_id), max_id)
+        runtime.read_message_ids[str(chat_id)] = max_id
+
+    async def finish_outbound(self, instance: str, chat_id: str) -> None:
+        """Clear a Bale typing state if the active protocol client exposed one."""
+        runtime = self._get_runtime(instance)
+        if runtime.client is not None:
+            await runtime.client.stop_typing(int(chat_id))
 
     async def resolve_phone_to_user(
         self,
@@ -1364,6 +1385,15 @@ class BalePvConnector:
             instance,
             len(updates),
         )
+        for update in updates:
+            message = update.get("message") if isinstance(update, dict) else None
+            if not isinstance(message, dict) or bool(message.get("_outgoing")):
+                continue
+            peer_id = message.get("chat", {}).get("id") if isinstance(message.get("chat"), dict) else None
+            message_id = message.get("message_id")
+            if peer_id is not None and str(message_id or "").isdigit():
+                key = str(peer_id)
+                runtime.pending_read_message_ids[key] = max(runtime.pending_read_message_ids.get(key, 0), int(message_id))
         return {
             "ok": True,
             "result": updates,
@@ -1397,12 +1427,21 @@ class BalePvConnector:
             message = update.get("message") or update
             sender = message.get("from") or {}
             uid = sender.get("id")
+            chat = message.get("chat") or {}
+            outgoing_private = bool(message.get("_outgoing")) and chat.get("type") == "private"
+            if outgoing_private:
+                # The sender is us. Resolve the recipient instead, and never
+                # attach our sender access hash to the recipient's identity.
+                peer_id = str(chat.get("id") or "")
+                uid = int(peer_id) if peer_id.isdigit() else None
             if not isinstance(uid, int):
                 continue
             if uid in runtime.user_cache:
                 continue
+            if runtime.name_lookup_retry_at.get(uid, 0) > time.time():
+                continue
             unknown_uids.add(uid)
-            access_hash = message.get("_sender_access_hash") or message.get("sender_access_hash")
+            access_hash = None if outgoing_private else message.get("_sender_access_hash") or message.get("sender_access_hash")
             if isinstance(access_hash, int):
                 uid_to_access_hash[uid] = access_hash
 
@@ -1421,9 +1460,15 @@ class BalePvConnector:
                 if not isinstance(uid, int):
                     continue
                 result[uid] = user
-                name = user.get("name") or user.get("nick")
+                local_name = str(user.get("local_name") or "").strip()
+                if local_name:
+                    runtime.contact_name_cache[uid] = local_name
+                name = runtime.contact_name_cache.get(uid) or user.get("name") or user.get("nick")
                 if name:
                     runtime.user_cache[uid] = str(name).strip()
+                    runtime.name_lookup_retry_at.pop(uid, None)
+                else:
+                    result.pop(uid, None)
 
         self._logger.info(
             "bale_pv resolving_unknown_senders instance=%s count=%s",
@@ -1515,6 +1560,8 @@ class BalePvConnector:
                     exc,
                 )
 
+        for uid in unknown_uids - set(runtime.user_cache):
+            runtime.name_lookup_retry_at[uid] = time.time() + 60
         return result
 
     @staticmethod
@@ -1656,7 +1703,7 @@ class BalePvConnector:
         cached_name = ""
         if user_cache and isinstance(sender_uid, int):
             cached_name = user_cache.get(sender_uid, "")
-        display_name = info.get("name") or cached_name
+        display_name = info.get("local_name") or cached_name or info.get("name")
         nick = info.get("nick")
         username = nick or display_name or f"user_{sender_uid}"
         # Prefer the resolved display name. If none is available, fall back to
@@ -2461,7 +2508,7 @@ class BalePvConnector:
         runtime = self._instances.get(instance)
         if not runtime:
             return None
-        return runtime.user_cache.get(user_id)
+        return runtime.contact_name_cache.get(user_id) or runtime.user_cache.get(user_id)
 
     async def get_user_avatar_bytes(
         self,
@@ -3061,6 +3108,9 @@ class BalePvConnector:
                         "description": f"grpc_error_{status}",
                     }
 
+                from bale_pv_connector.dialog_parser import parse_get_contacts_response, parse_load_users_response
+                parsed_contacts = parse_get_contacts_response(msg)
+                profiles = {int(user["id"]): user for user in parsed_contacts["users"] if isinstance(user.get("id"), int)}
                 fields = ProtobufParser(msg).parse()
                 user_ids: List[int] = []
                 user_bytes_list = fields.get(3, [])
@@ -3070,7 +3120,9 @@ class BalePvConnector:
                     if isinstance(uid, int):
                         user_ids.append(uid)
 
-                # Fetch names via LoadUsers (field 4 contains the display name)
+                user_ids = list(dict.fromkeys(user_ids + list(profiles)))
+                # Field 4 is the saved contact alias; field 3 is the public
+                # profile name. Keep both so an absent alias is not nameless.
                 name_map: Dict[int, str] = {}
                 if user_ids:
                     lu_req = ProtobufMessage()
@@ -3098,6 +3150,11 @@ class BalePvConnector:
                     )
                     lu_msg, lu_status, _ = parse_grpc_web_response(lu_resp.content)
                     if lu_status == 0 and lu_msg:
+                        for user in parse_load_users_response(lu_msg).get("users", []):
+                            uid = user.get("id")
+                            if isinstance(uid, int):
+                                existing = profiles.get(uid, {})
+                                profiles[uid] = {**user, "local_name": existing.get("local_name") or user.get("local_name")}
                         lu_fields = ProtobufParser(lu_msg).parse()
                         for user_bytes in lu_fields.get(1, []):
                             if not isinstance(user_bytes, bytes):
@@ -3119,9 +3176,14 @@ class BalePvConnector:
 
                 contacts = []
                 for uid in user_ids:
+                    profile = profiles.get(uid, {})
+                    local_name = profile.get("local_name") or name_map.get(uid, "")
                     contacts.append({
                         "id": uid,
-                        "name": name_map.get(uid, ""),
+                        "name": local_name or profile.get("name") or profile.get("nick") or "",
+                        "local_name": local_name,
+                        "profile_name": profile.get("name") or "",
+                        "nick": profile.get("nick") or "",
                     })
 
                 self._logger.info(
@@ -3150,6 +3212,8 @@ class BalePvConnector:
                 if name:
                     runtime.user_cache[int(uid)] = str(name).strip()
                     runtime.chat_title_cache[int(uid)] = str(name).strip()
+                if contact.get("local_name"):
+                    runtime.contact_name_cache[int(uid)] = str(contact["local_name"]).strip()
         else:
             self._logger.warning(
                 "bale_pv user_cache_contacts_failed instance=%s error=%s",

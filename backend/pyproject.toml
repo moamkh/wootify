@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "wootify"
-version = "6.0.4"
+version = "7.0.1"
 description = "Chatwoot messaging-platform connector and instance manager"
 requires-python = ">=3.11"
 dependencies = [
@@ -28,7 +28,11 @@ dependencies = [
   "websockets>=15.0",
   "protobuf>=4.0",
   "instagrapi==2.18.17",
+  "eitaa-cli @ git+https://github.com/EhsanAhmadzadeh/eitaa-cli.git@685a71e12d78cf58cb18074e08aad4c8e06981a0",
 ]
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/wootify", "src/app"]
+
+[tool.hatch.metadata]
+allow-direct-references = true

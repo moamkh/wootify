@@ -19,6 +19,8 @@ export function useInstanceDirectory({ instances, instanceSearch, instanceStatus
         item.platform_metadata?.bale_bot_name, item.platform_metadata?.bale_department,
         item.platform_metadata?.bale_pv_display_name, item.platform_metadata?.bale_pv_department,
         item.platform_metadata?.bale_pv_phone_number, item.platform_metadata?.instagram_display_name,
+        item.platform_metadata?.eitaa_pv_display_name, item.platform_metadata?.eitaa_pv_department,
+        item.platform_metadata?.eitaa_pv_phone_number,
         item.platform_metadata?.instagram_department, item.platform_metadata?.instagram_username,
         item.platform_metadata?.telegram_bot_name, item.platform_metadata?.telegram_department,
         item.chatwoot?.account_id, item.chatwoot?.inbox_id,

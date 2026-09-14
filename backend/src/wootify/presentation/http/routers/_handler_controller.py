@@ -76,6 +76,7 @@ from wootify.application.instances.service import InstanceService
 from wootify.application.messaging.message_mapping import MessageMappingService
 from wootify.application.messaging.chatwoot_webhook import ChatwootWebhookService
 from wootify.plugins.bale_pv.connector import bale_pv
+from wootify.plugins.eitaa_pv.connector import eitaa_pv
 from wootify.connectors.registry import connector_registry
 from wootify.instagram import instagram_pv
 from wootify.application.instances.platform_catalog import PlatformRegistryService
@@ -458,6 +459,17 @@ async def instance_health(instance_key: str, db: Session = Depends(get_db)):
                 endpoint='instance_health',
                 instance_key=instance_key,
             )
+        if runtime.platform_type.key == 'bale_pv_enterprise':
+            from datetime import datetime, timezone
+            from wootify.infrastructure.persistence.models import InstanceRuntimeState
+            sync = db.query(InstanceRuntimeState).filter(InstanceRuntimeState.instance_id == runtime.instance.id).first()
+            last_sync = sync.last_sync_at if sync else None
+            if last_sync is not None:
+                if last_sync.tzinfo is None:
+                    last_sync = last_sync.replace(tzinfo=timezone.utc)
+                interval = int(runtime.platform_metadata.get('bale_pv_poll_interval') or settings.BALE_POLL_INTERVAL_SECONDS)
+                if (datetime.now(timezone.utc) - last_sync).total_seconds() > max(300, interval * 3):
+                    raise HTTPException(status_code=503, detail='Bale PV polling is stale despite socket connectivity')
         return {'status': 'ok'}
     except HTTPException:
         raise
@@ -1500,7 +1512,7 @@ async def _deliver_chatwoot_webhook_background(
             result = await enterprise.receive_chatwoot_webhook(db, resolved_instance_key, payload)
         elif platform_key == 'telegram_enterprise':
             result = await enterprise_telegram.receive_chatwoot_webhook(db, resolved_instance_key, payload)
-        elif platform_key in ('bale_pv_enterprise', 'instagram_pv_enterprise'):
+        elif platform_key in ('bale_pv_enterprise', 'eitaa_pv_enterprise', 'instagram_pv_enterprise'):
             result = await chatwoot_bridge.handle_chatwoot_webhook(db, resolved_instance_key, payload)
         else:
             result = await bridge.receive_chatwoot_webhook(db, resolved_instance_key, payload)
@@ -1519,6 +1531,7 @@ async def _deliver_chatwoot_webhook_background(
             result.get('ignored') if isinstance(result, dict) else None,
             result.get('reason') if isinstance(result, dict) else None,
         )
+
         _log_delivery_result(resolved_instance_key, route_key, result)
     except Exception as exc:
         logger.exception(
@@ -1701,7 +1714,7 @@ async def simulate_platform_event(instance_key: str, payload: SimulatePlatformEv
                 }
             )
 
-        if runtime.platform_type.key in ('bale_pv_enterprise', 'instagram_pv_enterprise'):
+        if runtime.platform_type.key in ('bale_pv_enterprise', 'eitaa_pv_enterprise', 'instagram_pv_enterprise'):
             result = await chatwoot_bridge.ingest_platform_event(db, instance_key, event)
         else:
             result = await bridge.ingest_platform_event(db, instance_key, event)
@@ -2465,3 +2478,40 @@ async def get_version() -> dict[str, str]:
     version_file = PROJECT_ROOT / 'VERSION'
     version = version_file.read_text(encoding='utf-8').strip() if version_file.exists() else 'unknown'
     return {'version': version}
+
+
+@router.post('/instances/{instance_key}/eitaa-pv/auth/send-code', response_model=GenericMessageResponse)
+async def eitaa_pv_send_code(instance_key: str, db: Session = Depends(get_db)):
+    """Request an Eitaa Web authentication code for a personal instance."""
+    runtime = _require_instance_runtime(db, instance_key)
+    if runtime.platform_type.key != 'eitaa_pv_enterprise':
+        raise HTTPException(status_code=400, detail='not an eitaa_pv_enterprise instance')
+    await eitaa_pv.connect(instance_key, runtime.platform_metadata)
+    result = await eitaa_pv.send_auth_code(instance_key)
+    return GenericMessageResponse(message='code_sent', detail=f"delivery={result.get('delivery')} timeout={result.get('timeout_seconds')}", status='ok')
+
+
+@router.post('/instances/{instance_key}/eitaa-pv/auth/validate-code', response_model=GenericMessageResponse)
+async def eitaa_pv_validate_code(instance_key: str, payload: dict[str, Any], db: Session = Depends(get_db)):
+    """Validate an Eitaa code and start the Wootify platform runtime."""
+    runtime = _require_instance_runtime(db, instance_key)
+    if runtime.platform_type.key != 'eitaa_pv_enterprise':
+        raise HTTPException(status_code=400, detail='not an eitaa_pv_enterprise instance')
+    code = str(payload.get('code') or '').strip()
+    if not code:
+        raise HTTPException(status_code=400, detail='code is required')
+    await eitaa_pv.connect(instance_key, runtime.platform_metadata)
+    await eitaa_pv.validate_auth_code(instance_key, code)
+    await runtime_registry.connect_instance(instance_key, 'eitaa_pv_enterprise', runtime.platform_metadata)
+    return GenericMessageResponse(message='authenticated', detail='Eitaa session saved', status='ok')
+
+
+@router.get('/instances/{instance_key}/eitaa-pv/auth/status', response_model=GenericMessageResponse)
+async def eitaa_pv_auth_status(instance_key: str, db: Session = Depends(get_db)):
+    """Return the current Eitaa personal-session state."""
+    runtime = _require_instance_runtime(db, instance_key)
+    if runtime.platform_type.key != 'eitaa_pv_enterprise':
+        raise HTTPException(status_code=400, detail='not an eitaa_pv_enterprise instance')
+    await eitaa_pv.connect(instance_key, runtime.platform_metadata)
+    result = await eitaa_pv.get_connection_state(instance_key)
+    return GenericMessageResponse(message=result['detail'], detail=f"phone={result.get('phone_number')}", status='ok')

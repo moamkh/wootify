@@ -10,6 +10,7 @@ import asyncio
 import json
 import logging
 import mimetypes
+import random
 from typing import Any, AsyncIterator, Dict, List, Optional, Tuple
 
 from wootify.adapters.base import BasePlatformAdapter
@@ -94,6 +95,16 @@ class BalePvAdapter(BasePlatformAdapter):
             mirror_echo=mirror_echo,
         )
         return {"ok": True, "result": result}
+
+    async def prepare_outbound(self, peer_id: str) -> None:
+        await bale_pv.prepare_outbound(self.instance_key, peer_id)
+        # The protocol client has a verified StopTyping RPC but no captured
+        # start-typing wire method yet.  Keep the same human response delay
+        # without sending an invented request.
+        await asyncio.sleep(random.uniform(1.0, 3.0))
+
+    async def finish_outbound(self, peer_id: str) -> None:
+        await bale_pv.finish_outbound(self.instance_key, peer_id)
 
     async def edit_message(
         self,
@@ -259,7 +270,8 @@ class BalePvAdapter(BasePlatformAdapter):
             recipient_name = bale_pv.get_user_name(self.instance_key, int(chat_id)) if chat_id.isdigit() else None
             from_name = recipient_name or f"Bale User {chat_id}"
         else:
-            from_name = sender_name or sender_username or f"Bale User {chat_id}"
+            contact_name = bale_pv.get_user_name(self.instance_key, int(chat_id)) if chat_id.isdigit() else None
+            from_name = contact_name or sender_name or sender_username or f"Bale User {chat_id}"
 
         text = str(message.get("text") or message.get("caption") or "").strip()
 

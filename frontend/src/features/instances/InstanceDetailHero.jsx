@@ -12,6 +12,7 @@ export default function InstanceDetailHero({
   isTelegramPlatform,
   isEnterpriseBalePlatform,
   isBalePvPlatform,
+  isEitaaPvPlatform,
   isInstagramPvPlatform,
   isEnterpriseTelegramPlatform,
   isEnterprisePlatform,
@@ -41,6 +42,9 @@ export default function InstanceDetailHero({
       ) : null}
       {isBalePvPlatform ? (
         <div className="instance-token">{maskTokenValue(form.bale_pv_phone_number || selectedInstance?.platform_metadata?.bale_pv_phone_number)}</div>
+      ) : null}
+      {isEitaaPvPlatform ? (
+        <div className="instance-token">{maskTokenValue(form.eitaa_pv_phone_number || selectedInstance?.platform_metadata?.eitaa_pv_phone_number)}</div>
       ) : null}
       {isInstagramPvPlatform ? (
         <div className="instance-token">{maskTokenValue(form.instagram_username || selectedInstance?.platform_metadata?.instagram_username)}</div>
@@ -81,6 +85,22 @@ export default function InstanceDetailHero({
             <div>
               <span className="k">Department</span>
               <span className="v">{form.bale_pv_department || '-'}</span>
+            </div>
+          </>
+        ) : null}
+        {isEitaaPvPlatform ? (
+          <>
+            <div>
+              <span className="k">Display name</span>
+              <span className="v">{form.eitaa_pv_display_name || '-'}</span>
+            </div>
+            <div>
+              <span className="k">Phone</span>
+              <span className="v">{form.eitaa_pv_phone_number || '-'}</span>
+            </div>
+            <div>
+              <span className="k">Department</span>
+              <span className="v">{form.eitaa_pv_department || '-'}</span>
             </div>
           </>
         ) : null}
@@ -164,7 +184,7 @@ export default function InstanceDetailHero({
             </>
           ) : (
             <button className="btn" disabled={busy} onClick={() => onCreateInbox(selectedInstance.instance_key)}>
-              {isBalePvPlatform ? 'Link Inbox' : 'Create Inbox'}
+              {isBalePvPlatform || isEitaaPvPlatform ? 'Link Inbox' : 'Create Inbox'}
             </button>
           )}
           {isBalePvPlatform && onBalePvSyncContacts ? (

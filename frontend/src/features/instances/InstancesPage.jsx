@@ -18,6 +18,7 @@ export default function InstancesPage({
   PLATFORM_TELEGRAM,
   PLATFORM_BALE_ENTERPRISE,
   PLATFORM_BALE_PV_ENTERPRISE,
+  PLATFORM_EITAA_PV_ENTERPRISE,
   PLATFORM_INSTAGRAM_PV_ENTERPRISE,
   PLATFORM_TELEGRAM_ENTERPRISE,
 }) {
@@ -51,12 +52,15 @@ export default function InstancesPage({
             const healthTone = !item.is_enabled || health == null ? 'warn' : health ? 'good' : 'bad';
             const isTelegram = item.platform_type_key === PLATFORM_TELEGRAM || item.platform_type_key === PLATFORM_TELEGRAM_ENTERPRISE;
             const isBalePv = item.platform_type_key === PLATFORM_BALE_PV_ENTERPRISE;
+            const isEitaaPv = item.platform_type_key === PLATFORM_EITAA_PV_ENTERPRISE;
             const isInstagramPv = item.platform_type_key === PLATFORM_INSTAGRAM_PV_ENTERPRISE;
             const isEnterprise = item.platform_type_key === PLATFORM_BALE_ENTERPRISE || item.platform_type_key === PLATFORM_TELEGRAM_ENTERPRISE;
             const botName = isTelegram
               ? item.platform_metadata?.telegram_bot_name || '-'
               : isBalePv
                 ? item.platform_metadata?.bale_pv_display_name || '-'
+                : isEitaaPv
+                  ? item.platform_metadata?.eitaa_pv_display_name || '-'
                 : isInstagramPv
                   ? item.platform_metadata?.instagram_display_name || '-'
                   : item.platform_metadata?.bale_bot_name || '-';
@@ -64,6 +68,8 @@ export default function InstancesPage({
               ? item.platform_metadata?.telegram_bot_id || '-'
               : isBalePv
                 ? item.platform_metadata?.bale_pv_phone_number || '-'
+                : isEitaaPv
+                  ? item.platform_metadata?.eitaa_pv_phone_number || '-'
                 : isInstagramPv
                   ? item.platform_metadata?.instagram_username || '-'
                   : item.platform_metadata?.bale_bot_id || '-';
@@ -71,11 +77,15 @@ export default function InstancesPage({
               ? item.platform_metadata?.telegram_department || '-'
               : isBalePv
                 ? item.platform_metadata?.bale_pv_department || '-'
+                : isEitaaPv
+                  ? item.platform_metadata?.eitaa_pv_department || '-'
                 : isInstagramPv
                   ? item.platform_metadata?.instagram_department || '-'
                   : item.platform_metadata?.bale_department || '-';
             const maskedToken = isBalePv
               ? maskTokenValue(item.platform_metadata?.bale_pv_phone_number)
+              : isEitaaPv
+                ? maskTokenValue(item.platform_metadata?.eitaa_pv_phone_number)
               : isInstagramPv
                 ? maskTokenValue(item.platform_metadata?.instagram_username)
                 : maskTokenValue(
@@ -197,7 +207,7 @@ export default function InstancesPage({
                         onCreateInbox(item.instance_key);
                       }}
                     >
-                      {isBalePv ? 'Link Inbox' : 'Create Inbox'}
+                      {isBalePv || isEitaaPv ? 'Link Inbox' : 'Create Inbox'}
                     </button>
                   )}
                   {isBalePv && onBalePvSyncContacts ? (

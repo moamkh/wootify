@@ -39,7 +39,7 @@ BALE_PV_ENTERPRISE_CAPABILITIES = {
     'send_media': True,
     'reply_sync': True,
     'inbound_polling': True,
-    'mark_as_read': False,
+    'mark_as_read': True,
     'edit_message': True,
     'delete_message': True,
 }
@@ -100,6 +100,21 @@ BALE_PV_ENTERPRISE_METADATA_SCHEMA: dict[str, Any] = {
         'bale_pv_share_phone_prompt_enabled': {'type': 'boolean'},
         'bale_pv_share_phone_prompt_only_if_missing_phone': {'type': 'boolean'},
         'bale_pv_share_phone_prompt_text': {'type': 'string'},
+    },
+}
+
+EITAA_PV_ENTERPRISE_CAPABILITIES = dict(BALE_PV_ENTERPRISE_CAPABILITIES)
+
+EITAA_PV_ENTERPRISE_METADATA_SCHEMA: dict[str, Any] = {
+    'type': 'object',
+    'required': ['eitaa_pv_phone_number'],
+    'properties': {
+        'eitaa_pv_phone_number': {'type': 'string'},
+        'eitaa_pv_session_dir': {'type': 'string'},
+        'eitaa_pv_poll_interval': {'type': 'integer'},
+        'eitaa_pv_display_name': {'type': 'string'},
+        'eitaa_pv_department': {'type': 'string'},
+        'eitaa_pv_endpoint': {'type': 'string'},
     },
 }
 
@@ -267,6 +282,13 @@ class PlatformRegistryService:
                 display_name='Bale PV (Personal)',
                 capabilities_json=BALE_PV_ENTERPRISE_CAPABILITIES,
                 metadata_schema_json=BALE_PV_ENTERPRISE_METADATA_SCHEMA,
+                is_active=True,
+            )
+            platform_repo.upsert(
+                key='eitaa_pv_enterprise',
+                display_name='Eitaa PV (Personal)',
+                capabilities_json=EITAA_PV_ENTERPRISE_CAPABILITIES,
+                metadata_schema_json=EITAA_PV_ENTERPRISE_METADATA_SCHEMA,
                 is_active=True,
             )
             platform_repo.upsert(

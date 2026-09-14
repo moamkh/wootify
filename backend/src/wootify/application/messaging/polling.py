@@ -43,6 +43,12 @@ from wootify.application.messaging.bridge import BridgeService
 from wootify.application.messaging.chatwoot_bridge import chatwoot_bridge
 from wootify.application.enterprise.bale import EnterpriseBaleService
 from wootify.application.enterprise.telegram import EnterpriseTelegramService
+
+
+# Personal-account platforms use an adapter to translate their native event
+# format into the Chatwoot event contract.  Keep this in one place so Eitaa
+# receives the same inbound/outbound bridge treatment as Bale PV.
+_ADAPTER_CHATWOOT_PLATFORM_KEYS = {"bale_pv_enterprise", "eitaa_pv_enterprise"}
 from wootify.application.instances.service import InstanceService
 from wootify.paths import DEFAULT_ENTERPRISE_TMP_DIR
 
@@ -136,6 +142,17 @@ class BalePollingService:
         while not self._stop.is_set():
             try:
                 enabled = self._list_enabled_instance_keys()
+                # A reconnect must not leave a cancelled/dead task occupying
+                # its instance slot forever. Preserve connector queues and
+                # update watermarks while recreating only the polling task.
+                for key, task in list(self._poll_tasks.items()):
+                    if task.done():
+                        error = None if task.cancelled() else task.exception()
+                        self._poll_tasks.pop(key)
+                        self._logger.warning(
+                            'poll_task_terminated instance=%s cancelled=%s error=%s; restarting_if_enabled',
+                            key, task.cancelled(), error,
+                        )
                 existing = set(self._poll_tasks.keys())
 
                 disabled_tasks = []
@@ -219,15 +236,15 @@ class BalePollingService:
                     runtime_instance_id=runtime_instance_id,
                 )
 
-                # Register the Bale PV adapter runtime first so inbound normalization
-                # and outbound webhooks can use it even if the connector is still
-                # completing authentication.
-                if platform_key == 'bale_pv_enterprise':
+                # Register personal-account adapter runtimes first so inbound
+                # normalization and outbound Chatwoot webhooks share one session.
+                if platform_key in _ADAPTER_CHATWOOT_PLATFORM_KEYS:
                     try:
                         await runtime_registry.connect_instance(instance_key, platform_key, cfg)
                     except Exception as exc:
                         self._logger.warning(
-                            'bale_pv_adapter_register_failed instance=%s error=%s',
+                            'personal_adapter_register_failed platform=%s instance=%s error=%s',
+                            platform_key,
                             instance_key,
                             exc,
                         )
@@ -321,7 +338,7 @@ class BalePollingService:
                             update_processed = True
                         else:
                             try:
-                                if platform_key == 'bale_pv_enterprise':
+                                if platform_key in _ADAPTER_CHATWOOT_PLATFORM_KEYS:
                                     event = await self._normalize_with_adapter(instance_key, update)
                                 else:
                                     event = await self._platform_update_to_event(instance_key, platform_key, update, connector=connector)
@@ -330,7 +347,7 @@ class BalePollingService:
                                     update_processed = True
                                 else:
                                     with SessionLocal() as db:
-                                        if platform_key == 'bale_pv_enterprise':
+                                        if platform_key in _ADAPTER_CHATWOOT_PLATFORM_KEYS:
                                             await chatwoot_bridge.ingest_platform_event(db, instance_key, event)
                                         else:
                                             await self._bridge.ingest_platform_event(db, instance_key, event)
@@ -410,15 +427,14 @@ class BalePollingService:
                 continue
 
             # When the last batch contained updates, loop immediately to drain
-            # any backlog. On an empty/timed-out long-poll the request itself
-            # already paced the loop, so a short pause is enough; waiting on the
-            # stop event keeps shutdown responsive either way.
+            # any backlog.  Otherwise honour the platform's configured cadence.
+            # Waiting on the stop event (rather than asyncio.sleep) still makes
+            # shutdown immediate.  In particular, Eitaa PV intentionally uses
+            # the same five-second default as the Bale connectors.
             if updates:
                 continue
             try:
-                # Honor the configured poll interval but cap the idle wait so a
-                # large interval does not add unbounded latency between polls.
-                await asyncio.wait_for(self._stop.wait(), timeout=min(float(poll_interval), 2.0))
+                await asyncio.wait_for(self._stop.wait(), timeout=float(poll_interval))
             except asyncio.TimeoutError:
                 continue
 
@@ -849,7 +865,7 @@ class BalePollingService:
                 elif platform_key == 'telegram_enterprise':
                     await self._enterprise_telegram.handle_platform_update(db, instance_key, item['payload'])
                 else:
-                    if platform_key == 'bale_pv_enterprise':
+                    if platform_key in _ADAPTER_CHATWOOT_PLATFORM_KEYS:
                         event = await self._normalize_with_adapter(instance_key, item['payload'])
                     else:
                         connector = connector_registry.get(platform_key)
@@ -857,7 +873,7 @@ class BalePollingService:
                             instance_key, platform_key, item['payload'], connector=connector
                         )
                     if event:
-                        if platform_key == 'bale_pv_enterprise':
+                        if platform_key in _ADAPTER_CHATWOOT_PLATFORM_KEYS:
                             await chatwoot_bridge.ingest_platform_event(db, instance_key, event)
                         else:
                             await self._bridge.ingest_platform_event(db, instance_key, event)
@@ -1089,8 +1105,8 @@ class BalePollingService:
         if key == 'telegram':
             raw = cfg.get('telegram_poll_interval')
             return int(raw or settings.TELEGRAM_POLL_INTERVAL_SECONDS)
-        if key == 'bale_pv_enterprise':
-            raw = cfg.get('bale_pv_poll_interval')
+        if key in _ADAPTER_CHATWOOT_PLATFORM_KEYS:
+            raw = cfg.get('eitaa_pv_poll_interval' if key == 'eitaa_pv_enterprise' else 'bale_pv_poll_interval')
             return int(raw or settings.BALE_POLL_INTERVAL_SECONDS)
         raw = cfg.get('bale_poll_interval')
         return int(raw or settings.BALE_POLL_INTERVAL_SECONDS)
@@ -1128,17 +1144,17 @@ class BalePollingService:
                 'text': str(cfg.get('telegram_share_phone_prompt_text') or settings.TELEGRAM_SHARE_PHONE_PROMPT_TEXT).strip(),
             }
 
-        if key == 'bale_pv_enterprise':
+        if key in _ADAPTER_CHATWOOT_PLATFORM_KEYS:
             return {
                 'enabled': self._coerce_bool(
-                    cfg.get('bale_pv_share_phone_prompt_enabled'),
+                    cfg.get('eitaa_pv_share_phone_prompt_enabled' if key == 'eitaa_pv_enterprise' else 'bale_pv_share_phone_prompt_enabled'),
                     default=settings.BALE_SHARE_PHONE_BUTTON,
                 ),
                 'only_if_missing_phone': self._coerce_bool(
-                    cfg.get('bale_pv_share_phone_prompt_only_if_missing_phone'),
+                    cfg.get('eitaa_pv_share_phone_prompt_only_if_missing_phone' if key == 'eitaa_pv_enterprise' else 'bale_pv_share_phone_prompt_only_if_missing_phone'),
                     default=True,
                 ),
-                'text': str(cfg.get('bale_pv_share_phone_prompt_text') or settings.BALE_SHARE_PHONE_PROMPT_TEXT).strip(),
+                'text': str(cfg.get('eitaa_pv_share_phone_prompt_text' if key == 'eitaa_pv_enterprise' else 'bale_pv_share_phone_prompt_text') or settings.BALE_SHARE_PHONE_PROMPT_TEXT).strip(),
             }
 
         return {
@@ -1176,15 +1192,15 @@ class BalePollingService:
         instance_key: str,
         update: dict[str, Any],
     ) -> Optional[dict[str, Any]]:
-        """Normalize a Bale PV update using the new adapter runtime."""
+        """Normalize a personal-account update through its registered adapter."""
         from wootify.runtime_registry import get_runtime
         runtime = get_runtime(instance_key)
         if not runtime:
-            self._logger.warning('bale_pv_adapter_no_runtime instance=%s', instance_key)
+            self._logger.warning('personal_adapter_no_runtime instance=%s', instance_key)
             return None
         event = runtime.adapter.normalize_incoming_update(update)
         if not event:
-            self._logger.debug('bale_pv_adapter_normalize_skipped instance=%s', instance_key)
+            self._logger.debug('personal_adapter_normalize_skipped instance=%s', instance_key)
             return None
 
         original_refs = event.get("attachments") or []

@@ -678,7 +678,7 @@ class BaleWebSocketClient:
                 return False
 
     async def close(self) -> None:
-        """Close the WebSocket connection and cancel all pending requests.
+        """Close the WebSocket connection and fail all pending requests.
 
         Safe to call multiple times; subsequent calls are no-ops.
         """
@@ -692,8 +692,10 @@ class BaleWebSocketClient:
         if self._ws:
             await self._ws.close()
             self._ws = None
-        # Cancel any in-flight response futures so callers don't hang.
+        # Disconnect is an I/O failure, not cancellation of the caller task.
+        # Cancelling these futures propagates CancelledError into pollers and
+        # can permanently terminate them during a routine reconnect.
         for future in self._pending_responses.values():
             if not future.done():
-                future.cancel()
+                future.set_exception(ConnectionError("Bale WebSocket disconnected"))
         self._pending_responses.clear()

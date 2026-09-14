@@ -48,6 +48,9 @@ import {
   balePvSendCode,
   balePvValidateCode,
   balePvAuthStatus,
+  eitaaPvSendCode,
+  eitaaPvValidateCode,
+  eitaaPvAuthStatus,
   balePvSyncContacts,
   balePvSyncDialogs,
   instagramPvCheck,
@@ -66,6 +69,7 @@ import {
   PLATFORM_BALE,
   PLATFORM_BALE_ENTERPRISE,
   PLATFORM_BALE_PV_ENTERPRISE,
+  PLATFORM_EITAA_PV_ENTERPRISE,
   PLATFORM_INSTAGRAM_PV_ENTERPRISE,
   PLATFORM_TELEGRAM,
   PLATFORM_TELEGRAM_ENTERPRISE,
@@ -138,6 +142,12 @@ function defaultForm(features) {
     bale_pv_share_phone_prompt_enabled: true,
     bale_pv_share_phone_prompt_only_if_missing_phone: true,
     bale_pv_share_phone_prompt_text: 'Use the button below to share your phone number.\nCommands: /share_phone, /help',
+    eitaa_pv_phone_number: '',
+    eitaa_pv_session_dir: '',
+    eitaa_pv_poll_interval: '5',
+    eitaa_pv_display_name: '',
+    eitaa_pv_department: '',
+    eitaa_pv_endpoint: '',
     instagram_username: '',
     instagram_password: '',
     instagram_sessionid: '',
@@ -292,6 +302,8 @@ export default function App() {
   const [version, setVersion] = useState('');
   const [balePvAuthCode, setBalePvAuthCode] = useState('');
   const [balePvAuthLoading, setBalePvAuthLoading] = useState(false);
+  const [eitaaPvAuthCode, setEitaaPvAuthCode] = useState('');
+  const [eitaaPvAuthLoading, setEitaaPvAuthLoading] = useState(false);
   const [instagramCheckLoading, setInstagramCheckLoading] = useState(false);
   const [instagramCheckResult, setInstagramCheckResult] = useState(null);
   const [instagramChallengeCode, setInstagramChallengeCode] = useState('');
@@ -315,6 +327,7 @@ export default function App() {
   const isStandardBalePlatform = form.platform_type_key === PLATFORM_BALE;
   const isEnterpriseBalePlatform = form.platform_type_key === PLATFORM_BALE_ENTERPRISE;
   const isBalePvPlatform = form.platform_type_key === PLATFORM_BALE_PV_ENTERPRISE;
+  const isEitaaPvPlatform = form.platform_type_key === PLATFORM_EITAA_PV_ENTERPRISE;
   const isInstagramPvPlatform = form.platform_type_key === PLATFORM_INSTAGRAM_PV_ENTERPRISE;
   const isTelegramPlatform = form.platform_type_key === PLATFORM_TELEGRAM || form.platform_type_key === PLATFORM_TELEGRAM_ENTERPRISE;
   const isEnterpriseTelegramPlatform = form.platform_type_key === PLATFORM_TELEGRAM_ENTERPRISE;
@@ -437,6 +450,12 @@ export default function App() {
       bale_pv_share_phone_prompt_text:
         row.platform_metadata?.bale_pv_share_phone_prompt_text ||
         'Use the button below to share your phone number.\nCommands: /share_phone, /help',
+      eitaa_pv_phone_number: row.platform_metadata?.eitaa_pv_phone_number || '',
+      eitaa_pv_session_dir: row.platform_metadata?.eitaa_pv_session_dir || '',
+      eitaa_pv_poll_interval: String(row.platform_metadata?.eitaa_pv_poll_interval ?? '5'),
+      eitaa_pv_display_name: row.platform_metadata?.eitaa_pv_display_name || '',
+      eitaa_pv_department: row.platform_metadata?.eitaa_pv_department || '',
+      eitaa_pv_endpoint: row.platform_metadata?.eitaa_pv_endpoint || '',
       instagram_username: row.platform_metadata?.instagram_username || '',
       instagram_password: row.platform_metadata?.instagram_password || '',
       instagram_sessionid: row.platform_metadata?.instagram_sessionid || '',
@@ -1242,6 +1261,7 @@ export default function App() {
     isTelegramPlatform,
     isEnterpriseBalePlatform,
     isBalePvPlatform,
+    isEitaaPvPlatform,
     isInstagramPvPlatform,
     isEnterpriseTelegramPlatform,
     isEnterprisePlatform,
@@ -1314,6 +1334,25 @@ export default function App() {
       } catch (e) {
         alert(e?.message || String(e));
       }
+    },
+    eitaaPvAuthCode,
+    setEitaaPvAuthCode,
+    eitaaPvAuthLoading,
+    onEitaaPvSendCode: async (instanceKey) => {
+      setEitaaPvAuthLoading(true);
+      try { const res = await eitaaPvSendCode(instanceKey); alert(res?.message || 'Code sent'); }
+      catch (e) { alert(e?.message || String(e)); }
+      finally { setEitaaPvAuthLoading(false); }
+    },
+    onEitaaPvValidateCode: async (instanceKey, code) => {
+      setEitaaPvAuthLoading(true);
+      try { const res = await eitaaPvValidateCode(instanceKey, code); alert(res?.message || 'Authenticated'); }
+      catch (e) { alert(e?.message || String(e)); }
+      finally { setEitaaPvAuthLoading(false); }
+    },
+    onEitaaPvAuthStatus: async (instanceKey) => {
+      try { const res = await eitaaPvAuthStatus(instanceKey); alert(`${res?.message || 'unknown'} | ${res?.detail || ''}`); }
+      catch (e) { alert(e?.message || String(e)); }
     },
     instagramCheckLoading,
     instagramCheckResult,
@@ -1510,6 +1549,7 @@ export default function App() {
             PLATFORM_TELEGRAM={PLATFORM_TELEGRAM}
             PLATFORM_BALE_ENTERPRISE={PLATFORM_BALE_ENTERPRISE}
             PLATFORM_BALE_PV_ENTERPRISE={PLATFORM_BALE_PV_ENTERPRISE}
+            PLATFORM_EITAA_PV_ENTERPRISE={PLATFORM_EITAA_PV_ENTERPRISE}
             PLATFORM_INSTAGRAM_PV_ENTERPRISE={PLATFORM_INSTAGRAM_PV_ENTERPRISE}
             PLATFORM_TELEGRAM_ENTERPRISE={PLATFORM_TELEGRAM_ENTERPRISE}
           />

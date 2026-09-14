@@ -10,6 +10,11 @@ export const balePvValidateCode = (k, code) => fetchJSON(`/api/v1/instances/${id
   method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ code }),
 });
 export const balePvAuthStatus = (k) => fetchJSON(`/api/v1/instances/${id(k)}/bale-pv/auth/status`);
+export const eitaaPvSendCode = (k) => fetchJSON(`/api/v1/instances/${id(k)}/eitaa-pv/auth/send-code`, { method: 'POST' });
+export const eitaaPvValidateCode = (k, code) => fetchJSON(`/api/v1/instances/${id(k)}/eitaa-pv/auth/validate-code`, {
+  method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ code }),
+});
+export const eitaaPvAuthStatus = (k) => fetchJSON(`/api/v1/instances/${id(k)}/eitaa-pv/auth/status`);
 export const balePvSyncContacts = (k) => fetchJSON(`/api/v1/instances/${id(k)}/bale-pv/sync-contacts`, { method: 'POST' });
 export function balePvSyncDialogs(k, loadHistory = true, historyLimit = 50) {
   const params = new URLSearchParams(); params.set('load_history', loadHistory ? 'true' : 'false'); params.set('history_limit', String(historyLimit));

@@ -21,3 +21,4 @@ python-telegram-bot>=22,<23
 websockets>=15.0
 protobuf>=4.0
 instagrapi==2.18.17
+eitaa-cli @ git+https://github.com/EhsanAhmadzadeh/eitaa-cli.git@685a71e12d78cf58cb18074e08aad4c8e06981a0

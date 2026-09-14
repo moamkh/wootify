@@ -37,6 +37,7 @@ PLATFORM_REQUIRED_TOKEN_KEY = {
     'bale': 'bale_token',
     'bale_enterprise': 'bale_token',
     'bale_pv_enterprise': 'bale_pv_phone_number',
+    'eitaa_pv_enterprise': 'eitaa_pv_phone_number',
     'telegram': 'telegram_token',
     'telegram_enterprise': 'telegram_token',
 }
@@ -601,6 +602,15 @@ class InstanceService:
                 'bale_pv_share_phone_prompt_text': str(
                     data.get('bale_pv_share_phone_prompt_text') or settings.BALE_SHARE_PHONE_PROMPT_TEXT
                 ).strip(),
+            }
+        if key == 'eitaa_pv_enterprise':
+            return {
+                'eitaa_pv_phone_number': str(data.get('eitaa_pv_phone_number') or '').strip(),
+                'eitaa_pv_session_dir': str(data.get('eitaa_pv_session_dir') or '').strip() or None,
+                'eitaa_pv_poll_interval': int(data.get('eitaa_pv_poll_interval') or settings.BALE_POLL_INTERVAL_SECONDS),
+                'eitaa_pv_display_name': str(data.get('eitaa_pv_display_name') or '').strip() or None,
+                'eitaa_pv_department': str(data.get('eitaa_pv_department') or '').strip() or None,
+                'eitaa_pv_endpoint': str(data.get('eitaa_pv_endpoint') or '').strip() or None,
             }
 
         if key == 'instagram_pv_enterprise':

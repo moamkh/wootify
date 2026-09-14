@@ -55,6 +55,7 @@ class ChatwootBridgeService:
     def __init__(self) -> None:
         """Initialize the instance."""
         self._clients: TTLCache[ChatwootClient] = TTLCache(maxsize=50, ttl=3600)
+        self._contact_name_checks: TTLCache[bool] = TTLCache(maxsize=5000, ttl=300)
         # Chatwoot can emit duplicate account-webhook callbacks for one
         # outgoing message. Successful sends are covered by their persisted
         # mapping; failures need this guard to avoid duplicate private notes.
@@ -92,10 +93,8 @@ class ChatwootBridgeService:
             getattr(getattr(instance, "platform_type", None), "key", "") or ""
         ).strip().lower() or "bale_pv_enterprise"
 
-        # Instagram polls also return messages sent by the authenticated
-        # account. Chatwoot has already created those messages before the
-        # bridge sends them, so an Instagram echo must never be posted back as
-        # an incoming message or considered an edit from the customer.
+        # Eitaa and Bale mirror messages sent in their native apps too;
+        # existing outbound mappings deduplicate Chatwoot-originated echoes.
         if platform_key == "instagram_pv_enterprise" and bool(event.get("outgoing")):
             return {"ok": True, "ignored": True, "reason": "platform_outgoing_echo"}
 
@@ -160,12 +159,13 @@ class ChatwootBridgeService:
             instance=instance,
         )
 
-        # If we resolved a better group/channel title, update an existing generic
-        # contact name so old "Group {id}" contacts are renamed automatically.
+        # Repair generic group/channel titles and Bale private-contact names.
+        # Never replace an existing meaningful name customized by an agent.
         if (
             not contact_created
-            and chat_type in ("group", "channel")
+            and (chat_type in ("group", "channel") or (platform_key == "bale_pv_enterprise" and chat_type == "private"))
             and not self._is_generic_contact_name(from_name)
+            and not self._contact_name_checks.get(f"{instance_key}:{contact_id}:{from_name}")
         ):
             try:
                 current = await client.get_contact(account_id, contact_id)
@@ -184,12 +184,39 @@ class ChatwootBridgeService:
                         contact_id,
                         from_name,
                     )
+                self._contact_name_checks.set(f"{instance_key}:{contact_id}:{from_name}", True)
             except Exception as exc:
                 logger.debug(
                     "chatwoot_bridge.rename_group_contact_failed instance=%s chat_id=%s error=%s",
                     instance_key,
                     chat_id,
                     exc,
+                )
+
+        # Eitaa history contains both directions.  Older connector versions
+        # used an outgoing message's sender (the authenticated account) for
+        # the contact name.  Eitaa now supplies the dialog peer, so repair
+        # that stale name when the matching private contact is encountered.
+        if (
+            not contact_created
+            and platform_key == "eitaa_pv_enterprise"
+            and chat_type == "private"
+            and from_name
+        ):
+            try:
+                current = await client.get_contact(account_id, contact_id)
+                payload = current.get("payload") or current if isinstance(current, dict) else {}
+                current_name = str(payload.get("name") or "").strip() if isinstance(payload, dict) else ""
+                if current_name and current_name != from_name:
+                    await client.update_contact(account_id, contact_id, {"name": from_name})
+                    logger.info(
+                        "chatwoot_bridge.renamed_eitaa_private_contact instance=%s chat_id=%s contact_id=%s old_name=%s new_name=%s",
+                        instance_key, chat_id, contact_id, current_name, from_name,
+                    )
+            except Exception as exc:
+                logger.debug(
+                    "chatwoot_bridge.rename_eitaa_private_contact_failed instance=%s chat_id=%s error=%s",
+                    instance_key, chat_id, exc,
                 )
 
         # Service notices (e.g. Bale's "<name> joined Bale" contact-registered
@@ -653,24 +680,41 @@ class ChatwootBridgeService:
                         base_url = str(chatwoot_cfg.get("base_url") or "").rstrip("/")
                         data_url = f"{base_url}{data_url}"
                     filename = self._attachment_filename(att, data_url)
-                    result = await runtime.adapter.send_media(
-                        peer_id,
-                        data_url,
-                        filename=filename,
-                        caption=content or None,
-                        reply_to=reply_to,
-                        # The Chatwoot message already exists (the agent sent
-                        # it); a synthesized echo would only risk a duplicate.
-                        mirror_echo=False,
-                    )
+                    await self._prepare_adapter_outbound(runtime.adapter, peer_id)
+                    try:
+                        # Chatwoot can include stale composer text alongside an
+                        # attachment-only event.  Eitaa renders it as a caption
+                        # before the media (for example, "and there is a ").
+                        # Do not synthesize a caption for Eitaa attachments.
+                        attachment_caption = (
+                            None
+                            if runtime.platform_type == "eitaa_pv_enterprise"
+                            else content or None
+                        )
+                        result = await runtime.adapter.send_media(
+                            peer_id,
+                            data_url,
+                            filename=filename,
+                            caption=attachment_caption,
+                            reply_to=reply_to,
+                            # The Chatwoot message already exists (the agent sent
+                            # it); a synthesized echo would only risk a duplicate.
+                            mirror_echo=False,
+                        )
+                    finally:
+                        await self._finish_adapter_outbound(runtime.adapter, peer_id)
                     sent.append(result)
             else:
-                result = await runtime.adapter.send_text(
-                    peer_id,
-                    content,
-                    reply_to=reply_to,
-                    mirror_echo=False,
-                )
+                await self._prepare_adapter_outbound(runtime.adapter, peer_id)
+                try:
+                    result = await runtime.adapter.send_text(
+                        peer_id,
+                        content,
+                        reply_to=reply_to,
+                        mirror_echo=False,
+                    )
+                finally:
+                    await self._finish_adapter_outbound(runtime.adapter, peer_id)
                 sent.append(result)
 
             # Persist the platform rid assigned to each sent message so a
@@ -686,7 +730,7 @@ class ChatwootBridgeService:
                     peer_id=peer_id,
                     chatwoot_message_id=outbound_message_id,
                     sent=sent,
-                    text=content,
+                    text=("" if attachments and runtime.platform_type == "eitaa_pv_enterprise" else content),
                     message_kind=MessageKind.media if attachments else MessageKind.text,
                 )
             except Exception as exc:
@@ -719,6 +763,29 @@ class ChatwootBridgeService:
     # ------------------------------------------------------------------
     # Chatwoot helpers
     # ------------------------------------------------------------------
+
+    @staticmethod
+    async def _prepare_adapter_outbound(adapter: Any, peer_id: str) -> None:
+        """Run a platform's optional read-receipt/typing pre-send policy."""
+        prepare = getattr(adapter, "prepare_outbound", None)
+        if prepare is None:
+            return
+        try:
+            await prepare(str(peer_id))
+        except Exception as exc:
+            # A cosmetic/read-state failure must not prevent an agent reply.
+            logger.warning("adapter_pre_send_policy_failed peer_id=%s error=%s", peer_id, exc)
+
+    @staticmethod
+    async def _finish_adapter_outbound(adapter: Any, peer_id: str) -> None:
+        """Run a platform's optional post-send cleanup without masking delivery."""
+        finish = getattr(adapter, "finish_outbound", None)
+        if finish is None:
+            return
+        try:
+            await finish(str(peer_id))
+        except Exception as exc:
+            logger.debug("adapter_post_send_policy_failed peer_id=%s error=%s", peer_id, exc)
 
     def _chatwoot_client_for_instance(
         self,

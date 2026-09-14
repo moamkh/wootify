@@ -5,6 +5,8 @@ from __future__ import annotations
 from wootify.plugins.bale.connector import bale
 from wootify.plugins.bale_pv.adapter import BalePvAdapter
 from wootify.plugins.bale_pv.connector import bale_pv
+from wootify.plugins.eitaa_pv.adapter import EitaaPvAdapter
+from wootify.plugins.eitaa_pv.connector import eitaa_pv
 from wootify.plugins.instagram.adapter import InstagramPvAdapter
 from wootify.plugins.telegram.connector import telegram
 from wootify.plugins.base import PlatformPlugin
@@ -28,6 +30,7 @@ def build_builtin_registry() -> PlatformPluginRegistry:
         PlatformPlugin("bale", "Bale", bale, "BALE", _BALE, family="bale"),
         PlatformPlugin("bale_enterprise", "Bale Enterprise", bale, "BALE_ENTERPRISE", _BALE_ENTERPRISE, family="bale"),
         PlatformPlugin("bale_pv_enterprise", "Bale PV (Personal)", bale_pv, "BALE_PV", _BALE_PV, adapter_factory=_adapter(BalePvAdapter), family="bale_pv"),
+        PlatformPlugin("eitaa_pv_enterprise", "Eitaa PV (Personal)", eitaa_pv, "EITAA_PV", _BALE_PV, adapter_factory=_adapter(EitaaPvAdapter), family="eitaa_pv"),
         PlatformPlugin("instagram_pv_enterprise", "Instagram PV (Personal)", _instagram_connector(), "INSTAGRAM_PV", _BALE_PV, adapter_factory=_adapter(InstagramPvAdapter), experimental=True, family="instagram"),
         PlatformPlugin("telegram", "Telegram", telegram, "TELEGRAM", _TELEGRAM, family="telegram"),
         PlatformPlugin("telegram_enterprise", "Telegram Enterprise", telegram, "TELEGRAM_ENTERPRISE", _TELEGRAM_ENTERPRISE, family="telegram"),
