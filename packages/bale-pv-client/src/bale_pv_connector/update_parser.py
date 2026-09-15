@@ -33,6 +33,7 @@ WebSocket Update Frame Structure:
     9: channelPeer (Peer)
 
 Message (G):
+    3: deletedMessage (empty marker message)
     4: documentMessage (Document)
     12: stickerMessage (StickerMessage)
     15: textMessage (TextMessage)
@@ -370,6 +371,18 @@ def _parse_message_content(data: bytes) -> Optional[Dict[str, Any]]:
     """Parse Message (G) and extract text or media info."""
     try:
         fields = ProtobufParser(data).parse()
+
+        # Field 3 = deletedMessage. The current Bale web protobuf defines this
+        # as an empty marker message; the enclosing UpdateMessage/ChannelMessage
+        # retains the original rid and peer needed to locate the Chatwoot row.
+        # Check key presence rather than truthiness because the payload is
+        # normally zero bytes.
+        if 3 in fields:
+            return {
+                "text": "",
+                "message_type": "deleted",
+                "deleted": True,
+            }
 
         # Field 4 = documentMessage (media: photo, video, audio, doc, etc.)
         doc_bytes = fields.get(4, [None])[0]

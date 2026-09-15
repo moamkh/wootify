@@ -136,6 +136,7 @@ class BalePvInstanceRuntime:
     name_lookup_retry_at: Dict[int, float] = field(default_factory=dict)
     chat_title_cache: Dict[int, str] = field(default_factory=dict)  # peer_id -> title
     group_access_hash_cache: Dict[int, int] = field(default_factory=dict)  # group_id -> access_hash
+    peer_type_cache: Dict[str, int] = field(default_factory=dict)  # peer_id -> 1 user, 2 group, 3 channel
     self_user_id: Optional[int] = None  # extracted from JWT payload after login
     last_user_cache_refresh: float = 0.0  # unix timestamp of last bulk user refresh
     pending_read_message_ids: Dict[str, int] = field(default_factory=dict)
@@ -171,6 +172,38 @@ class BalePvConnector:
         if not runtime:
             raise RuntimeError(f"Bale PV instance '{instance}' is not configured")
         return runtime
+
+    @staticmethod
+    def _peer_type_value(value: Any) -> int:
+        """Normalize protocol/UI peer types to Bale's numeric enum."""
+        if isinstance(value, int) and value in (1, 2, 3):
+            return value
+        return {
+            "user": 1,
+            "private": 1,
+            "group": 2,
+            "channel": 3,
+        }.get(str(value or "").strip().lower(), 1)
+
+    def cache_peer_metadata(self, instance: str, chat_id: str, peer_type: Any) -> None:
+        """Cache the authoritative peer type discovered from Bale updates."""
+        runtime = self._get_runtime(instance)
+        runtime.peer_type_cache[str(chat_id)] = self._peer_type_value(peer_type)
+
+    def get_peer_type(self, instance: str, chat_id: str) -> Optional[str]:
+        """Return a cached peer type label without guessing user."""
+        value = self._get_runtime(instance).peer_type_cache.get(str(chat_id))
+        return {1: "user", 2: "group", 3: "channel"}.get(value)
+
+    def _resolved_peer_type(
+        self,
+        runtime: BalePvInstanceRuntime,
+        chat_id: str,
+        peer_type: Any = None,
+    ) -> int:
+        resolved = self._peer_type_value(peer_type) if peer_type is not None else runtime.peer_type_cache.get(str(chat_id), 1)
+        runtime.peer_type_cache[str(chat_id)] = resolved
+        return resolved
 
     def _get_media_http_client(self, instance: str) -> Any:
         """Return the per-instance AsyncClient for media transfer.
@@ -566,6 +599,7 @@ class BalePvConnector:
         reply_markup: Any = None,
         access_hash: Optional[int] = None,
         mirror_echo: bool = True,
+        peer_type: Any = None,
     ) -> Dict:
         """Send a text message via the userbot.
 
@@ -593,6 +627,9 @@ class BalePvConnector:
 
         try:
             peer_id = int(chat_id)
+            resolved_peer_type = self._resolved_peer_type(runtime, chat_id, peer_type)
+            if access_hash is None and resolved_peer_type in (2, 3):
+                access_hash = runtime.group_access_hash_cache.get(peer_id) or None
             # Bale uses the request rid as the permanent message ID. The
             # SendMessage acknowledgement's small integer is a server date,
             # not the message rid used by UpdateMessage/DeleteMessage.
@@ -609,6 +646,7 @@ class BalePvConnector:
                 reply_to_message_id=reply_to,
                 access_hash=access_hash,
                 random_id=request_rid,
+                peer_type=resolved_peer_type,
             )
             ack = self._parse_send_ack(response)
             rid = request_rid
@@ -643,7 +681,7 @@ class BalePvConnector:
             )
             raise RuntimeError(f"send_text failed: {exc}") from exc
 
-    async def prepare_outbound(self, instance: str, chat_id: str) -> None:
+    async def prepare_outbound(self, instance: str, chat_id: str, peer_type: Any = None) -> None:
         """Acknowledge pending inbound messages once before an agent reply."""
         runtime = self._get_runtime(instance)
         max_id = runtime.pending_read_message_ids.get(str(chat_id), 0)
@@ -651,14 +689,24 @@ class BalePvConnector:
             return
         if runtime.client is None:
             raise RuntimeError("Bale PV messaging client is not connected")
-        await runtime.client.mark_read(int(chat_id), max_id)
+        resolved_peer_type = self._resolved_peer_type(runtime, chat_id, peer_type)
+        access_hash = runtime.group_access_hash_cache.get(int(chat_id), 0) if resolved_peer_type in (2, 3) else 0
+        await runtime.client.message_read(
+            int(chat_id),
+            max_id,
+            peer_type=resolved_peer_type,
+            access_hash=access_hash,
+        )
         runtime.read_message_ids[str(chat_id)] = max_id
 
-    async def finish_outbound(self, instance: str, chat_id: str) -> None:
+    async def finish_outbound(self, instance: str, chat_id: str, peer_type: Any = None) -> None:
         """Clear a Bale typing state if the active protocol client exposed one."""
         runtime = self._get_runtime(instance)
         if runtime.client is not None:
-            await runtime.client.stop_typing(int(chat_id))
+            await runtime.client.stop_typing(
+                int(chat_id),
+                peer_type=self._resolved_peer_type(runtime, chat_id, peer_type),
+            )
 
     async def resolve_phone_to_user(
         self,
@@ -776,6 +824,7 @@ class BalePvConnector:
         reply_markup: Any = None,
         access_hash: Optional[int] = None,
         mirror_echo: bool = True,
+        peer_type: Any = None,
     ) -> Dict:
         """Send media via the userbot.
 
@@ -837,7 +886,7 @@ class BalePvConnector:
         try:
             uploaded = await self._upload_file_to_nasim(
                 instance, chat_id, file_bytes, filename, caption, quoted, access_hash,
-                mirror_echo=mirror_echo,
+                mirror_echo=mirror_echo, peer_type=peer_type,
             )
         except Exception as exc:
             self._logger.exception(
@@ -864,6 +913,7 @@ class BalePvConnector:
         quoted: Optional[Dict] = None,
         access_hash: Optional[int] = None,
         mirror_echo: bool = True,
+        peer_type: Any = None,
     ) -> Optional[Dict]:
         """Upload file to Bale Nasim storage and send as DocumentMessage."""
         import httpx
@@ -883,6 +933,9 @@ class BalePvConnector:
 
         runtime = self._get_runtime(instance)
         peer_id = int(chat_id)
+        resolved_peer_type = self._resolved_peer_type(runtime, chat_id, peer_type)
+        if access_hash is None and resolved_peer_type in (2, 3):
+            access_hash = runtime.group_access_hash_cache.get(peer_id) or None
 
         # Resolve mime type and Bale send category.
         import mimetypes
@@ -896,7 +949,7 @@ class BalePvConnector:
             mime_type=mime_type,
             uid=peer_id,
             send_type=send_type,
-            peer_type=Peer.PEER_TYPE_USER,
+            peer_type=resolved_peer_type,
             access_hash=access_hash or 0,
         )
 
@@ -1134,6 +1187,7 @@ class BalePvConnector:
             ext=ext,
             peer_access_hash=access_hash or 0,
             random_id=request_rid,
+            peer_type=resolved_peer_type,
         )
         ack = self._parse_send_ack(send_response)
         rid = request_rid
@@ -1335,6 +1389,12 @@ class BalePvConnector:
             parsed = self._parse_raw_update(raw, runtime.user_cache, runtime.self_user_id, runtime.chat_title_cache)
             if parsed:
                 updates.append(parsed)
+                message = parsed.get("message") if isinstance(parsed, dict) else None
+                chat = message.get("chat") if isinstance(message, dict) else None
+                if isinstance(chat, dict) and chat.get("id") is not None:
+                    runtime.peer_type_cache[str(chat["id"])] = self._peer_type_value(
+                        chat.get("type")
+                    )
 
         # Resolve missing group/channel titles on demand so Chatwoot contacts
         # show real names instead of "Group {id}" / "Channel {id}".
@@ -1595,22 +1655,28 @@ class BalePvConnector:
             return None
 
         sender_uid = parsed.get("sender_uid")
-        # Must have integer sender_uid to be a real message
+        event_type = parsed.get("type", "message")
+        is_edited = bool(parsed.get("edited"))
+        is_deleted = bool(parsed.get("deleted"))
+        original_peer = parsed.get("peer") or {}
+        # Normal displayable messages require a real sender. A deletedMessage
+        # marker can legitimately omit senderInfo; its peer and original rid
+        # are sufficient to route and delete the mapped Chatwoot message.
         if not isinstance(sender_uid, int):
-            return None
+            peer_sender = original_peer.get("id") if isinstance(original_peer, dict) else None
+            if is_deleted and isinstance(peer_sender, int):
+                sender_uid = peer_sender
+            else:
+                return None
 
         # Preserve the sender access_hash when the update includes it. This is
         # required to resolve non-contact group senders via LoadUsers.
         sender_access_hash = parsed.get("sender_access_hash")
 
-        event_type = parsed.get("type", "message")
-        is_edited = bool(parsed.get("edited"))
-
         # For channel/broadcast messages the authoritative chat peer is channel_peer.
         # Edited private messages are an exception: field 1 is the actual chat peer,
         # while field 9 (channel_peer) contains the authenticated account (self).
         channel_peer = parsed.get("channel_peer")
-        original_peer = parsed.get("peer") or {}
         if (
             event_type == "channel_message"
             and isinstance(channel_peer, dict)
@@ -1759,7 +1825,7 @@ class BalePvConnector:
         # Chatwoot contact but skip creating a conversation/message — otherwise
         # the empty conversation fires inbox automations (greeting/auto-message)
         # toward the user.
-        service_notice = not text and not media
+        service_notice = not is_deleted and not text and not media
         # Bale security notices are text-bearing messages from its own reserved
         # direct peer.  Keep this distinct from generic service notices: the
         # bridge must not create even a contact for a platform system message.
@@ -1800,6 +1866,8 @@ class BalePvConnector:
             message["_outgoing"] = True
         if is_edited:
             message["_edited"] = True
+        if is_deleted:
+            message["_deleted"] = True
 
         # Log unresolved senders so we can see why names fall back to IDs.
         if sender_label.startswith("User ") or not display_name:
@@ -2628,6 +2696,7 @@ class BalePvConnector:
         from bale_pv_connector.messaging_messages import Peer
 
         runtime = self._get_runtime(instance)
+        runtime.peer_type_cache[str(peer_id)] = self._peer_type_value(peer_type)
         if runtime.auth_state != "authenticated" or runtime.client is None:
             return None
 
@@ -2994,6 +3063,7 @@ class BalePvConnector:
                 "rid": d.get("rid"),
             }
             runtime.chat_title_cache[int(peer_id)] = final_display_name
+            runtime.peer_type_cache[str(peer_id)] = int(peer_type)
             normalized_dialogs.append(normalized)
 
         result: Dict[str, Any] = {

@@ -27,6 +27,7 @@ class BalePvAdapter(BasePlatformAdapter):
         self._connected = False
         # Cache peer_id -> access_hash so outbound messages to non-contacts work.
         self._access_hash_cache: Dict[str, int] = {}
+        self._peer_type_cache: Dict[str, str] = {}
         self._self_id: Optional[str] = None
 
     async def connect(self) -> None:
@@ -45,6 +46,39 @@ class BalePvAdapter(BasePlatformAdapter):
             logger.debug("bale_pv_adapter_disconnect_error instance=%s error=%s", self.instance_key, exc)
         self._connected = False
         self._access_hash_cache.clear()
+        self._peer_type_cache.clear()
+
+    def cache_peer_metadata(self, peer_id: str, *, peer_type: str) -> None:
+        """Remember whether a Bale destination is a user, group or channel."""
+        normalized = str(peer_type or "").strip().lower()
+        if normalized == "private":
+            normalized = "user"
+        if normalized not in ("user", "group", "channel"):
+            return
+        key = str(peer_id)
+        self._peer_type_cache[key] = normalized
+        try:
+            bale_pv.cache_peer_metadata(self.instance_key, key, normalized)
+        except RuntimeError:
+            # Normalization is also used independently in unit/import tools
+            # where the connector runtime has not been opened yet.
+            pass
+
+    def _peer_type_for(self, peer_id: str) -> Optional[str]:
+        # ``None`` lets the connector use peer metadata learned from its
+        # dialog/update caches. Defaulting eagerly to user would overwrite an
+        # authoritative group/channel classification after a restart.
+        cached = self._peer_type_cache.get(str(peer_id))
+        if cached:
+            return cached
+        try:
+            return bale_pv.get_peer_type(self.instance_key, str(peer_id))
+        except RuntimeError:
+            return None
+
+    def get_peer_type(self, peer_id: str) -> Optional[str]:
+        """Expose cached protocol peer type to the Chatwoot router."""
+        return self._peer_type_for(peer_id)
 
     async def resolve_phone_to_user(
         self,
@@ -93,18 +127,27 @@ class BalePvAdapter(BasePlatformAdapter):
             quoted=quoted,
             access_hash=access_hash,
             mirror_echo=mirror_echo,
+            peer_type=self._peer_type_for(peer_id),
         )
         return {"ok": True, "result": result}
 
     async def prepare_outbound(self, peer_id: str) -> None:
-        await bale_pv.prepare_outbound(self.instance_key, peer_id)
+        await bale_pv.prepare_outbound(
+            self.instance_key,
+            peer_id,
+            peer_type=self._peer_type_for(peer_id),
+        )
         # The protocol client has a verified StopTyping RPC but no captured
         # start-typing wire method yet.  Keep the same human response delay
         # without sending an invented request.
         await asyncio.sleep(random.uniform(1.0, 3.0))
 
     async def finish_outbound(self, peer_id: str) -> None:
-        await bale_pv.finish_outbound(self.instance_key, peer_id)
+        await bale_pv.finish_outbound(
+            self.instance_key,
+            peer_id,
+            peer_type=self._peer_type_for(peer_id),
+        )
 
     async def edit_message(
         self,
@@ -180,6 +223,7 @@ class BalePvAdapter(BasePlatformAdapter):
             quoted=quoted,
             access_hash=access_hash,
             mirror_echo=mirror_echo,
+            peer_type=self._peer_type_for(peer_id),
         )
         return {"ok": True, "result": result}
 
@@ -231,6 +275,10 @@ class BalePvAdapter(BasePlatformAdapter):
         chat_type = str(chat.get("type") or "private").strip().lower() or "private"
         if not chat_id:
             return None
+        self.cache_peer_metadata(
+            chat_id,
+            peer_type=("user" if chat_type == "private" else chat_type),
+        )
 
         sender = message.get("from") or {}
         sender_id = sender.get("id")
@@ -311,6 +359,7 @@ class BalePvAdapter(BasePlatformAdapter):
             "reply_to": reply_to,
             "outgoing": is_outgoing,
             "edited": bool(message.get("_edited")),
+            "deleted": bool(message.get("_deleted")),
             # True for non-displayable service messages (e.g. Bale's
             # "<name> joined Bale" contact-registered notice). The bridge uses
             # this to create/refresh the contact without opening a conversation.

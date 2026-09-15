@@ -372,6 +372,7 @@ class SendMessageRequest:
     def __init__(
         self,
         peer_id: int,
+        peer_type: int = Peer.PEER_TYPE_USER,
         text: Optional[str] = None,
         document: Optional[bytes] = None,
         random_id: Optional[int] = None,
@@ -379,6 +380,7 @@ class SendMessageRequest:
         access_hash: Optional[int] = None,
     ):
         self.peer_id = peer_id
+        self.peer_type = peer_type
         self.text = text
         self.document = document
         # Use a large random int64 if not provided
@@ -389,16 +391,16 @@ class SendMessageRequest:
     def serialize(self) -> bytes:
         # Use ExPeer when access_hash is available; required for non-contacts.
         if self.access_hash:
-            peer = ExPeer(self.peer_id, access_hash=self.access_hash)
+            peer = ExPeer(self.peer_id, self.peer_type, access_hash=self.access_hash)
         else:
-            peer = Peer(self.peer_id)
+            peer = Peer(self.peer_id, self.peer_type)
         msg = ProtobufMessage()
         msg.add_message(1, peer)
         msg.add_int64(2, self.random_id)
         msg.add_message(3, MessageContent(text=self.text, document=self.document))
         if self.reply_to_message_id is not None:
             # Field 4: replyTo peer (same type, different message_id as id)
-            msg.add_message(4, Peer(self.reply_to_message_id))
+            msg.add_message(4, Peer(self.reply_to_message_id, self.peer_type))
         # Field 6 is a duplicate peer in captures
         msg.add_message(6, peer)
         return msg.serialize()
@@ -461,12 +463,24 @@ class DeleteMessageRequest:
 class MessageReadRequest:
     """Request payload for bale.messaging.v2.Messaging/MessageRead"""
 
-    def __init__(self, peer_id: int, max_id: int):
+    def __init__(
+        self,
+        peer_id: int,
+        max_id: int,
+        peer_type: int = Peer.PEER_TYPE_USER,
+        access_hash: int = 0,
+    ):
         self.peer_id = peer_id
         self.max_id = max_id
+        self.peer_type = peer_type
+        self.access_hash = access_hash
 
     def serialize(self) -> bytes:
-        peer = Peer(self.peer_id)
+        peer = (
+            ExPeer(self.peer_id, self.peer_type, self.access_hash)
+            if self.access_hash
+            else Peer(self.peer_id, self.peer_type)
+        )
         msg = ProtobufMessage()
         msg.add_message(1, peer)
         msg.add_int64(2, self.max_id)
@@ -477,11 +491,12 @@ class MessageReadRequest:
 class StopTypingRequest:
     """Request payload for bale.messaging.v2.Messaging/StopTyping"""
 
-    def __init__(self, peer_id: int):
+    def __init__(self, peer_id: int, peer_type: int = Peer.PEER_TYPE_USER):
         self.peer_id = peer_id
+        self.peer_type = peer_type
 
     def serialize(self) -> bytes:
-        peer = Peer(self.peer_id)
+        peer = Peer(self.peer_id, self.peer_type)
         msg = ProtobufMessage()
         msg.add_message(1, peer)
         msg.add_message(6, peer)

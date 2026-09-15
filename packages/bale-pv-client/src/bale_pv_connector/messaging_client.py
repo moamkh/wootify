@@ -90,6 +90,7 @@ class BaleMessagingClient:
         reply_to_message_id: Optional[int] = None,
         access_hash: Optional[int] = None,
         random_id: Optional[int] = None,
+        peer_type: int = 1,
     ) -> Optional[bytes]:
         """Send a text message to a peer and return the raw ack bytes.
 
@@ -102,6 +103,7 @@ class BaleMessagingClient:
         """
         req = SendMessageRequest(
             peer_id=peer_id,
+            peer_type=peer_type,
             text=text,
             reply_to_message_id=reply_to_message_id,
             access_hash=access_hash,
@@ -167,6 +169,8 @@ class BaleMessagingClient:
         self,
         peer_id: int,
         max_id: int,
+        peer_type: int = 1,
+        access_hash: int = 0,
     ) -> bytes:
         """Mark messages as read up to max_id.
 
@@ -175,6 +179,8 @@ class BaleMessagingClient:
         req = MessageReadRequest(
             peer_id=peer_id,
             max_id=max_id,
+            peer_type=peer_type,
+            access_hash=access_hash,
         )
         return await self.ws.send_request(
             service_name=self.SERVICE,
@@ -182,9 +188,9 @@ class BaleMessagingClient:
             payload=req.serialize(),
         )
 
-    async def stop_typing(self, peer_id: int) -> None:
+    async def stop_typing(self, peer_id: int, peer_type: int = 1) -> None:
         """Send stop typing indicator (fire-and-forget)."""
-        req = StopTypingRequest(peer_id=peer_id)
+        req = StopTypingRequest(peer_id=peer_id, peer_type=peer_type)
         await self.ws.send_update(
             service_name=self.SERVICE,
             method="StopTyping",
@@ -267,6 +273,7 @@ class BaleMessagingClient:
         ext: Optional[Any] = None,
         peer_access_hash: int = 0,
         random_id: Optional[int] = None,
+        peer_type: int = 1,
     ) -> Optional[bytes]:
         """Send a document/media message and return the raw ack bytes.
 
@@ -293,6 +300,7 @@ class BaleMessagingClient:
         )
         req = SendMessageRequest(
             peer_id=peer_id,
+            peer_type=peer_type,
             document=doc.serialize(),
             random_id=random_id,
             reply_to_message_id=reply_to_message_id,
