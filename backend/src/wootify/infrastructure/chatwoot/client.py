@@ -312,6 +312,32 @@ class ChatwootClient:
             retry_on_read_errors=False,
         )
 
+    async def update_message_status(
+        self,
+        account_id: int,
+        conversation_id: int,
+        message_id: int,
+        *,
+        status: str,
+        external_error: Optional[str] = None,
+    ) -> Any:
+        """Update the native delivery state of an API-inbox message.
+
+        Chatwoot displays ``failed`` messages with their external error and
+        exposes its built-in Retry action. A read timeout is not retried here:
+        the update may already have committed and a repeated status event is
+        unnecessary.
+        """
+        data: Dict[str, Any] = {"status": str(status).strip().lower()}
+        if external_error is not None:
+            data["external_error"] = str(external_error)
+        return await self._request(
+            "PATCH",
+            f"/api/v1/accounts/{account_id}/conversations/{conversation_id}/messages/{message_id}",
+            json_data=data,
+            retry_on_read_errors=False,
+        )
+
     @staticmethod
     def _flatten_multipart_data(data: Dict[str, Any]) -> Dict[str, Any]:
         """Flatten nested dict values into Rails bracket-notation keys.
