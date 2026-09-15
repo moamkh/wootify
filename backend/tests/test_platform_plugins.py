@@ -18,6 +18,7 @@ EXPECTED_KEYS = {
     "bale",
     "bale_enterprise",
     "bale_pv_enterprise",
+    "eitaa_pv_enterprise",
     "instagram_pv_enterprise",
     "telegram",
     "telegram_enterprise",

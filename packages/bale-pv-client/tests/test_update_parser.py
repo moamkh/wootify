@@ -13,6 +13,14 @@ def _build_text_message(text: str) -> bytes:
     return msg.serialize()
 
 
+def _build_deleted_message() -> bytes:
+    msg = ProtobufMessage()
+    msg.add_message(
+        3, ProtobufMessage(), include_empty=True
+    )  # Message G -> empty deletedMessage marker
+    return msg.serialize()
+
+
 def _build_update_message_frame(
     peer_id: int,
     sender_uid: int,
@@ -98,6 +106,28 @@ def test_parse_new_text_message_update() -> None:
     assert parsed["peer"] == {"type": 1, "id": 123}
     assert parsed["text"] == "hello"
     assert parsed["message_type"] == "text"
+
+
+def test_parse_deleted_message_update() -> None:
+    peer = Peer(123).serialize()
+    update = ProtobufMessage()
+    update.add_bytes(1, peer)
+    update.add_int32(2, 456)
+    update.add_int64(4, 789)
+    update.add_bytes(5, _build_deleted_message())
+    wrapper = ProtobufMessage().add_bytes(
+        BaleUpdateType.NEW_MESSAGE, update.serialize()
+    )
+    inner = ProtobufMessage().add_bytes(1, wrapper.serialize())
+    frame = ProtobufMessage().add_bytes(1, inner.serialize()).serialize()
+
+    parsed = parse_ws_update(frame)
+
+    assert parsed is not None
+    assert parsed["rid"] == "789"
+    assert parsed["deleted"] is True
+    assert parsed["message_type"] == "deleted"
+    assert parsed["text"] == ""
 
 
 def test_parse_channel_message_update() -> None:

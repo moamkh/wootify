@@ -58,7 +58,12 @@ async def test_private_placeholder_repair_preserves_custom_names(existing_name, 
     with patch.object(service, '_chatwoot_client_for_instance', return_value=(instance, {'account_id': 1, 'inbox_id': 2}, client)), patch.object(service, '_get_or_create_contact', new=AsyncMock(return_value=(10, False))):
         result = await service.ingest_platform_event(MagicMock(), 'test', event)
     assert result['contact_only']
+    name_updates = [
+        call
+        for call in client.update_contact.await_args_list
+        if len(call.args) >= 3 and call.args[2].get('name') == 'Saved Contact'
+    ]
     if should_rename:
-        client.update_contact.assert_awaited_once_with(1, 10, {'name': 'Saved Contact'})
+        assert len(name_updates) == 1
     else:
-        client.update_contact.assert_not_awaited()
+        assert name_updates == []

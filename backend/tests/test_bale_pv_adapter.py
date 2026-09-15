@@ -1348,7 +1348,7 @@ async def test_webhook_propagates_message_updated_deleted(db_session):
 
     mapping = MessageMapping(
         conversation_id=str(conversation.id),
-        direction=MessageDirection.platform_to_chatwoot,
+        direction=MessageDirection.chatwoot_to_platform,
         message_kind=MessageKind.text,
         platform_message_id="888",
         chatwoot_message_id="999",

@@ -215,8 +215,23 @@ class _FakeMessagingClient:
         self.ack = ack
         self.sent = []
 
-    async def send_message(self, peer_id, text, reply_to_message_id=None, access_hash=None, random_id=None):
-        self.sent.append({"peer_id": peer_id, "text": text, "random_id": random_id})
+    async def send_message(
+        self,
+        peer_id,
+        text,
+        reply_to_message_id=None,
+        access_hash=None,
+        random_id=None,
+        peer_type=1,
+    ):
+        self.sent.append(
+            {
+                "peer_id": peer_id,
+                "peer_type": peer_type,
+                "text": text,
+                "random_id": random_id,
+            }
+        )
         return self.ack
 
 
