@@ -1,5 +1,18 @@
 # Changelog
 
+## 7.0.2 — 2026-09-16
+
+- Route outbound Chatwoot messages through instance-owned conversation
+  mappings and safely parse Bale, Eitaa, Telegram and Instagram identifiers.
+- Type Bale contacts as users, groups or channels and record confirmed
+  sendability without misclassifying protocol peer types.
+- Mark failed Chatwoot deliveries with the native failed state and external
+  error so agents see the red undelivered indicator and Retry action.
+- Use Bale's real `MessageRead` RPC with peer-aware read and typing state.
+- Decode Bale's `deletedMessage` WebSocket marker and propagate native Bale
+  deletions to Chatwoot without creating a delete echo loop.
+- No database schema changes.
+
 ## 7.0.1 — 2026-09-13
 
 - Reconnect reliability follow-up: fail disconnected Bale RPCs as connection
