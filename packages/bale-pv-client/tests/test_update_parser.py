@@ -130,6 +130,39 @@ def test_parse_deleted_message_update() -> None:
     assert parsed["text"] == ""
 
 
+def test_parse_web_bale_dedicated_delete_update() -> None:
+    """Parse the field-54341 delete frame captured from production Web Bale."""
+    reference = ProtobufMessage()
+    reference.add_int64(1, 1789547704022)
+    reference.add_int64(2, 9407350905859307013)
+
+    deleted = ProtobufMessage()
+    deleted.add_bytes(1, reference.serialize())
+    deleted.add_bytes(2, Peer(1755271951).serialize())
+
+    wrapper = ProtobufMessage().add_bytes(
+        BaleUpdateType.DELETE_MESSAGE, deleted.serialize()
+    )
+    container = ProtobufMessage()
+    container.add_bytes(1, wrapper.serialize())
+    container.add_int64(3, 42895)
+    container.add_int64(4, 1789547751768)
+    inner = ProtobufMessage().add_bytes(1, container.serialize())
+    frame = ProtobufMessage().add_bytes(2, inner.serialize()).serialize()
+
+    parsed = parse_ws_update(frame)
+
+    assert parsed == {
+        "type": "message",
+        "rid": "9407350905859307013",
+        "date": 1789547704022,
+        "peer": {"type": 1, "id": 1755271951},
+        "text": "",
+        "message_type": "deleted",
+        "deleted": True,
+    }
+
+
 def test_parse_channel_message_update() -> None:
     """Real channel/group messages carry senderInfo with the actual sender uid."""
     sender_info = ProtobufMessage()

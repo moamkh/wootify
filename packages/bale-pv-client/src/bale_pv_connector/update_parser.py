@@ -105,6 +105,9 @@ class BaleUpdateType:
     NEW_MESSAGE = 55
     APP_SETTINGS = 131
     CHANNEL_MESSAGE = 162
+    # Web Bale emits message deletions as a dedicated high-numbered update.
+    # The payload contains field 1 = {original_date, rid} and field 2 = Peer.
+    DELETE_MESSAGE = 54341
     # Seen in recent captures: call-signaling field numbers are not a tight block.
     CALL_SIGNALING_START = 52805
     CALL_SIGNALING_END = 52832
@@ -135,7 +138,7 @@ KNOWN_WRAPPER_FIELDS: set[int] = {
     2627,
     54323,
     54335,
-    54341,
+    BaleUpdateType.DELETE_MESSAGE,
 }
 
 
@@ -840,6 +843,7 @@ def parse_ws_update(data: bytes) -> Optional[Dict[str, Any]]:
       55: updateMessage (new private/group message)
       131: appSettings (in_app_message_config, drafts, view counts)
       162: channelMessage (channel/broadcast message)
+      54341: deleteMessage (original timestamp/RID + peer)
       52805-52832: callSignaling (voice/video call events)
 
     UpdateMessage (field 55) fields:
@@ -1074,6 +1078,44 @@ def parse_ws_update(data: bytes) -> Optional[Dict[str, Any]]:
         channel_bytes = wrapper.get(BaleUpdateType.CHANNEL_MESSAGE, [None])[0]
         if isinstance(channel_bytes, bytes):
             return _apply_ts(_parse_channel_message_update(channel_bytes))
+
+        # Field 54341: message deleted from Web Bale. Unlike the older
+        # deletedMessage content marker, this update has no sender or Message G:
+        #   1: {1: original timestamp, 2: rid}
+        #   2: Peer {1: type, 2: id}
+        # The peer and RID are sufficient for the connector/bridge to locate
+        # and soft-delete the corresponding Chatwoot message.
+        delete_bytes = wrapper.get(BaleUpdateType.DELETE_MESSAGE, [None])[0]
+        if isinstance(delete_bytes, bytes):
+            deleted = ProtobufParser(delete_bytes).parse()
+            reference_bytes = deleted.get(1, [None])[0]
+            peer_bytes = deleted.get(2, [None])[0]
+            reference = (
+                ProtobufParser(reference_bytes).parse()
+                if isinstance(reference_bytes, bytes)
+                else {}
+            )
+            rid = reference.get(2, [None])[0]
+            original_date = reference.get(1, [None])[0]
+            peer = _parse_peer(peer_bytes) if isinstance(peer_bytes, bytes) else None
+            if isinstance(rid, int) and peer and isinstance(peer.get("id"), int):
+                return _apply_ts(
+                    {
+                        "type": "message",
+                        "rid": str(rid),
+                        "date": original_date,
+                        "peer": peer,
+                        "text": "",
+                        "message_type": "deleted",
+                        "deleted": True,
+                    }
+                )
+            logger.warning(
+                "bale_ws_invalid_delete_update rid=%s peer=%s",
+                rid,
+                peer,
+            )
+            return None
 
         # Field 19: read/delivery receipt
         status_bytes = wrapper.get(BaleUpdateType.MESSAGE_STATUS, [None])[0]

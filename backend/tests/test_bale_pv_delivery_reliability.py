@@ -113,6 +113,40 @@ def test_deleted_wire_update_reaches_adapter_as_deleted_event():
     assert event["platform_message_id"] == "9020"
 
 
+def test_web_bale_dedicated_delete_reaches_adapter_as_deleted_event():
+    reference = ProtobufMessage()
+    reference.add_int64(1, 1789547704022)
+    reference.add_int64(2, 9407350905859307013)
+    deleted = ProtobufMessage()
+    deleted.add_bytes(1, reference.serialize())
+    deleted.add_bytes(2, Peer(1755271951).serialize())
+    wrapper = ProtobufMessage().add_bytes(
+        BaleUpdateType.DELETE_MESSAGE, deleted.serialize()
+    )
+    container = ProtobufMessage()
+    container.add_bytes(1, wrapper.serialize())
+    container.add_int64(4, 1789547751768)
+    inner = ProtobufMessage().add_bytes(1, container.serialize())
+    frame = ProtobufMessage().add_bytes(2, inner.serialize()).serialize()
+
+    normalized = BalePvConnector._parse_raw_update(
+        frame,
+        user_cache={},
+        self_user_id=999,
+    )
+    assert normalized is not None
+    assert normalized["message"]["chat"]["id"] == "1755271951"
+    assert normalized["message"]["message_id"] == "9407350905859307013"
+    assert normalized["message"]["_deleted"] is True
+
+    adapter = BalePvAdapter("delete-sample", {})
+    event = adapter.normalize_incoming_update(normalized)
+    assert event is not None
+    assert event["deleted"] is True
+    assert event["platform_message_id"] == "9407350905859307013"
+    assert event["chat_id"] == "1755271951"
+
+
 def test_senderless_group_delete_uses_authoritative_peer():
     content = ProtobufMessage().add_message(
         3, ProtobufMessage(), include_empty=True
