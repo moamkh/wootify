@@ -15,18 +15,13 @@ class ChatwootWebhookService:
     """Own the account-webhook lifecycle for a Wootify instance."""
 
     SUBSCRIPTIONS = [
+        # These are the only events consumed by the bridge.  Account-level
+        # webhooks are delivered to every configured instance URL, so
+        # subscribing to contact/conversation/inbox/typing noise multiplies
+        # load without changing connector state.
         "conversation_status_changed",
-        "conversation_updated",
-        "conversation_created",
-        "contact_created",
-        "contact_updated",
         "message_created",
         "message_updated",
-        "webwidget_triggered",
-        "inbox_created",
-        "inbox_updated",
-        "conversation_typing_on",
-        "conversation_typing_off",
     ]
 
     def __init__(

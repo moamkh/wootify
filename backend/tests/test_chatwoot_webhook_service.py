@@ -36,7 +36,11 @@ async def test_configure_creates_missing_instance_webhook():
     assert result["created"] is True
     payload = client.create_webhook.await_args.args[1]
     assert payload["url"].endswith("/api/v1/webhooks/chatwoot/bale-one")
-    assert "message_updated" in payload["subscriptions"]
+    assert payload["subscriptions"] == [
+        "conversation_status_changed",
+        "message_created",
+        "message_updated",
+    ]
     client.close.assert_awaited_once()
 
 
