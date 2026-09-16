@@ -34,6 +34,11 @@ class Settings(BaseSettings):
     SQLITE_MIGRATION_SOURCE_URL: str = default_sqlite_database_url
     SQLITE_BUSY_TIMEOUT_MS: int = 60000
     SQLITE_JOURNAL_MODE: str = 'WAL'
+    # Bound PostgreSQL lock waits so one synchronous ORM statement cannot
+    # indefinitely stall the single asyncio worker.  The idle transaction
+    # timeout is a final safety net for sessions stranded across network I/O.
+    POSTGRES_LOCK_TIMEOUT_MS: int = 5000
+    POSTGRES_IDLE_TRANSACTION_TIMEOUT_MS: int = 60000
 
     CHATWOOT_BASE_URL: str = 'http://localhost:3000'
     CHATWOOT_API_TOKEN: str = ''

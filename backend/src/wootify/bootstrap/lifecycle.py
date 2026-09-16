@@ -10,7 +10,11 @@ from typing import TYPE_CHECKING, AsyncIterator
 from fastapi import FastAPI
 
 from wootify.config import settings
-from wootify.presentation.http.api_v1 import _webhook_delivery_tasks
+from wootify.presentation.http.api_v1 import (
+    _webhook_delivery_tasks,
+    start_chatwoot_delivery_recovery,
+    stop_chatwoot_delivery_recovery,
+)
 from wootify.infrastructure.persistence.session import SessionLocal, engine
 from wootify.logging_config import configure_logging
 from wootify.infrastructure.persistence.models import Base
@@ -51,9 +55,11 @@ class ApplicationLifecycle:
         self.initialize_database()
         await self.container.polling.start()
         await self.container.instagram_polling.start()
+        await start_chatwoot_delivery_recovery()
 
     async def stop(self) -> None:
         logger.info("shutdown")
+        await stop_chatwoot_delivery_recovery()
         pending_tasks = [task for task in _webhook_delivery_tasks if not task.done()]
         if pending_tasks:
             logger.info("shutdown: draining %d in-flight webhook deliveries", len(pending_tasks))

@@ -9,6 +9,7 @@ cleaner pattern from evolution-api/messenger_chatwoot_connector:
 
 from __future__ import annotations
 
+import asyncio
 import datetime as dt
 import logging
 import re
@@ -47,6 +48,7 @@ from wootify.runtime_registry import get_runtime
 from wootify.application.messaging.conversation_mapping import ConversationMappingService
 from wootify.application.shared.cache import TTLCache
 from wootify.infrastructure.security.crypto import encryptor
+from wootify.infrastructure.persistence.session import SessionLocal
 
 logger = logging.getLogger("app.services.chatwoot_bridge_service")
 
@@ -680,8 +682,8 @@ class ChatwootBridgeService:
             # webhook retries and deactivates stale mappings for the peer.
             if chatwoot_conversation_id:
                 try:
-                    ConversationMappingService().upsert(
-                        db,
+                    await self._persist_outbound_conversation_mapping(
+                        db=db,
                         instance_id=instance.id,
                         platform_conversation_id=str(peer_id),
                         chatwoot_conversation_id=str(chatwoot_conversation_id),
@@ -689,6 +691,9 @@ class ChatwootBridgeService:
                         chatwoot_inbox_id=str(conv_obj.get("inbox_id") or payload.get("inbox_id") or "") or None,
                     )
                 except Exception as exc:
+                    # Never carry a failed/locked transaction into network
+                    # awaits or the delivery-failure notification path.
+                    db.rollback()
                     logger.warning(
                         "chatwoot_bridge.outbound_mapping_persist_failed instance=%s chatwoot_conversation_id=%s peer_id=%s error=%s",
                         instance_key,
@@ -844,6 +849,15 @@ class ChatwootBridgeService:
                     exc,
                 )
         except Exception as exc:
+            # A failed flush/lock wait leaves the SQLAlchemy session unusable
+            # until rollback.  Release every lock before awaiting Chatwoot.
+            try:
+                db.rollback()
+            except Exception:
+                logger.exception(
+                    "chatwoot_bridge.outbound_delivery_rollback_failed instance=%s",
+                    instance_key,
+                )
             # Delivery runs in a background task (the webhook was already
             # acked), so surface the failure to agents as a private note on
             # the conversation instead of failing silently.
@@ -876,6 +890,53 @@ class ChatwootBridgeService:
             }
 
         return {"ok": True, "peer_id": peer_id, "sent": sent}
+
+    @staticmethod
+    async def _persist_outbound_conversation_mapping(
+        *,
+        db: Session,
+        instance_id: str,
+        platform_conversation_id: str,
+        chatwoot_conversation_id: str,
+        chatwoot_contact_id: Optional[str],
+        chatwoot_inbox_id: Optional[str],
+    ) -> None:
+        """Commit mapping changes before any platform/network await.
+
+        PostgreSQL mapping writes run in a short worker-thread transaction so
+        a contended row lock cannot block the asyncio event loop.  SQLite tests
+        keep using their existing session because the StaticPool connection is
+        intentionally shared and is not safe to use concurrently in a thread.
+        """
+
+        def persist_with_session(mapping_db: Session) -> None:
+            try:
+                ConversationMappingService().upsert(
+                    mapping_db,
+                    instance_id=str(instance_id),
+                    platform_conversation_id=str(platform_conversation_id),
+                    chatwoot_conversation_id=str(chatwoot_conversation_id),
+                    chatwoot_contact_id=chatwoot_contact_id,
+                    chatwoot_inbox_id=chatwoot_inbox_id,
+                )
+                mapping_db.commit()
+            except Exception:
+                mapping_db.rollback()
+                raise
+
+        dialect_obj = getattr(getattr(db, "bind", None), "dialect", None)
+        dialect = str(getattr(dialect_obj, "name", "") or "")
+        if dialect == "postgresql":
+            def persist_postgresql() -> None:
+                with SessionLocal() as mapping_db:
+                    persist_with_session(mapping_db)
+
+            await asyncio.to_thread(persist_postgresql)
+            # The request/background session may have cached the old mapping.
+            db.expire_all()
+            return
+
+        persist_with_session(db)
 
     async def _handle_platform_message_deleted(
         self,

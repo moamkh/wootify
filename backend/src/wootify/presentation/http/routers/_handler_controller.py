@@ -9,6 +9,9 @@ from __future__ import annotations
 import asyncio
 import base64
 import binascii
+import datetime as dt
+import hashlib
+import json
 import logging
 from dataclasses import dataclass
 from pathlib import Path
@@ -16,9 +19,11 @@ from typing import Any, Optional
 
 import httpx
 from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile, status
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from wootify.infrastructure.persistence.session import SessionLocal, get_db
+from wootify.infrastructure.persistence.models import ChatwootWebhookDelivery
 from wootify.presentation.http.schemas.api_v1 import (
     AutoCreateInboxResponse,
     BalePvContactsResponse,
@@ -1399,6 +1404,9 @@ async def bale_pv_dialogs(instance_key: str, db: Session = Depends(get_db)):
 
 # Strong references to in-flight background webhook deliveries (prevents GC of tasks).
 _webhook_delivery_tasks: set = set()
+_webhook_delivery_active_ids: set[str] = set()
+_webhook_delivery_recovery_task: Optional[asyncio.Task] = None
+_webhook_delivery_recovery_stop: Optional[asyncio.Event] = None
 
 # Bounded fan-out for background deliveries so a burst of webhooks (or a slow
 # platform) cannot accumulate unlimited concurrent transfers.
@@ -1406,6 +1414,9 @@ _webhook_delivery_semaphore = asyncio.Semaphore(20)
 
 # Hard cap on a single background delivery so hung transfers cannot live forever.
 _WEBHOOK_DELIVERY_TIMEOUT_SECONDS = 300
+_WEBHOOK_DELIVERY_RECOVERY_INTERVAL_SECONDS = 10
+_WEBHOOK_DELIVERY_RETRY_MAX_SECONDS = 300
+_WEBHOOK_DELIVERY_MAX_ATTEMPTS = 10
 
 # Per-(instance, conversation) delivery locks: serialize redeliveries/retries of
 # the same conversation so concurrent background tasks cannot both pass the
@@ -1487,25 +1498,98 @@ def _log_delivery_result(resolved_instance_key: str, route_key: Optional[str], r
         )
 
 
+def _chatwoot_delivery_key(instance_key: str, route_key: Optional[str], payload: dict[str, Any]) -> str:
+    """Return a stable idempotency key for one exact Chatwoot callback."""
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str).encode("utf-8")
+    digest = hashlib.sha256(encoded).hexdigest()
+    return hashlib.sha256(f"{instance_key}:{route_key or ''}:{digest}".encode("utf-8")).hexdigest()
+
+
+def _persist_chatwoot_delivery(
+    db: Session,
+    *,
+    instance_key: str,
+    platform_key: str,
+    route_key: Optional[str],
+    payload: dict[str, Any],
+) -> str:
+    """Durably queue a webhook before returning HTTP 200 to Chatwoot."""
+    delivery_key = _chatwoot_delivery_key(instance_key, route_key, payload)
+    row = ChatwootWebhookDelivery(
+        delivery_key=delivery_key,
+        instance_key=instance_key,
+        platform_key=platform_key,
+        route_key=route_key,
+        payload_json=payload,
+        status="pending",
+        attempts=0,
+        next_attempt_at=dt.datetime.utcnow(),
+    )
+    try:
+        db.add(row)
+        db.commit()
+        db.refresh(row)
+        return str(row.id)
+    except IntegrityError:
+        db.rollback()
+        existing = (
+            db.query(ChatwootWebhookDelivery)
+            .filter(ChatwootWebhookDelivery.delivery_key == delivery_key)
+            .one()
+        )
+        # A deliberate Chatwoot retry should re-arm a terminal failure.
+        if existing.status == "failed":
+            existing.status = "pending"
+            existing.next_attempt_at = dt.datetime.utcnow()
+            existing.last_error = None
+            db.commit()
+        return str(existing.id)
+
+
+def _complete_chatwoot_delivery(delivery_id: str) -> None:
+    with SessionLocal() as db:
+        row = db.get(ChatwootWebhookDelivery, str(delivery_id))
+        if row is not None:
+            db.delete(row)
+            db.commit()
+
+
+def _fail_chatwoot_delivery(delivery_id: str, error: str, *, terminal: bool = False) -> None:
+    with SessionLocal() as db:
+        row = db.get(ChatwootWebhookDelivery, str(delivery_id))
+        if row is None:
+            return
+        row.attempts = int(row.attempts or 0) + 1
+        row.last_error = str(error)[:1000]
+        if terminal or row.attempts >= _WEBHOOK_DELIVERY_MAX_ATTEMPTS:
+            row.status = "failed"
+            row.next_attempt_at = None
+        else:
+            delay = min(2 ** min(row.attempts, 8), _WEBHOOK_DELIVERY_RETRY_MAX_SECONDS)
+            row.status = "pending"
+            row.next_attempt_at = dt.datetime.utcnow() + dt.timedelta(seconds=delay)
+        db.commit()
+
+
+def _delivery_result_failed(result: Any) -> bool:
+    if not isinstance(result, dict):
+        return False
+    return bool(
+        result.get("ok") is False
+        or result.get("status") in ("failed", "error")
+        or result.get("message") == "delivery_failed"
+    )
+
+
 async def _deliver_chatwoot_webhook_background(
     platform_key: str,
     resolved_instance_key: str,
     payload: dict[str, Any],
     *,
     route_key: Optional[str],
+    delivery_id: str,
 ) -> None:
-    """Deliver a Chatwoot webhook to the platform in the background.
-
-    Runs with its own DB session because the request-scoped session is closed
-    when the webhook response is returned. Delivery failures were already
-    acknowledged with HTTP 200 before this change, so logging here preserves
-    the previous failure semantics while decoupling Chatwoot's webhook timeout
-    from platform delivery latency.
-
-    Delivery is serialized per (instance, conversation) to close the TOCTOU
-    duplicate window between concurrent redeliveries, bounded by a module-level
-    semaphore, and capped by a timeout so hung transfers cannot accumulate.
-    """
+    """Deliver one durably queued Chatwoot webhook to its platform."""
     db = SessionLocal()
     try:
         if platform_key == 'bale_enterprise':
@@ -1516,9 +1600,6 @@ async def _deliver_chatwoot_webhook_background(
             result = await chatwoot_bridge.handle_chatwoot_webhook(db, resolved_instance_key, payload)
         else:
             result = await bridge.receive_chatwoot_webhook(db, resolved_instance_key, payload)
-        # The endpoint acknowledges callbacks before platform delivery. Record
-        # the result without message content so an ignored outbound webhook is
-        # distinguishable from a successful Instagram/Bale send in local logs.
         logger.info(
             'endpoint=webhook_chatwoot background_delivery_result instance_key=%s route_key=%s event=%s message_id=%s conversation_id=%s message_type=%s ok=%s ignored=%s reason=%s',
             resolved_instance_key,
@@ -1531,17 +1612,34 @@ async def _deliver_chatwoot_webhook_background(
             result.get('ignored') if isinstance(result, dict) else None,
             result.get('reason') if isinstance(result, dict) else None,
         )
-
         _log_delivery_result(resolved_instance_key, route_key, result)
+        if _delivery_result_failed(result):
+            await asyncio.to_thread(
+                _fail_chatwoot_delivery,
+                delivery_id,
+                str(result.get('detail') or result.get('message') or 'delivery_failed'),
+                terminal=True,
+            )
+        else:
+            await asyncio.to_thread(_complete_chatwoot_delivery, delivery_id)
+    except asyncio.CancelledError:
+        db.rollback()
+        raise
     except Exception as exc:
+        db.rollback()
         logger.exception(
             'endpoint=webhook_chatwoot background_delivery_failed instance_key=%s route_key=%s error=%s',
             resolved_instance_key,
             route_key,
             str(exc),
         )
+        await asyncio.to_thread(_fail_chatwoot_delivery, delivery_id, f'{type(exc).__name__}: {exc}')
     finally:
-        db.close()
+        try:
+            if db.in_transaction():
+                db.rollback()
+        finally:
+            db.close()
 
 
 async def _deliver_chatwoot_webhook_guarded(
@@ -1550,6 +1648,7 @@ async def _deliver_chatwoot_webhook_guarded(
     payload: dict[str, Any],
     *,
     route_key: Optional[str],
+    delivery_id: str,
 ) -> None:
     """Wrap background delivery with the semaphore, timeout, and per-conversation lock."""
     lock_key = _chatwoot_delivery_lock_key(resolved_instance_key, payload)
@@ -1563,6 +1662,7 @@ async def _deliver_chatwoot_webhook_guarded(
                         resolved_instance_key,
                         payload,
                         route_key=route_key,
+                        delivery_id=delivery_id,
                     ),
                     timeout=_WEBHOOK_DELIVERY_TIMEOUT_SECONDS,
                 )
@@ -1574,8 +1674,112 @@ async def _deliver_chatwoot_webhook_guarded(
                     resolved_instance_key,
                     route_key,
                 )
+                await asyncio.to_thread(
+                    _fail_chatwoot_delivery,
+                    delivery_id,
+                    'delivery_timeout',
+                )
             finally:
                 _release_webhook_delivery_lock(lock_key, lock)
+
+
+def _schedule_chatwoot_delivery(
+    *,
+    delivery_id: str,
+    platform_key: str,
+    instance_key: str,
+    payload: dict[str, Any],
+    route_key: Optional[str],
+) -> None:
+    """Schedule a queued delivery once per process."""
+    if delivery_id in _webhook_delivery_active_ids:
+        return
+    _webhook_delivery_active_ids.add(delivery_id)
+    task = asyncio.create_task(
+        _deliver_chatwoot_webhook_guarded(
+            platform_key,
+            instance_key,
+            payload,
+            route_key=route_key,
+            delivery_id=delivery_id,
+        )
+    )
+    _webhook_delivery_tasks.add(task)
+
+    def completed(done: asyncio.Task) -> None:
+        _webhook_delivery_tasks.discard(done)
+        _webhook_delivery_active_ids.discard(delivery_id)
+
+    task.add_done_callback(completed)
+
+
+def _load_due_chatwoot_deliveries() -> list[dict[str, Any]]:
+    now = dt.datetime.utcnow()
+    with SessionLocal() as db:
+        rows = (
+            db.query(ChatwootWebhookDelivery)
+            .filter(
+                ChatwootWebhookDelivery.status == 'pending',
+                (ChatwootWebhookDelivery.next_attempt_at.is_(None))
+                | (ChatwootWebhookDelivery.next_attempt_at <= now),
+            )
+            .order_by(ChatwootWebhookDelivery.created_at.asc())
+            .limit(100)
+            .all()
+        )
+        return [
+            {
+                'id': str(row.id),
+                'platform_key': str(row.platform_key),
+                'instance_key': str(row.instance_key),
+                'payload': dict(row.payload_json or {}),
+                'route_key': row.route_key,
+            }
+            for row in rows
+        ]
+
+
+async def _run_chatwoot_delivery_recovery() -> None:
+    assert _webhook_delivery_recovery_stop is not None
+    while not _webhook_delivery_recovery_stop.is_set():
+        try:
+            rows = await asyncio.to_thread(_load_due_chatwoot_deliveries)
+            for row in rows:
+                _schedule_chatwoot_delivery(
+                    delivery_id=row['id'],
+                    platform_key=row['platform_key'],
+                    instance_key=row['instance_key'],
+                    payload=row['payload'],
+                    route_key=row['route_key'],
+                )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception('chatwoot webhook delivery recovery scan failed')
+        try:
+            await asyncio.wait_for(
+                _webhook_delivery_recovery_stop.wait(),
+                timeout=_WEBHOOK_DELIVERY_RECOVERY_INTERVAL_SECONDS,
+            )
+        except asyncio.TimeoutError:
+            pass
+
+
+async def start_chatwoot_delivery_recovery() -> None:
+    global _webhook_delivery_recovery_stop, _webhook_delivery_recovery_task
+    if _webhook_delivery_recovery_task and not _webhook_delivery_recovery_task.done():
+        return
+    _webhook_delivery_recovery_stop = asyncio.Event()
+    _webhook_delivery_recovery_task = asyncio.create_task(_run_chatwoot_delivery_recovery())
+
+
+async def stop_chatwoot_delivery_recovery() -> None:
+    global _webhook_delivery_recovery_task
+    if _webhook_delivery_recovery_stop is not None:
+        _webhook_delivery_recovery_stop.set()
+    if _webhook_delivery_recovery_task is not None:
+        await _webhook_delivery_recovery_task
+    _webhook_delivery_recovery_task = None
 
 
 async def _handle_chatwoot_webhook(
@@ -1629,20 +1833,23 @@ async def _handle_chatwoot_webhook(
                 status='ignored',
             )
         resolved_instance_key = runtime.instance.instance_key
-        # Instagram polling owns the same stateful client and can temporarily
-        # hold its lock while an inbox request finishes. Acknowledge Chatwoot
-        # first, then retain the guarded task until it has delivered or timed
-        # out. The persisted mapping makes Chatwoot retries idempotent.
-        task = asyncio.create_task(
-            _deliver_chatwoot_webhook_guarded(
-                runtime.platform_type.key,
-                resolved_instance_key,
-                payload,
-                route_key=route_key,
-            )
+        # Commit a durable queue row before acknowledging Chatwoot.  If the
+        # worker exits after the HTTP 200 but before delivery, startup recovery
+        # schedules this exact payload again.
+        delivery_id = _persist_chatwoot_delivery(
+            db,
+            instance_key=resolved_instance_key,
+            platform_key=runtime.platform_type.key,
+            route_key=route_key,
+            payload=payload,
         )
-        _webhook_delivery_tasks.add(task)
-        task.add_done_callback(_webhook_delivery_tasks.discard)
+        _schedule_chatwoot_delivery(
+            delivery_id=delivery_id,
+            platform_key=runtime.platform_type.key,
+            instance_key=resolved_instance_key,
+            payload=payload,
+            route_key=route_key,
+        )
         return GenericMessageResponse(
             message='accepted',
             detail='delivery scheduled in background',

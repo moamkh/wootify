@@ -5,12 +5,17 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
+from sqlalchemy import create_engine
+from sqlalchemy.orm import sessionmaker
 
 import wootify.services.chatwoot_bridge_service as bridge_module
+import wootify.presentation.http.routers._handler_controller as webhook_controller
 from wootify.application.messaging.chatwoot_bridge import ChatwootBridgeService
 from wootify.application.messaging.destination_resolver import DestinationResolver
 from wootify.infrastructure.persistence.models import (
     Conversation,
+    ChatwootWebhookDelivery,
+    Base,
     Instance,
     MessageDirection,
     MessageKind,
@@ -293,6 +298,76 @@ async def test_disconnected_instance_marks_outgoing_message_failed(db_session, m
         external_error="Bale PV: RuntimeError: instance_not_connected",
     )
     client.post_message.assert_awaited_once()
+
+
+@pytest.mark.anyio
+async def test_outbound_mapping_is_committed_before_platform_prepare(db_session):
+    instance = _instance(db_session, "mapping-transaction-bale")
+    service = ChatwootBridgeService()
+
+    await service._persist_outbound_conversation_mapping(
+        db=db_session,
+        instance_id=instance.id,
+        platform_conversation_id="123",
+        chatwoot_conversation_id="8123",
+        chatwoot_contact_id="42",
+        chatwoot_inbox_id="5",
+    )
+
+    assert db_session.in_transaction() is False
+    row = (
+        db_session.query(Conversation)
+        .filter(
+            Conversation.instance_id == instance.id,
+            Conversation.platform_conversation_id == "123",
+        )
+        .one()
+    )
+    assert row.chatwoot_conversation_id == "8123"
+
+
+def test_chatwoot_webhook_is_durable_and_failed_retry_rearms(tmp_path, monkeypatch):
+    engine = create_engine(f"sqlite:///{tmp_path / 'deliveries.db'}")
+    Base.metadata.create_all(engine)
+    factory = sessionmaker(bind=engine, autocommit=False, autoflush=False)
+    monkeypatch.setattr(webhook_controller, "SessionLocal", factory)
+    payload = _payload("BALE_PV:USER:123", message_id=9911, conversation_id=8811)
+    with factory() as session:
+        delivery_id = webhook_controller._persist_chatwoot_delivery(
+            session,
+            instance_key="durable-bale",
+            platform_key="bale_pv_enterprise",
+            route_key=None,
+            payload=payload,
+        )
+        duplicate_id = webhook_controller._persist_chatwoot_delivery(
+            session,
+            instance_key="durable-bale",
+            platform_key="bale_pv_enterprise",
+            route_key=None,
+            payload=payload,
+        )
+        assert duplicate_id == delivery_id
+
+        webhook_controller._fail_chatwoot_delivery(
+            delivery_id, "PermissionDenied", terminal=True
+        )
+        session.expire_all()
+        failed = session.get(ChatwootWebhookDelivery, delivery_id)
+        assert failed is not None
+        assert failed.status == "failed"
+
+        rearmed_id = webhook_controller._persist_chatwoot_delivery(
+            session,
+            instance_key="durable-bale",
+            platform_key="bale_pv_enterprise",
+            route_key=None,
+            payload=payload,
+        )
+        session.expire_all()
+        assert rearmed_id == delivery_id
+        assert session.get(ChatwootWebhookDelivery, delivery_id).status == "pending"
+    engine.dispose()
 
 
 @pytest.mark.anyio

@@ -113,6 +113,23 @@ if _is_sqlite_url(DATABASE_URL):
         cursor.close()
 
 
+if _is_postgresql_url(DATABASE_URL):
+
+    @event.listens_for(engine, 'connect')
+    def _set_postgresql_timeouts(dbapi_connection, _connection_record):
+        """Prevent a row lock or abandoned transaction from wedging the worker."""
+        cursor = dbapi_connection.cursor()
+        cursor.execute(
+            "SET lock_timeout = %s",
+            (f"{max(int(settings.POSTGRES_LOCK_TIMEOUT_MS), 1)}ms",),
+        )
+        cursor.execute(
+            "SET idle_in_transaction_session_timeout = %s",
+            (f"{max(int(settings.POSTGRES_IDLE_TRANSACTION_TIMEOUT_MS), 1000)}ms",),
+        )
+        cursor.close()
+
+
 def get_db() -> Generator[Session, None, None]:
     """Get db."""
     db = SessionLocal()

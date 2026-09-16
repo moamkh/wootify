@@ -90,3 +90,29 @@ class InboundEventRetry(Base):
     last_attempt_at = Column(DateTime(timezone=True), nullable=True)
     # Earliest time the drainer should retry this row (exponential backoff).
     next_attempt_at = Column(DateTime(timezone=True), nullable=True, index=True)
+
+
+class ChatwootWebhookDelivery(Base):
+    """Durable, acknowledged Chatwoot webhook awaiting platform delivery."""
+
+    __tablename__ = "chatwoot_webhook_deliveries"
+
+    id = Column(String(36), primary_key=True, default=_uuid)
+    delivery_key = Column(String(64), nullable=False, unique=True, index=True)
+    instance_key = Column(String(128), nullable=False, index=True)
+    platform_key = Column(String(64), nullable=False)
+    route_key = Column(String(128), nullable=True)
+    payload_json = Column(JSON, nullable=False, default=dict)
+    status = Column(String(16), nullable=False, default="pending", index=True)
+    attempts = Column(Integer, nullable=False, default=0)
+    last_error = Column(Text, nullable=True)
+    next_attempt_at = Column(DateTime(timezone=True), nullable=True, index=True)
+    created_at = Column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    updated_at = Column(
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=func.now(),
+        onupdate=func.now(),
+    )
