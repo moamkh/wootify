@@ -1,5 +1,21 @@
 # Changelog
 
+## 7.0.3 — 2026-09-16
+
+- Prevent an outbound conversation-mapping lock from being held across Bale
+  read-receipt, response-delay and message-send awaits.
+- Run PostgreSQL mapping writes in short worker-thread transactions and apply
+  bounded lock and idle-transaction timeouts so one row conflict cannot freeze
+  the API event loop.
+- Persist accepted Chatwoot callbacks before acknowledging them and recover
+  pending deliveries after a worker restart, with bounded retry backoff.
+- Roll back failed background delivery sessions before performing any further
+  network work.
+- Reduce account-wide Chatwoot webhook subscriptions to the three events the
+  bridge consumes, eliminating contact, inbox, typing and conversation noise.
+- Add the `chatwoot_webhook_deliveries` reliability migration and regression
+  coverage for committed mapping boundaries and durable callback re-arming.
+
 ## 7.0.2 — 2026-09-16
 
 - Route outbound Chatwoot messages through instance-owned conversation
