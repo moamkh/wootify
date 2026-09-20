@@ -1386,8 +1386,12 @@ class BalePvConnector:
 
         # First-pass parse to discover unknown senders and missing group titles.
         for raw in raw_updates:
-            parsed = self._parse_raw_update(raw, runtime.user_cache, runtime.self_user_id, runtime.chat_title_cache)
-            if parsed:
+            for parsed in self._parse_raw_updates(
+                raw,
+                runtime.user_cache,
+                runtime.self_user_id,
+                runtime.chat_title_cache,
+            ):
                 updates.append(parsed)
                 message = parsed.get("message") if isinstance(parsed, dict) else None
                 chat = message.get("chat") if isinstance(message, dict) else None
@@ -1430,14 +1434,14 @@ class BalePvConnector:
             # names and group titles are accurate.
             updates = []
             for raw in raw_updates:
-                parsed = self._parse_raw_update(
+                parsed_entries = self._parse_raw_updates(
                     raw,
                     runtime.user_cache,
                     runtime.self_user_id,
                     runtime.chat_title_cache,
                     user_info_map,
                 )
-                if parsed:
+                for parsed in parsed_entries:
                     updates.append(parsed)
 
         self._logger.debug(
@@ -1625,6 +1629,42 @@ class BalePvConnector:
         return result
 
     @staticmethod
+    def _parse_raw_updates(
+        raw: Any,
+        user_cache: Optional[Dict[int, str]] = None,
+        self_user_id: Optional[int] = None,
+        chat_title_cache: Optional[Dict[int, str]] = None,
+        user_info_map: Optional[Dict[int, Dict[str, Any]]] = None,
+    ) -> List[Dict[str, Any]]:
+        """Normalize every Bale event present in one raw WebSocket frame."""
+        from bale_pv_connector.update_parser import parse_ws_updates
+
+        if isinstance(raw, dict):
+            parsed = BalePvConnector._parse_raw_update(
+                raw,
+                user_cache,
+                self_user_id,
+                chat_title_cache,
+                user_info_map,
+            )
+            return [parsed] if parsed else []
+        if not isinstance(raw, bytes):
+            return []
+
+        result: List[Dict[str, Any]] = []
+        for parsed_wire_update in parse_ws_updates(raw):
+            parsed = BalePvConnector._parse_raw_update(
+                {"_bale_parsed_update": parsed_wire_update},
+                user_cache,
+                self_user_id,
+                chat_title_cache,
+                user_info_map,
+            )
+            if parsed:
+                result.append(parsed)
+        return result
+
+    @staticmethod
     def _parse_raw_update(
         raw: Any,
         user_cache: Optional[Dict[int, str]] = None,
@@ -1642,17 +1682,21 @@ class BalePvConnector:
             user_info_map: Optional uid -> {name, nick, access_hash, ...} fetched
                 via LoadUsers for senders not present in the contact cache.
         """
-        from bale_pv_connector.update_parser import parse_ws_update
-
         if isinstance(raw, dict):
-            return raw
-        if not isinstance(raw, bytes):
-            return None
+            wire_parsed = raw.get("_bale_parsed_update")
+            if not isinstance(wire_parsed, dict):
+                return raw
+            parsed = wire_parsed
+        else:
+            if not isinstance(raw, bytes):
+                return None
+            # Direct callers preserve historical single-event behavior. The
+            # polling path uses _parse_raw_updates to fan out a media batch.
+            from bale_pv_connector.update_parser import parse_ws_update
 
-        # Try to parse as WebSocket update frame
-        parsed = parse_ws_update(raw)
-        if not parsed:
-            return None
+            parsed = parse_ws_update(raw)
+            if not parsed or parsed.get("type") == "media_batch":
+                return None
 
         sender_uid = parsed.get("sender_uid")
         event_type = parsed.get("type", "message")

@@ -105,6 +105,9 @@ class BaleUpdateType:
     NEW_MESSAGE = 55
     APP_SETTINGS = 131
     CHANNEL_MESSAGE = 162
+    # Web Bale sends an album / batch of ordinary media messages in this
+    # wrapper. It is adjacent to call-signalling fields but is not a call.
+    MEDIA_BATCH = 52815
     # Web Bale emits message deletions as a dedicated high-numbered update.
     # The payload contains field 1 = {original_date, rid} and field 2 = Peer.
     DELETE_MESSAGE = 54341
@@ -434,6 +437,68 @@ def _parse_message_content(data: bytes) -> Optional[Dict[str, Any]]:
     except Exception as exc:
         logger.warning("bale_ws_parse_message_content_failed error=%s data_len=%s", exc, len(data))
         return {}
+
+
+def _parse_media_batch_update(data: bytes) -> List[Dict[str, Any]]:
+    """Parse Web Bale's variable-length media batch (wrapper field 52815).
+
+    A single WebSocket update contains one chat peer and a repeated field-2
+    record for every original message in an album. Each record has its own
+    RID, timestamp, and Message-G-shaped field 4. Emit one normal message
+    event per record so downstream code posts each attachment independently.
+    """
+    try:
+        batch = ProtobufParser(data).parse()
+        peer_bytes = batch.get(1, [None])[0]
+        peer = _parse_peer(peer_bytes) if isinstance(peer_bytes, bytes) else None
+        if not peer or not isinstance(peer.get("id"), int):
+            logger.warning("bale_ws_invalid_media_batch_peer peer=%s", peer)
+            return []
+
+        events: List[Dict[str, Any]] = []
+        for record_bytes in batch.get(2, []):
+            if not isinstance(record_bytes, bytes):
+                continue
+            record = ProtobufParser(record_bytes).parse()
+            sender_uid = record.get(1, [None])[0]
+            rid = record.get(2, [None])[0]
+            date = record.get(3, [None])[0]
+            content_bytes = record.get(4, [None])[0]
+            content = (
+                _parse_message_content(content_bytes)
+                if isinstance(content_bytes, bytes)
+                else None
+            )
+            # A batch can carry unsupported metadata alongside media. Do not
+            # turn those records into blank conversations/messages.
+            if (
+                not isinstance(rid, int)
+                or not isinstance(content, dict)
+                or not content.get("media")
+            ):
+                continue
+            events.append(
+                {
+                    "type": "message",
+                    "sender_uid": sender_uid if isinstance(sender_uid, int) else peer["id"],
+                    "rid": str(rid),
+                    "date": date,
+                    "peer": peer,
+                    **content,
+                }
+            )
+
+        if events:
+            logger.info(
+                "bale_ws_media_batch_parsed peer_id=%s message_count=%s rids=%s",
+                peer["id"],
+                len(events),
+                [event["rid"] for event in events],
+            )
+        return events
+    except Exception as exc:
+        logger.warning("bale_ws_parse_media_batch_failed error=%s", exc)
+        return []
 
 
 def _parse_forward_header(data: bytes) -> Optional[Dict[str, Any]]:
@@ -843,6 +908,7 @@ def parse_ws_update(data: bytes) -> Optional[Dict[str, Any]]:
       55: updateMessage (new private/group message)
       131: appSettings (in_app_message_config, drafts, view counts)
       162: channelMessage (channel/broadcast message)
+      52815: mediaBatch (one or more ordinary media messages)
       54341: deleteMessage (original timestamp/RID + peer)
       52805-52832: callSignaling (voice/video call events)
 
@@ -1079,6 +1145,18 @@ def parse_ws_update(data: bytes) -> Optional[Dict[str, Any]]:
         if isinstance(channel_bytes, bytes):
             return _apply_ts(_parse_channel_message_update(channel_bytes))
 
+        # Field 52815: Web Bale media album / batch. Keep all child events in
+        # the result; ``parse_ws_updates`` expands them before connector
+        # normalization so each image is delivered to Chatwoot separately.
+        media_batch_bytes = wrapper.get(BaleUpdateType.MEDIA_BATCH, [None])[0]
+        if isinstance(media_batch_bytes, bytes):
+            return _apply_ts(
+                {
+                    "type": "media_batch",
+                    "events": _parse_media_batch_update(media_batch_bytes),
+                }
+            )
+
         # Field 54341: message deleted from Web Bale. Unlike the older
         # deletedMessage content marker, this update has no sender or Message G:
         #   1: {1: original timestamp, 2: rid}
@@ -1146,6 +1224,22 @@ def parse_ws_update(data: bytes) -> Optional[Dict[str, Any]]:
     except Exception as exc:
         logger.debug("parse_ws_update failed: %s", exc)
         return None
+
+
+def parse_ws_updates(data: bytes) -> List[Dict[str, Any]]:
+    """Return every normalized event carried by one WebSocket frame.
+
+    Most frames contain one event. Web Bale's field-52815 media batches carry
+    an arbitrary number of independent messages and must be fanned out before
+    the connector and Chatwoot bridge process them.
+    """
+    parsed = parse_ws_update(data)
+    if not parsed:
+        return []
+    if parsed.get("type") == "media_batch":
+        events = parsed.get("events")
+        return [event for event in events if isinstance(event, dict)] if isinstance(events, list) else []
+    return [parsed]
 
 
 def parse_update_message(data: bytes) -> Optional[Dict[str, Any]]:

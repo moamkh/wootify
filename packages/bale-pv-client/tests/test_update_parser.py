@@ -4,7 +4,7 @@ import pytest
 
 from bale_pv_connector.messaging_messages import Peer, TextMessage
 from bale_pv_connector.protobuf_wire import ProtobufMessage
-from bale_pv_connector.update_parser import BaleUpdateType, parse_ws_update
+from bale_pv_connector.update_parser import BaleUpdateType, parse_ws_update, parse_ws_updates
 
 
 def _build_text_message(text: str) -> bytes:
@@ -19,6 +19,37 @@ def _build_deleted_message() -> bytes:
         3, ProtobufMessage(), include_empty=True
     )  # Message G -> empty deletedMessage marker
     return msg.serialize()
+
+
+def _build_media_batch_frame(*, peer_id: int, records: list[tuple[int, int, str]]) -> bytes:
+    """Build Web Bale field-52815 media batch with any number of photos."""
+    batch = ProtobufMessage()
+    batch.add_bytes(1, Peer(peer_id).serialize())
+    for rid, file_id, filename in records:
+        document = ProtobufMessage()
+        document.add_int64(1, file_id)
+        document.add_int64(2, peer_id)
+        document.add_int32(3, 1024)
+        document.add_string(4, filename)
+        document.add_string(5, "image/jpeg")
+        document.add_message(11, ProtobufMessage().add_int32(1, 1))
+
+        content = ProtobufMessage().add_bytes(4, document.serialize())
+        record = ProtobufMessage()
+        record.add_int64(1, peer_id)
+        record.add_int64(2, rid)
+        record.add_int64(3, 1789890807814)
+        record.add_bytes(4, content.serialize())
+        batch.add_bytes(2, record.serialize())
+
+    wrapper = ProtobufMessage().add_bytes(
+        BaleUpdateType.MEDIA_BATCH, batch.serialize()
+    )
+    container = ProtobufMessage()
+    container.add_bytes(1, wrapper.serialize())
+    container.add_int64(4, 1789890807843)
+    inner = ProtobufMessage().add_bytes(1, container.serialize())
+    return ProtobufMessage().add_bytes(2, inner.serialize()).serialize()
 
 
 def _build_update_message_frame(
@@ -161,6 +192,39 @@ def test_parse_web_bale_dedicated_delete_update() -> None:
         "message_type": "deleted",
         "deleted": True,
     }
+
+
+def test_parse_web_bale_media_batch_fans_out_every_photo() -> None:
+    frame = _build_media_batch_frame(
+        peer_id=1694458917,
+        records=[
+            (1125873486199994588, 15061249203552001792, "first.jpg"),
+            (14764327620305682142, 4766472998868819712, "second.jpg"),
+            (10963754209466357096, 4645629018665590531, "third.jpg"),
+            (918273645546372819, 4645629018665590532, "fourth.jpg"),
+        ],
+    )
+
+    # Single-event compatibility API identifies the frame; the fan-out API
+    # returns each original Bale media message separately.
+    parsed = parse_ws_update(frame)
+    assert parsed is not None
+    assert parsed["type"] == "media_batch"
+
+    events = parse_ws_updates(frame)
+    assert [event["rid"] for event in events] == [
+        "1125873486199994588",
+        "14764327620305682142",
+        "10963754209466357096",
+        "918273645546372819",
+    ]
+    assert all(event["peer"] == {"type": 1, "id": 1694458917} for event in events)
+    assert [event["media"]["file_name"] for event in events] == [
+        "first.jpg",
+        "second.jpg",
+        "third.jpg",
+        "fourth.jpg",
+    ]
 
 
 def test_parse_channel_message_update() -> None:

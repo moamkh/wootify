@@ -147,6 +147,57 @@ def test_web_bale_dedicated_delete_reaches_adapter_as_deleted_event():
     assert event["chat_id"] == "1755271951"
 
 
+def test_web_bale_media_batch_becomes_one_update_per_photo():
+    peer_id = 1694458917
+    batch = ProtobufMessage().add_bytes(1, Peer(peer_id).serialize())
+    expected_rids = [1125873486199994588, 14764327620305682142, 10963754209466357096]
+    for index, rid in enumerate(expected_rids, start=1):
+        document = ProtobufMessage()
+        document.add_int64(1, 15061249203552001790 + index)
+        document.add_int64(2, peer_id)
+        document.add_int32(3, 1000 + index)
+        document.add_string(4, f"photo-{index}.jpg")
+        document.add_string(5, "image/jpeg")
+        document.add_message(11, ProtobufMessage().add_int32(1, 1))
+        content = ProtobufMessage().add_bytes(4, document.serialize())
+        record = ProtobufMessage()
+        record.add_int64(1, peer_id)
+        record.add_int64(2, rid)
+        record.add_int64(3, 1789890807814 + index)
+        record.add_bytes(4, content.serialize())
+        batch.add_bytes(2, record.serialize())
+
+    wrapper = ProtobufMessage().add_bytes(BaleUpdateType.MEDIA_BATCH, batch.serialize())
+    container = ProtobufMessage().add_bytes(1, wrapper.serialize())
+    frame = ProtobufMessage().add_bytes(
+        2, ProtobufMessage().add_bytes(1, container.serialize()).serialize()
+    ).serialize()
+
+    updates = BalePvConnector._parse_raw_updates(
+        frame,
+        user_cache={peer_id: "Roya"},
+        self_user_id=999,
+    )
+    assert len(updates) == 3
+    assert [update["message"]["message_id"] for update in updates] == [str(rid) for rid in expected_rids]
+
+    adapter = BalePvAdapter("album-sample", {})
+    events = [adapter.normalize_incoming_update(update) for update in updates]
+    assert all(event is not None for event in events)
+    assert [event["platform_message_id"] for event in events] == [str(rid) for rid in expected_rids]
+    # Bale's adapter deliberately presents image files as the generic
+    # ``photo.jpg`` name.  The important contract here is that a batched Web
+    # Bale update becomes three independently deliverable Chatwoot events,
+    # each with its own media reference.
+    assert all(len(event["attachments"]) == 1 for event in events)
+    assert [event["attachments"][0]["content_type"] for event in events] == [
+        "image/jpeg",
+        "image/jpeg",
+        "image/jpeg",
+    ]
+    assert len({event["attachments"][0]["file_id"] for event in events}) == 3
+
+
 def test_senderless_group_delete_uses_authoritative_peer():
     content = ProtobufMessage().add_message(
         3, ProtobufMessage(), include_empty=True
