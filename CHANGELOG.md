@@ -1,5 +1,9 @@
 # Changelog
 
+## 7.0.4 — 2026-09-20
+
+- Fixed Web Bale media batches so every photo or file in an album is delivered to Chatwoot as its own message.
+
 ## 7.0.3 — 2026-09-16
 
 - Prevent an outbound conversation-mapping lock from being held across Bale
