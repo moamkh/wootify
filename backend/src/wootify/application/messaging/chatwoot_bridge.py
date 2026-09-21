@@ -553,6 +553,29 @@ class ChatwootBridgeService:
                     "detail": f"edit_reply_echo:{source_id}",
                 }
 
+        attachments = self._unique_chatwoot_attachments(
+            self._extract_chatwoot_attachments(payload)
+        )
+        if not content and not attachments:
+            error = RuntimeError(
+                "empty_outgoing_message: Chatwoot supplied neither text nor attachments"
+            )
+            logger.warning(
+                "chatwoot_bridge.empty_outgoing_message instance=%s message_id=%s conversation_id=%s",
+                instance_key,
+                self._extract_id(payload) or self._extract_id(message_obj),
+                MessagePayloadParser.extract_conversation_id(payload),
+            )
+            await self._notify_delivery_failure(
+                client,
+                account_id,
+                payload,
+                None,
+                error,
+                platform_type=getattr(instance, "platform_type", None),
+            )
+            return {"ok": False, "detail": "empty_outgoing_message"}
+
         runtime = get_runtime(instance_key)
         if not runtime or runtime.status != "open":
             await self._notify_delivery_failure(
@@ -748,10 +771,6 @@ class ChatwootBridgeService:
                 )
                 if mapping and mapping.platform_message_id:
                     reply_to = mapping.platform_message_id
-
-            attachments = self._unique_chatwoot_attachments(
-                self._extract_chatwoot_attachments(payload)
-            )
 
             cache_peer_metadata = getattr(runtime.adapter, "cache_peer_metadata", None)
             has_peer_metadata_api = callable(

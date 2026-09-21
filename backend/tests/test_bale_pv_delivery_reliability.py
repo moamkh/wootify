@@ -386,6 +386,46 @@ async def test_disconnected_instance_marks_outgoing_message_failed(db_session, m
 
 
 @pytest.mark.anyio
+async def test_empty_outgoing_message_is_failed_without_platform_send(db_session, monkeypatch):
+    instance = _instance(db_session, "empty-outgoing-bale")
+    adapter = AsyncMock()
+    runtime = SimpleNamespace(
+        status="open", platform_type="bale_pv_enterprise", adapter=adapter
+    )
+    client = AsyncMock()
+    service = ChatwootBridgeService()
+    monkeypatch.setattr(bridge_module, "get_runtime", lambda _: runtime)
+    monkeypatch.setattr(
+        service,
+        "_chatwoot_client_for_instance",
+        lambda *_: (instance, {"account_id": 1}, client),
+    )
+    payload = _payload(
+        "BALE_PV:USER:123", message_id=9012, conversation_id=81
+    )
+    payload["content"] = ""
+
+    result = await service.handle_chatwoot_webhook(
+        db_session, instance.instance_key, payload
+    )
+
+    assert result == {"ok": False, "detail": "empty_outgoing_message"}
+    adapter.send_text.assert_not_awaited()
+    adapter.send_media.assert_not_awaited()
+    client.update_message_status.assert_awaited_once_with(
+        1,
+        81,
+        9012,
+        status="failed",
+        external_error=(
+            "Bale PV: RuntimeError: empty_outgoing_message: Chatwoot supplied "
+            "neither text nor attachments"
+        ),
+    )
+    client.post_message.assert_awaited_once()
+
+
+@pytest.mark.anyio
 async def test_outbound_mapping_is_committed_before_platform_prepare(db_session):
     instance = _instance(db_session, "mapping-transaction-bale")
     service = ChatwootBridgeService()
