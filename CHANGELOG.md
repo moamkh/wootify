@@ -1,5 +1,17 @@
 # Changelog
 
+## 7.0.5 — 2026-09-21
+
+- Prevent Chatwoot voice recordings from enabling Send until the asynchronous
+  upload and attachment registration have both completed.
+- Propagate direct and indirect upload completion back to the reply composer so
+  failed or unfinished recordings cannot create attachment-free messages.
+- Reject outgoing Chatwoot webhooks containing neither text nor attachments,
+  mark the Chatwoot message as failed, and add the existing delivery-failure
+  note instead of sending an empty message to Bale.
+- Add regression coverage proving empty payloads never call the platform text
+  or media send APIs. No database schema changes.
+
 ## 7.0.4 — 2026-09-20
 
 - Fixed Web Bale media batches so every photo or file in an album is delivered to Chatwoot as its own message.
