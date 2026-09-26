@@ -689,15 +689,15 @@ class EnterpriseBaleService:
 
         if command == "/start":
             self._leave_live_session_if_needed(db, user)
-            await self._send_text(
-                instance_key,
+            await self._refresh_gre_and_show_root(
+                db,
+                runtime,
+                user,
                 str(chat_id),
-                self._message_text(
+                leading_text=self._message_text(
                     runtime.platform_metadata, "enterprise_welcome_text", WELCOME_TEXT
                 ),
             )
-
-            await self._refresh_gre_and_show_root(db, runtime, user, str(chat_id))
 
             db.commit()
             return {"message": "start_handled", "status": "ok"}
@@ -716,19 +716,15 @@ class EnterpriseBaleService:
                 contact_payload=contact_payload, text=text
             )
             if not phone_number:
-                await self._send_text(
-                    instance_key,
-                    str(chat_id),
-                    self._message_text(
-                        runtime.platform_metadata,
-                        "enterprise_invalid_phone_text",
-                        INVALID_PHONE_TEXT,
-                    ),
-                )
                 await self._send_phone_prompt(
                     instance_key,
                     str(chat_id),
                     platform_metadata=runtime.platform_metadata,
+                    leading_text=self._message_text(
+                        runtime.platform_metadata,
+                        "enterprise_invalid_phone_text",
+                        INVALID_PHONE_TEXT,
+                    ),
                 )
                 db.commit()
                 return {"message": "invalid_phone", "detail": "phone_required"}
@@ -969,19 +965,15 @@ class EnterpriseBaleService:
 
         # Phone format is invalid — ask again.
         if not result.normalized_phone:
-            await self._send_text(
-                runtime.instance.instance_key,
-                chat_id,
-                self._message_text(
-                    runtime.platform_metadata,
-                    "enterprise_invalid_phone_text",
-                    INVALID_PHONE_TEXT,
-                ),
-            )
             await self._send_phone_prompt(
                 runtime.instance.instance_key,
                 chat_id,
                 platform_metadata=runtime.platform_metadata,
+                leading_text=self._message_text(
+                    runtime.platform_metadata,
+                    "enterprise_invalid_phone_text",
+                    INVALID_PHONE_TEXT,
+                ),
             )
             return
 
@@ -993,17 +985,6 @@ class EnterpriseBaleService:
             else result.gre_status
         )
 
-        if resolved_status == EnterpriseGreStatus.ineligible:
-            await self._send_text(
-                runtime.instance.instance_key,
-                chat_id,
-                self._message_text(
-                    runtime.platform_metadata,
-                    "enterprise_number_not_found_text",
-                    NUMBER_NOT_FOUND_TEXT,
-                ),
-            )
-
         user.phone_number = result.normalized_phone
         user.gre_status = resolved_status
         self._users(db).save(user)
@@ -1012,6 +993,15 @@ class EnterpriseBaleService:
             user,
             chat_id,
             platform_metadata=runtime.platform_metadata,
+            leading_text=(
+                self._message_text(
+                    runtime.platform_metadata,
+                    "enterprise_number_not_found_text",
+                    NUMBER_NOT_FOUND_TEXT,
+                )
+                if resolved_status == EnterpriseGreStatus.ineligible
+                else None
+            ),
         )
         self._set_user_state(db, user, user.current_state)
 
@@ -1022,6 +1012,8 @@ class EnterpriseBaleService:
         runtime: Any,
         user: EnterpriseBaleUser,
         chat_id: str,
+        *,
+        leading_text: Optional[str] = None,
     ) -> None:
         """Re-run GRE validation using the stored phone number and show the root menu."""
         try:
@@ -1042,6 +1034,7 @@ class EnterpriseBaleService:
                 runtime.instance.instance_key,
                 chat_id,
                 platform_metadata=runtime.platform_metadata,
+                leading_text=leading_text,
             )
             return
         await self._show_root_menu(
@@ -1049,6 +1042,7 @@ class EnterpriseBaleService:
             user,
             chat_id,
             platform_metadata=runtime.platform_metadata,
+            leading_text=leading_text,
         )
 
     async def _handle_eligible_root(
@@ -1302,6 +1296,7 @@ class EnterpriseBaleService:
             return {"message": "manual_not_found", "detail": "selection_invalid"}
 
         resolved_link = str(selected.link_url or "").strip()
+        root_markup = self._prepare_root_menu(user)
         if resolved_link:
             # Encode any literal spaces in the URL so the Markdown parser
             # (Bale auto-parses all messages as Markdown) doesn't break the
@@ -1326,7 +1321,7 @@ class EnterpriseBaleService:
                 runtime.instance.instance_key,
                 chat_id,
                 message,
-                reply_markup=self._remove_keyboard_markup(),
+                reply_markup=root_markup,
             )
         else:
             asset_row, content = await self._documents.read_asset_bytes(db, selected.id)
@@ -1336,21 +1331,8 @@ class EnterpriseBaleService:
                 content,
                 asset_row.original_filename,
                 caption=asset_row.display_name or None,
-                reply_markup=self._remove_keyboard_markup(),
+                reply_markup=root_markup,
             )
-        # When a link was sent, the link message already dismissed the keyboard
-        # (via _remove_keyboard_markup), so rebuild_keyboard must be False to
-        # avoid sending the "فایل مورد نظر👆" separator message unnecessarily.
-        needs_rebuild = (not resolved_link) and self._manual_menu_needs_root_rebuild(
-            db, runtime.instance.id, user.gre_status
-        )
-        await self._show_root_menu(
-            runtime.instance.instance_key,
-            user,
-            chat_id,
-            platform_metadata=runtime.platform_metadata,
-            rebuild_keyboard=needs_rebuild,
-        )
         # Clear group selection after sending manual
         user.current_group_id = None
         db.add(user)
@@ -1376,13 +1358,7 @@ class EnterpriseBaleService:
                 runtime.instance.instance_key,
                 chat_id,
                 address_text,
-                reply_markup=self._remove_keyboard_markup(),
-            )
-            await self._show_root_menu(
-                runtime.instance.instance_key,
-                user,
-                chat_id,
-                platform_metadata=runtime.platform_metadata,
+                reply_markup=self._prepare_root_menu(user),
             )
             return {"message": "address_sent", "status": "ok"}
         if action == "address_other_provinces":
@@ -1394,13 +1370,7 @@ class EnterpriseBaleService:
                 runtime.instance.instance_key,
                 chat_id,
                 address_text,
-                reply_markup=self._remove_keyboard_markup(),
-            )
-            await self._show_root_menu(
-                runtime.instance.instance_key,
-                user,
-                chat_id,
-                platform_metadata=runtime.platform_metadata,
+                reply_markup=self._prepare_root_menu(user),
             )
             return {"message": "address_sent", "status": "ok"}
 
@@ -1431,16 +1401,12 @@ class EnterpriseBaleService:
                     "enterprise_no_catalog_text",
                     NO_CATALOG_TEXT,
                 ),
-            )
-            await self._show_root_menu(
-                instance_key,
-                user,
-                chat_id,
-                platform_metadata=runtime.platform_metadata,
+                reply_markup=self._prepare_root_menu(user),
             )
             return
 
         resolved_link = str(catalog.link_url or "").strip()
+        root_markup = self._prepare_root_menu(user)
         if resolved_link:
             safe_url = resolved_link.replace(" ", "%20")
             display_name = (
@@ -1462,7 +1428,7 @@ class EnterpriseBaleService:
                 instance_key,
                 chat_id,
                 message,
-                reply_markup=self._remove_keyboard_markup(),
+                reply_markup=root_markup,
             )
         else:
             asset_row, content = await self._documents.read_asset_bytes(db, catalog.id)
@@ -1472,14 +1438,8 @@ class EnterpriseBaleService:
                 content,
                 asset_row.original_filename,
                 caption=asset_row.display_name or None,
-                reply_markup=self._remove_keyboard_markup(),
+                reply_markup=root_markup,
             )
-        await self._show_root_menu(
-            instance_key,
-            user,
-            chat_id,
-            platform_metadata=runtime.platform_metadata,
-        )
 
     async def _enter_live_route(
         self,
@@ -2353,10 +2313,10 @@ class EnterpriseBaleService:
         platform_metadata: Optional[dict[str, Any]] = None,
         rebuild_keyboard: bool = False,
         send_prompt_text: bool = True,
+        leading_text: Optional[str] = None,
     ) -> None:
         """Render the correct GRE-root menu."""
-        user.current_group_id = None
-        markup = self._root_menu_markup(user.gre_status)
+        markup = self._prepare_root_menu(user)
         prompt_text = (
             self._message_text(
                 platform_metadata, "enterprise_menu_prompt_text", MENU_PROMPT_TEXT
@@ -2364,6 +2324,7 @@ class EnterpriseBaleService:
             if send_prompt_text
             else ""
         )
+        prompt_text = self._join_response_text(leading_text, prompt_text)
         logger.info(
             "enterprise.menu_send instance=%s chat_id=%s menu=root gre_status=%s rebuild=%s items=%s",
             instance_key,
@@ -2406,16 +2367,32 @@ class EnterpriseBaleService:
         chat_id: str,
         *,
         platform_metadata: Optional[dict[str, Any]] = None,
+        leading_text: Optional[str] = None,
     ) -> None:
         """Send the enterprise phone-capture prompt."""
+        prompt_text = self._message_text(
+            platform_metadata, "enterprise_phone_prompt_text", PHONE_PROMPT_TEXT
+        )
         await self._send_text(
             instance_key,
             chat_id,
-            self._message_text(
-                platform_metadata, "enterprise_phone_prompt_text", PHONE_PROMPT_TEXT
-            ),
+            self._join_response_text(leading_text, prompt_text),
             reply_markup=self._phone_prompt_markup(),
         )
+
+    def _prepare_root_menu(self, user: EnterpriseBaleUser) -> dict[str, Any]:
+        """Move a user to the root state and return its keyboard for one-message replies."""
+        user.current_group_id = None
+        if user.gre_status == EnterpriseGreStatus.eligible:
+            user.current_state = EnterpriseUserState.eligible_root
+        else:
+            user.current_state = EnterpriseUserState.ineligible_root
+        return self._root_menu_markup(user.gre_status)
+
+    @staticmethod
+    def _join_response_text(*parts: Optional[str]) -> str:
+        """Combine related response fragments into one Bale message."""
+        return "\n\n".join(str(part).strip() for part in parts if str(part or "").strip())
 
     def _get_or_create_user(
         self,

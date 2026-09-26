@@ -1,5 +1,13 @@
 # Changelog
 
+## 7.0.6 — 2026-09-26
+
+- Send Bale Enterprise content and its restored root keyboard in one message
+  for manuals, catalogs, and addresses. Combine welcome and phone validation
+  text with their respective menu or prompt instead of sending a second bubble.
+- Add regression coverage for the single-response address and phone flows.
+  No database schema changes.
+
 ## 7.0.5 — 2026-09-21
 
 - Prevent Chatwoot voice recordings from enabling Send until the asynchronous
