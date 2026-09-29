@@ -331,6 +331,50 @@ async def test_instance_conversation_mapping_wins_over_contact_identifier(db_ses
 
 
 @pytest.mark.anyio
+async def test_operator_reply_uses_explicit_chatwoot_parent_not_conversation_preview(db_session, monkeypatch):
+    instance = _instance(db_session, "threaded-bale")
+    conversation = Conversation(
+        instance_id=instance.id,
+        platform_conversation_id="888",
+        chatwoot_conversation_id="2181",
+        chatwoot_contact_id="42",
+        chatwoot_inbox_id="48",
+        is_active=True,
+    )
+    db_session.add(conversation)
+    db_session.flush()
+    for chatwoot_id, bale_id in ((70494, "4574299872747724413"), (70493, "123")):
+        db_session.add(MessageMapping(
+            conversation_id=conversation.id,
+            direction=MessageDirection.chatwoot_to_platform,
+            message_kind=MessageKind.text,
+            status=MessageStatus.sent,
+            chatwoot_message_id=str(chatwoot_id),
+            platform_message_id=bale_id,
+        ))
+    db_session.commit()
+
+    adapter = AsyncMock()
+    adapter.send_text.return_value = {"ok": True, "result": {"result": {"rid": 999}}}
+    runtime = SimpleNamespace(status="open", platform_type="bale_pv_enterprise", adapter=adapter)
+    client = AsyncMock()
+    service = ChatwootBridgeService()
+    monkeypatch.setattr(bridge_module, "get_runtime", lambda _: runtime)
+    monkeypatch.setattr(service, "_chatwoot_client_for_instance", lambda *_: (instance, {"account_id": 3}, client))
+    payload = _payload("BALE_PV:USER:888", message_id=70495, conversation_id=2181)
+    payload["content"] = "5555555"
+    payload["content_attributes"] = {"in_reply_to": 70494}
+    payload["conversation"]["messages"] = [{"id": 70493}]
+
+    result = await service.handle_chatwoot_webhook(db_session, instance.instance_key, payload)
+
+    assert result["ok"] is True
+    adapter.send_text.assert_awaited_once_with(
+        "888", "5555555", reply_to="4574299872747724413", mirror_echo=False
+    )
+
+
+@pytest.mark.anyio
 async def test_failed_delivery_marks_original_message_and_keeps_private_note():
     service = ChatwootBridgeService()
     client = AsyncMock()

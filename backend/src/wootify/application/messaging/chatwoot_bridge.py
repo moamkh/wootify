@@ -758,19 +758,27 @@ class ChatwootBridgeService:
                 }
 
             reply_to = None
-            parent_id = payload.get("conversation") and payload["conversation"].get("messages") and payload["conversation"]["messages"][0].get("id")
-            if parent_id:
+            parent_id = MessagePayloadParser.extract_parent_message_id(payload)
+            if parent_id and chatwoot_conversation_id:
                 mapping = (
                     db.query(MessageMapping)
                     .join(Conversation, MessageMapping.conversation_id == Conversation.id)
                     .filter(
                         MessageMapping.chatwoot_message_id == str(parent_id),
                         Conversation.instance_id == instance.id,
+                        Conversation.chatwoot_conversation_id == str(chatwoot_conversation_id),
                     )
                     .first()
                 )
                 if mapping and mapping.platform_message_id:
                     reply_to = mapping.platform_message_id
+                else:
+                    logger.info(
+                        "chatwoot_bridge.reply_parent_not_mapped instance=%s conversation_id=%s parent_message_id=%s",
+                        instance_key,
+                        chatwoot_conversation_id,
+                        parent_id,
+                    )
 
             cache_peer_metadata = getattr(runtime.adapter, "cache_peer_metadata", None)
             has_peer_metadata_api = callable(
