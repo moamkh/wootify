@@ -30,6 +30,7 @@ from wootify.infrastructure.persistence.models import (
     MessageKind,
     MessageStatus,
 )
+from wootify.infrastructure.persistence.repositories.contact_mapping_repository import ContactMappingRepository
 from wootify.infrastructure.persistence.repositories.conversation_runtime_state_repository import ConversationRuntimeStateRepository
 from wootify.application.messaging.chatwoot_database import ChatwootDatabaseService
 from wootify.application.messaging.conversation_mapping import ConversationMappingService
@@ -243,6 +244,10 @@ class BridgeService:
             )
 
         mapped_candidate = None if mapped_is_probably_message_id else mapped_destination
+        if not mapped_candidate and contact_id:
+            mapped_candidate = ContactMappingRepository(db).unique_platform_id_for_chatwoot(
+                runtime.instance.id, str(contact_id)
+            )
         destination_chat_id = self._choose_destination_chat_id(mapped_candidate, extracted_destination)
         if mapped_is_probably_message_id and (not destination_chat_id or destination_chat_id == mapped_destination):
             inferred_destination = self._infer_destination_from_contact_history(db, runtime.instance.id, contact_id)
@@ -392,6 +397,13 @@ class BridgeService:
             destination_chat_id = resolved_chat_id
             if resolved_user.get('access_hash'):
                 phone_access_hash = int(resolved_user['access_hash'])
+
+        # Import destinations found through legacy Chatwoot source IDs only
+        # after phone resolution; the local map owns subsequent deliveries.
+        if contact_id:
+            ContactMappingRepository(db).save(
+                runtime.instance.id, str(destination_chat_id), str(contact_id)
+            )
 
         operator_name = self._extract_chatwoot_operator_name(payload)
         operator_note_text, operator_state_row, operator_state_value = self._resolve_operator_notification(
@@ -630,6 +642,8 @@ class BridgeService:
         if not conversation:
             contact_id = await self._get_or_create_contact(
                 client,
+                db=db,
+                instance_id=runtime.instance.id,
                 account_id=account_id,
                 inbox_id=inbox_id,
                 chat_id=chat_id,
@@ -717,6 +731,8 @@ class BridgeService:
             if not existing_contact_id.isdigit():
                 resolved_contact_id = await self._get_or_create_contact(
                     client,
+                    db=db,
+                    instance_id=runtime.instance.id,
                     account_id=account_id,
                     inbox_id=inbox_id,
                     chat_id=chat_id,
@@ -1215,6 +1231,8 @@ class BridgeService:
         else:
             contact_id = await self._get_or_create_contact(
                 client,
+                db=db,
+                instance_id=runtime.instance.id,
                 account_id=account_id,
                 inbox_id=inbox_id,
                 chat_id=chat_id,
@@ -1536,6 +1554,8 @@ class BridgeService:
         self,
         client: ChatwootClient,
         *,
+        db: Session,
+        instance_id: str,
         account_id: int,
         inbox_id: int,
         chat_id: str,
@@ -1555,6 +1575,7 @@ class BridgeService:
         missing-contact creation are performed.
         """
         identifier = self._prefixed_identifier(platform_key, chat_id)
+        mappings = ContactMappingRepository(db)
         normalized_phone = self._normalize_phone_number(phone_number)
 
         chat_kind = str(chat_type or 'user').strip().lower()
@@ -1580,11 +1601,47 @@ class BridgeService:
             if resolved_name == str(chat_id) and str(chat_id).isdigit():
                 source = self._source_prefix(platform_key).title()
                 resolved_name = f'{source} User {chat_id}'
+        mapped = mappings.get(instance_id, chat_id)
+        if mapped and str(mapped.chatwoot_contact_id).isdigit():
+            try:
+                fetched = await client.get_contact(account_id, int(mapped.chatwoot_contact_id))
+                current = self._extract_contact_payload(fetched)
+                if current:
+                    if chat_type and mapped.platform_contact_type != str(chat_type).lower():
+                        mappings.save(
+                            instance_id, chat_id, str(mapped.chatwoot_contact_id),
+                            platform_contact_type=chat_type,
+                        )
+                    if not skip_profile_sync:
+                        await self._sync_contact_name_if_needed(
+                            client,
+                            account_id=account_id,
+                            contact_id=int(mapped.chatwoot_contact_id),
+                            current_contact=current,
+                            new_name=resolved_name,
+                            additional_attributes=additional_attributes,
+                        )
+                    await self._sync_contact_phone_if_needed(
+                        client,
+                        account_id=account_id,
+                        contact_id=int(mapped.chatwoot_contact_id),
+                        current_contact=current,
+                        phone_number=normalized_phone,
+                        fallback_name=resolved_name,
+                    )
+                    return int(mapped.chatwoot_contact_id)
+            except httpx.HTTPStatusError as exc:
+                if exc.response is None or exc.response.status_code != 404:
+                    raise
+            mappings.delete(instance_id, chat_id)
         try:
             found = await client.search_contacts(account_id, identifier)
             payload = found.get('payload') if isinstance(found, dict) else None
             if isinstance(payload, list) and payload:
-                first = payload[0] if isinstance(payload[0], dict) else {}
+                first = next(
+                    (item for item in payload if isinstance(item, dict) and str(item.get('identifier') or '') == identifier),
+                    {},
+                )
                 cid = self._extract_id(first)
                 if cid:
                     if not skip_profile_sync:
@@ -1604,6 +1661,7 @@ class BridgeService:
                         phone_number=normalized_phone,
                         fallback_name=resolved_name,
                     )
+                    mappings.save(instance_id, chat_id, str(cid), platform_contact_type=chat_type)
                     return int(cid)
         except Exception:
             pass
@@ -1622,12 +1680,12 @@ class BridgeService:
                     phone_contact_id,
                     normalized_phone,
                 )
+                mappings.save(instance_id, chat_id, str(phone_contact_id), platform_contact_type=chat_type)
                 return int(phone_contact_id)
 
         create_payload: dict[str, Any] = {
             'inbox_id': int(inbox_id),
             'name': resolved_name,
-            'identifier': identifier,
         }
         if normalized_phone:
             create_payload['phone_number'] = normalized_phone
@@ -1647,6 +1705,7 @@ class BridgeService:
             cid = self._extract_id(((created or {}).get('payload') or {}).get('contact'))
         if not cid:
             raise RuntimeError('Failed to create Chatwoot contact')
+        mappings.save(instance_id, chat_id, str(cid), platform_contact_type=chat_type)
         await self._sync_contact_phone_if_needed(
             client,
             account_id=account_id,
@@ -2690,7 +2749,7 @@ class BridgeService:
         resolved_user: Dict[str, Any],
         phone_number: str,
     ) -> None:
-        """Update the Chatwoot contact with the resolved Bale identifier and name."""
+        """Update the Chatwoot contact name and phone without claiming its identifier."""
         if not chatwoot_contact_id:
             return
         try:
@@ -2698,13 +2757,11 @@ class BridgeService:
             account_id = int(runtime.chatwoot.get("account_id"))
             contact_id = int(chatwoot_contact_id)
             name = resolved_user.get("name") or resolved_user.get("nick") or f"User {resolved_user['id']}"
-            identifier = connector_registry.prefixed_source_id("bale_pv_enterprise", str(resolved_user["id"]))
             await client.update_contact(
                 account_id,
                 contact_id,
                 {
                     "name": name,
-                    "identifier": identifier,
                     "phone_number": self._normalize_bale_pv_phone(phone_number),
                 },
             )

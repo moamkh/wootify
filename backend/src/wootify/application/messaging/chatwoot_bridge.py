@@ -41,6 +41,7 @@ from wootify.infrastructure.persistence.models import (
 from wootify.infrastructure.persistence.repositories.conversation_repository import (
     ConversationRepository,
 )
+from wootify.infrastructure.persistence.repositories.contact_mapping_repository import ContactMappingRepository
 from wootify.infrastructure.persistence.repositories.message_mapping_repository import (
     MessageMappingRepository,
 )
@@ -254,6 +255,9 @@ class ChatwootBridgeService:
         # inbox automations (greeting/auto-message) toward a user who never
         # actually wrote to us. Outgoing echoes keep the existing behavior.
         if event.get("service_notice") and not event.get("outgoing"):
+            # Contact-only notices have no message mapping to commit later.
+            # Persist the new local contact identity before returning.
+            db.commit()
             logger.info(
                 "chatwoot_bridge.service_notice_contact_only instance=%s chat_id=%s contact_id=%s",
                 instance_key,
@@ -406,6 +410,25 @@ class ChatwootBridgeService:
             "private": False,
             "source_id": source_id,
         }
+        reply_reference = event.get("reply_to")
+        platform_parent_id = (
+            str(reply_reference.get("message_id") or reply_reference.get("id") or "").strip()
+            if isinstance(reply_reference, dict)
+            else ""
+        )
+        chatwoot_parent_id: Optional[str] = None
+        if platform_parent_id:
+            parent_mapping = MessageMappingRepository(db).get_by_platform_message_id(
+                str(conversation.id), platform_parent_id
+            )
+            if parent_mapping and str(parent_mapping.chatwoot_message_id or "").isdigit():
+                chatwoot_parent_id = str(parent_mapping.chatwoot_message_id)
+                post_data["content_attributes"] = {"in_reply_to": int(chatwoot_parent_id)}
+            else:
+                logger.info(
+                    "chatwoot_bridge.reply_parent_not_mapped instance=%s conversation_id=%s platform_parent_id=%s",
+                    instance_key, conversation.id, platform_parent_id,
+                )
 
         try:
             result = await self._post_message_to_chatwoot(
@@ -441,6 +464,10 @@ class ChatwootBridgeService:
                         conversation.chatwoot_conversation_id,
                     )
                     conversation_id = 0
+                # A parent from the deleted Chatwoot conversation cannot be
+                # referenced in the replacement conversation.
+                post_data.pop("content_attributes", None)
+                chatwoot_parent_id = None
                 result = await self._post_message_to_chatwoot(
                     client, account_id, conversation_id, post_data, attachments
                 )
@@ -457,6 +484,8 @@ class ChatwootBridgeService:
             message_kind=MessageKind.text if not attachments else MessageKind.media,
             chatwoot_message_id=str(chatwoot_message_id) if chatwoot_message_id else None,
             platform_message_id=platform_message_id,
+            chatwoot_parent_message_id=chatwoot_parent_id,
+            platform_parent_message_id=platform_parent_id or None,
             platform_payload_json={"text": text},
         )
 
@@ -618,43 +647,46 @@ class ChatwootBridgeService:
         if mapped_conversation and mapped_conversation.platform_conversation_id:
             peer_id = str(mapped_conversation.platform_conversation_id)
 
-        if identifier:
-            raw_identifier = str(identifier).strip()
-            expected_prefix = connector_registry.prefix(runtime.platform_type)
-            parsed_peer_id, parsed_peer_type, source_prefix = (
+        if not peer_id and chatwoot_contact_id:
+            peer_id = ContactMappingRepository(db).unique_platform_id_for_chatwoot(
+                instance.id, str(chatwoot_contact_id)
+            )
+        # One-time compatibility import for contacts created by older Wootify
+        # versions. The identifier is read only here and never used without
+        # first recording an instance-owned mapping.
+        if not peer_id and identifier and chatwoot_contact_id:
+            legacy_peer_id, legacy_peer_type, legacy_prefix = (
                 DestinationResolver.compatible_platform_destination(
-                    raw_identifier,
-                    expected_prefix=expected_prefix,
+                    str(identifier),
+                    expected_prefix=connector_registry.prefix(runtime.platform_type),
                     known_prefixes=connector_registry.all_prefixes(),
                 )
             )
-            stripped_identifier = parsed_peer_id or raw_identifier
-            # A prefixed identifier (e.g. BALE_PV:<id>) is an already-resolved
-            # Bale user id and must be used verbatim — its digits can look like
-            # a phone number, and re-resolving them would send to a wrong user.
-            if peer_id:
-                # Still capture a typed identifier so the adapter can encode
-                # group/channel requests correctly, but never replace the
-                # instance-owned mapped destination with contact-global data.
-                peer_type = parsed_peer_type
-            elif source_prefix and parsed_peer_id:
-                peer_id = parsed_peer_id
-                peer_type = parsed_peer_type
-            elif source_prefix:
-                # A known but incompatible platform identifier must not leak
-                # into another connector (for example EITAA_PV -> Telegram).
-                if phone_number and runtime.platform_type == "bale_pv_enterprise":
-                    peer_id = self._normalize_bale_pv_phone(str(phone_number))
-                    is_phone_destination = True
-                else:
-                    peer_id = None
-            elif self._is_phone_number_destination(stripped_identifier):
-                # The contact identifier itself is a raw phone number; resolve it.
-                peer_id = self._normalize_bale_pv_phone(stripped_identifier)
-                is_phone_destination = True
-            else:
-                peer_id = stripped_identifier
-        elif not peer_id and phone_number:
+            if legacy_prefix and legacy_peer_id:
+                ContactMappingRepository(db).save(
+                    instance.id,
+                    legacy_peer_id,
+                    str(chatwoot_contact_id),
+                    platform_contact_type=legacy_peer_type,
+                )
+                peer_id = legacy_peer_id
+        if peer_id:
+            mapped_peer = ContactMappingRepository(db).get(instance.id, peer_id)
+            peer_type = mapped_peer.platform_contact_type if mapped_peer else None
+            if mapped_conversation and chatwoot_contact_id and not mapped_peer:
+                ContactMappingRepository(db).save(instance.id, peer_id, str(chatwoot_contact_id))
+        elif (
+            runtime.platform_type == "bale_pv_enterprise"
+            and identifier
+            and self._is_phone_number_destination(str(identifier))
+        ):
+            peer_id = self._normalize_bale_pv_phone(str(identifier))
+            is_phone_destination = True
+        elif (
+            runtime.platform_type == "bale_pv_enterprise"
+            and phone_number
+            and not str(identifier or "").lower().endswith("@g.us")
+        ):
             peer_id = self._normalize_bale_pv_phone(str(phone_number))
             is_phone_destination = True
 
@@ -664,15 +696,14 @@ class ChatwootBridgeService:
                 account_id,
                 payload,
                 None,
-                RuntimeError("recipient_not_resolvable: contact has neither identifier nor phone number"),
+                RuntimeError("recipient_not_resolvable: no instance-owned mapping or Bale phone number"),
                 platform_type=runtime.platform_type,
             )
             return {"ok": False, "detail": "peer_id_not_found"}
 
         try:
             # For Bale PV, a phone-number destination must be resolved to its Bale
-            # user id before we can send. The resolved id is also written back to the
-            # Chatwoot contact identifier for future messages.
+            # user id before we can send. The local contact map owns that identity.
             if (
                 runtime.platform_type == "bale_pv_enterprise"
                 and is_phone_destination
@@ -690,6 +721,8 @@ class ChatwootBridgeService:
                     current_identifier=identifier,
                 )
                 peer_id = str(resolved_user["id"])
+                if chatwoot_contact_id:
+                    ContactMappingRepository(db).save(instance.id, peer_id, str(chatwoot_contact_id))
                 # Keep the local conversation mapping in sync with the resolved id.
                 await self._sync_conversation_platform_id(
                     db, instance, original_peer_id, peer_id
@@ -1093,13 +1126,7 @@ class ChatwootBridgeService:
             elif sendability == "allowed":
                 attributes.pop("bale_send_restriction_reason", None)
 
-            update: Dict[str, Any] = {"custom_attributes": attributes}
-            if normalized_type in ("user", "group", "channel") and chat_id:
-                update["identifier"] = connector_registry.prefixed_source_id(
-                    "bale_pv_enterprise",
-                    f"{normalized_type.upper()}:{chat_id}",
-                )
-            await client.update_contact(account_id, contact_id, update)
+            await client.update_contact(account_id, contact_id, {"custom_attributes": attributes})
         except Exception as exc:
             self._contact_peer_metadata_checks.pop(cache_key)
             logger.warning(
@@ -1190,6 +1217,13 @@ class ChatwootBridgeService:
         # remote contacts/search call. A deleted remote contact surfaces as a
         # 404 when posting, which triggers the recreate/refresh path.
         if db is not None and instance is not None:
+            contact_map = ContactMappingRepository(db)
+            mapped_contact = contact_map.get(instance.id, chat_id)
+            if mapped_contact:
+                try:
+                    return int(mapped_contact.chatwoot_contact_id), False
+                except (TypeError, ValueError):
+                    contact_map.delete(instance.id, chat_id)
             local = (
                 db.query(Conversation)
                 .filter(
@@ -1202,6 +1236,7 @@ class ChatwootBridgeService:
             )
             if local and local.chatwoot_contact_id:
                 try:
+                    contact_map.save(instance.id, chat_id, str(local.chatwoot_contact_id), platform_contact_type=chat_type)
                     return int(local.chatwoot_contact_id), False
                 except (TypeError, ValueError):
                     pass
@@ -1234,14 +1269,43 @@ class ChatwootBridgeService:
                         continue
                     cid = self._extract_id(candidate)
                     if cid:
+                        if db is not None and instance is not None:
+                            ContactMappingRepository(db).save(instance.id, chat_id, str(cid), platform_contact_type=chat_type)
                         return int(cid), False
         except Exception:
             pass
 
+        # The same person may already exist in Chatwoot through WhatsApp.
+        # Reuse an exact phone match without altering that contact's identifier.
+        normalized_phone = self._normalize_bale_pv_phone(phone_number or "") if phone_number else ""
+        if normalized_phone:
+            for phone_query in dict.fromkeys((str(phone_number).strip(), f"+{normalized_phone}")):
+                try:
+                    found = await client.search_contacts(account_id, phone_query)
+                except Exception:
+                    continue
+                candidates = found.get("payload") if isinstance(found, dict) else None
+                if not isinstance(candidates, list):
+                    continue
+                for candidate in candidates:
+                    if not isinstance(candidate, dict):
+                        continue
+                    candidate_phone = self._normalize_bale_pv_phone(
+                        str(candidate.get("phone_number") or "")
+                    )
+                    if candidate_phone != normalized_phone:
+                        continue
+                    cid = self._extract_id(candidate)
+                    if cid:
+                        if db is not None and instance is not None:
+                            ContactMappingRepository(db).save(
+                                instance.id, chat_id, str(cid), platform_contact_type=chat_type
+                            )
+                        return int(cid), False
+
         create_payload: Dict[str, Any] = {
             "inbox_id": inbox_id,
             "name": from_name,
-            "identifier": prefixed_identifier,
         }
         if platform_key == "bale_pv_enterprise":
             create_payload["custom_attributes"] = {
@@ -1255,6 +1319,9 @@ class ChatwootBridgeService:
         cid = self._extract_id(created) or self._extract_id((created or {}).get("payload"))
         if not cid:
             raise RuntimeError("Failed to create Chatwoot contact")
+
+        if db is not None and instance is not None:
+            ContactMappingRepository(db).save(instance.id, chat_id, str(cid), platform_contact_type=chat_type)
 
         if avatar_bytes:
             try:
@@ -2069,15 +2136,10 @@ class ChatwootBridgeService:
         phone_number: str,
         current_identifier: Optional[Any] = None,
     ) -> None:
-        """Update the Chatwoot contact with the resolved Bale identifier and name.
+        """Refresh name/phone without changing Chatwoot's contact identifier.
 
-        Contacts whose current identifier belongs to another platform (e.g.
-        WhatsApp's ``989136421196@s.whatsapp.net``) are left untouched: that
-        identifier is owned by the other backend, and replacing it with
-        ``BALE_PV:<id>`` breaks that integration. The Bale message itself is
-        still delivered — only the write-back is skipped. A separate
-        ``BALE_PV:`` contact is created automatically on the user's first
-        inbound Bale message via ``_get_or_create_contact``.
+        Contacts owned by another platform are left untouched. Their Bale
+        identity is stored only in Wootify's instance-scoped contact map.
         """
         if not chatwoot_contact_id:
             return
@@ -2093,9 +2155,6 @@ class ChatwootBridgeService:
             or resolved_user.get("nick")
             or f"User {resolved_user['id']}"
         )
-        identifier = connector_registry.prefixed_source_id(
-            "bale_pv_enterprise", str(resolved_user["id"])
-        )
         normalized_phone = self._normalize_bale_pv_phone(phone_number)
         # Chatwoot validates phone numbers in E.164 format (leading '+').
         e164_phone = f"+{normalized_phone}" if normalized_phone else None
@@ -2105,7 +2164,6 @@ class ChatwootBridgeService:
                 int(chatwoot_contact_id),
                 {
                     "name": name,
-                    "identifier": identifier,
                     "phone_number": e164_phone,
                 },
             )
@@ -2122,7 +2180,7 @@ class ChatwootBridgeService:
                 return
             # 422: the phone number typically already belongs to another
             # contact (Chatwoot enforces phone uniqueness) — retry without it
-            # so the Bale display name and identifier are still written back.
+            # so the Bale display name is still written back.
             logger.info(
                 "chatwoot_bridge.update_bale_pv_contact_phone_conflict "
                 "contact_id=%s retry=without_phone",
@@ -2132,7 +2190,7 @@ class ChatwootBridgeService:
             await client.update_contact(
                 account_id,
                 int(chatwoot_contact_id),
-                {"name": name, "identifier": identifier},
+                {"name": name},
             )
         except Exception as exc:
             logger.warning(
@@ -2313,6 +2371,7 @@ class ChatwootBridgeService:
                 stale.is_active = False
                 db.add(stale)
                 db.commit()
+            ContactMappingRepository(db).delete(instance.id, chat_id)
             contact_id, _ = await self._get_or_create_contact(
                 client,
                 account_id=account_id,

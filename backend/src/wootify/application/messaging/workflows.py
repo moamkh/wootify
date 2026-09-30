@@ -12,6 +12,7 @@ import logging
 from typing import Any, Optional
 
 from sqlalchemy.orm import Session
+from wootify.infrastructure.persistence.repositories.contact_mapping_repository import ContactMappingRepository
 
 logger = logging.getLogger("app.services.bridge")
 
@@ -59,7 +60,10 @@ class BalePvSyncWorkflow:
                 identifier = service._prefixed_identifier(platform_key, str(uid))
                 found = await client.search_contacts(account_id, identifier)
                 payload = found.get("payload") if isinstance(found, dict) else None
-                was_existing = isinstance(payload, list) and payload and service._extract_id(payload[0])
+                was_existing = bool(ContactMappingRepository(db).get(runtime.instance.id, str(uid))) or bool(
+                    isinstance(payload, list)
+                    and any(isinstance(row, dict) and row.get("identifier") == identifier for row in payload)
+                )
                 avatar_bytes: Optional[bytes] = None
                 avatar_filename = "avatar.jpg"
                 if is_first_sync and not was_existing:
@@ -72,10 +76,12 @@ class BalePvSyncWorkflow:
                     except Exception as exc:
                         logger.debug("sync_bale_pv_contact_avatar_failed instance=%s uid=%s error=%s", instance_key, uid, exc)
                 contact_id = await service._get_or_create_contact(
-                    client, account_id=account_id, inbox_id=inbox_id, chat_id=str(uid),
+                    client, db=db, instance_id=runtime.instance.id,
+                    account_id=account_id, inbox_id=inbox_id, chat_id=str(uid),
                     platform_key=platform_key, from_name=name or None, first_name=name or None,
                     skip_profile_sync=skip_profile_sync,
                 )
+                db.commit()
                 if is_first_sync and avatar_bytes and contact_id:
                     try:
                         await client.update_contact_avatar(account_id, int(contact_id), avatar_bytes, filename=avatar_filename)
@@ -131,12 +137,18 @@ class BalePvSyncWorkflow:
                 identifier = service._prefixed_identifier(platform_key, str(peer_id))
                 found = await client.search_contacts(account_id, identifier)
                 payload = found.get("payload") if isinstance(found, dict) else None
-                was_existing = isinstance(payload, list) and payload and service._extract_id(payload[0])
+                was_existing = bool(ContactMappingRepository(db).get(runtime.instance.id, str(peer_id))) or bool(
+                    isinstance(payload, list)
+                    and any(isinstance(row, dict) and row.get("identifier") == identifier for row in payload)
+                )
                 contact_id = await service._get_or_create_contact(
-                    client, account_id=account_id, inbox_id=inbox_id, chat_id=str(peer_id),
+                    client, db=db, instance_id=runtime.instance.id,
+                    account_id=account_id, inbox_id=inbox_id, chat_id=str(peer_id),
                     platform_key=platform_key, from_name=display_name, first_name=display_name,
                     additional_attributes=additional_attributes,
+                    chat_type=peer_type_label,
                 )
+                db.commit()
                 conversation_id = await service._get_or_create_conversation_for_contact(
                     client, account_id=account_id, inbox_id=inbox_id, contact_id=contact_id
                 )

@@ -34,6 +34,7 @@ from wootify.infrastructure.persistence.models import (
 from wootify.infrastructure.persistence.repositories.enterprise_document_asset_repository import (
     EnterpriseDocumentAssetRepository,
 )
+from wootify.infrastructure.persistence.repositories.contact_mapping_repository import ContactMappingRepository
 from wootify.infrastructure.persistence.repositories.enterprise_manual_group_repository import (
     EnterpriseManualGroupRepository,
 )
@@ -1029,7 +1030,7 @@ class EnterpriseTelegramService:
             session.user_present = False
             self._sessions(db).save(session)
 
-        contact_id = await self._get_or_create_contact(runtime, user, int(inbox_id))
+        contact_id = await self._get_or_create_contact(db, runtime, user, int(inbox_id))
         client = self._get_chatwoot_client(runtime.chatwoot)
         created = await client.create_conversation(
             int(runtime.chatwoot["account_id"]),
@@ -1217,6 +1218,7 @@ class EnterpriseTelegramService:
 
     async def _get_or_create_contact(
         self,
+        db: Session,
         runtime: Any,
         user: EnterpriseTelegramUser,
         inbox_id: int,
@@ -1227,6 +1229,16 @@ class EnterpriseTelegramService:
         identifier = self._enterprise_source_id(
             runtime.instance.instance_key, user.platform_chat_id
         )
+        mappings = ContactMappingRepository(db)
+        mapped = mappings.get(runtime.instance.id, str(user.platform_chat_id))
+        if mapped and str(mapped.chatwoot_contact_id).isdigit():
+            try:
+                await client.get_contact(account_id, int(mapped.chatwoot_contact_id))
+                return str(mapped.chatwoot_contact_id)
+            except httpx.HTTPStatusError as exc:
+                if exc.response is None or exc.response.status_code != 404:
+                    raise
+                mappings.delete(runtime.instance.id, str(user.platform_chat_id))
         resolved_name = str(user.display_name or user.platform_chat_id).strip() or str(
             user.platform_chat_id
         )
@@ -1240,12 +1252,12 @@ class EnterpriseTelegramService:
             )
             if not contact_id:
                 raise RuntimeError("failed to resolve existing enterprise contact id")
+            mappings.save(runtime.instance.id, str(user.platform_chat_id), str(contact_id))
             return str(contact_id)
 
         create_payload = {
             "inbox_id": int(inbox_id),
             "name": resolved_name,
-            "identifier": identifier,
         }
         if user.phone_number:
             create_payload["phone_number"] = str(user.phone_number).strip()
@@ -1263,6 +1275,7 @@ class EnterpriseTelegramService:
                     (retry_contact or {}).get("payload")
                 )
                 if retry_id:
+                    mappings.save(runtime.instance.id, str(user.platform_chat_id), str(retry_id))
                     return str(retry_id)
             if user.phone_number and "phone_number" in create_payload:
                 fallback_payload = {
@@ -1282,6 +1295,7 @@ class EnterpriseTelegramService:
         )
         if not contact_id:
             raise RuntimeError("failed to create enterprise contact")
+        mappings.save(runtime.instance.id, str(user.platform_chat_id), str(contact_id))
         return str(contact_id)
 
     async def _find_contact_by_identifier(

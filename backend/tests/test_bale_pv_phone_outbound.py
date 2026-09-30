@@ -141,9 +141,9 @@ def test_phone_contact_resolved_and_message_sent(monkeypatch, db):
     assert adapter.sent_texts == [
         {'peer_id': '555000111', 'content': 'hello there', 'reply_to': None}
     ]
-    # Contact identifier rewritten to the resolved Bale user id (E.164 phone).
+    # Contact identifier is never claimed by Wootify.
     assert client.updated_contacts and client.updated_contacts[0]['phone_number'] == '+989123456789'
-    assert client.updated_contacts[0]['identifier'] == 'BALE_PV:555000111'
+    assert 'identifier' not in client.updated_contacts[0]
     assert client.updated_contacts[0]['name'] == 'Ali Test'
     # Resolved user cached in the DB for future sends.
     from wootify.models import BalePvPhoneResolvedUser
@@ -153,9 +153,30 @@ def test_phone_contact_resolved_and_message_sent(monkeypatch, db):
     assert client.posted_messages == []
 
 
+def test_instance_contact_map_routes_without_touching_whatsapp_identifier(monkeypatch, db):
+    from wootify.infrastructure.persistence.repositories.contact_mapping_repository import ContactMappingRepository
+
+    instance = _make_instance(db)
+    ContactMappingRepository(db).save(instance.id, '777123', '9', platform_contact_type='user')
+    db.commit()
+    adapter = _FakeAdapter()
+    client = _FakeClient()
+    service = _service(monkeypatch, db, adapter, client, instance)
+    payload = _payload(phone=None)
+    payload['conversation']['meta']['sender']['identifier'] = '989136421196@s.whatsapp.net'
+
+    result = asyncio.run(service.handle_chatwoot_webhook(db, 'inst-1', payload))
+
+    assert result['ok'] is True
+    assert result['peer_id'] == '777123'
+    assert adapter.resolved_phones == []
+    assert adapter.sent_texts[0]['peer_id'] == '777123'
+    assert client.updated_contacts == []
+
+
 def test_contact_update_phone_conflict_retries_without_phone(monkeypatch, db):
     """Chatwoot 422 (phone already taken by another contact) must not drop the
-    identifier/name write-back — retry without the phone number."""
+    name update — retry without the phone number."""
 
     class _ConflictClient(_FakeClient):
         async def update_contact(self, account_id, contact_id, data):
@@ -177,7 +198,7 @@ def test_contact_update_phone_conflict_retries_without_phone(monkeypatch, db):
     assert result['ok'] is True
     # The write-back eventually landed without the conflicting phone number.
     assert client.updated_contacts == [
-        {'name': 'Ali Test', 'identifier': 'BALE_PV:555000111'}
+        {'name': 'Ali Test'}
     ]
     assert adapter.sent_texts == [
         {'peer_id': '555000111', 'content': 'hello there', 'reply_to': None}
@@ -273,9 +294,9 @@ def test_unprefixed_phone_like_identifier_is_resolved(monkeypatch, db):
     assert result['ok'] is True
     assert adapter.resolved_phones == ['989123456789']
     assert adapter.sent_texts[0]['peer_id'] == '555000111'
-    # Bare phone identifiers are wootify-managed: the write-back still happens.
+    # A legacy bare-phone identifier may bootstrap delivery, but is not changed.
     assert client.updated_contacts
-    assert client.updated_contacts[0]['identifier'] == 'BALE_PV:555000111'
+    assert 'identifier' not in client.updated_contacts[0]
 
 
 class TestForeignIdentifierGuard:
@@ -343,7 +364,7 @@ class TestForeignIdentifierGuard:
         assert client.updated_contacts == []
 
     def test_phone_only_contact_still_updated(self, monkeypatch, db):
-        """No identifier at all (phone-only contact): write-back as before."""
+        """No identifier at all (phone-only contact): update without claiming one."""
         instance = _make_instance(db)
         adapter = _FakeAdapter()
         client = _FakeClient()
@@ -353,7 +374,7 @@ class TestForeignIdentifierGuard:
 
         assert result['ok'] is True
         assert client.updated_contacts
-        assert client.updated_contacts[0]['identifier'] == 'BALE_PV:555000111'
+        assert 'identifier' not in client.updated_contacts[0]
 
     def test_repeat_send_to_whatsapp_contact_uses_cached_phone_map(self, monkeypatch, db):
         """The phone->Bale-user map (bale_pv_phone_resolved_users) keeps

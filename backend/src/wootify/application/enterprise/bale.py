@@ -48,6 +48,7 @@ from wootify.infrastructure.persistence.models import (
 from wootify.infrastructure.persistence.repositories.enterprise_bale_session_repository import (
     EnterpriseBaleSessionRepository,
 )
+from wootify.infrastructure.persistence.repositories.contact_mapping_repository import ContactMappingRepository
 from wootify.infrastructure.persistence.repositories.enterprise_bale_user_repository import (
     EnterpriseBaleUserRepository,
 )
@@ -1848,7 +1849,7 @@ class EnterpriseBaleService:
             session.user_present = False
             self._sessions(db).save(session)
 
-        contact_id = await self._get_or_create_contact(runtime, user, int(inbox_id))
+        contact_id = await self._get_or_create_contact(db, runtime, user, int(inbox_id))
         client = self._get_chatwoot_client(runtime.chatwoot)
         created = await client.create_conversation(
             int(runtime.chatwoot["account_id"]),
@@ -2028,7 +2029,7 @@ class EnterpriseBaleService:
         return replacement
 
     async def _get_or_create_contact(
-        self, runtime: Any, user: EnterpriseBaleUser, inbox_id: int
+        self, db: Session, runtime: Any, user: EnterpriseBaleUser, inbox_id: int
     ) -> int:
         """Resolve a Chatwoot contact for an enterprise user."""
         client = self._get_chatwoot_client(runtime.chatwoot)
@@ -2036,6 +2037,16 @@ class EnterpriseBaleService:
         identifier = self._enterprise_source_id(
             runtime.instance.instance_key, user.platform_chat_id
         )
+        mappings = ContactMappingRepository(db)
+        mapped = mappings.get(runtime.instance.id, str(user.platform_chat_id))
+        if mapped and str(mapped.chatwoot_contact_id).isdigit():
+            try:
+                await client.get_contact(account_id, int(mapped.chatwoot_contact_id))
+                return int(mapped.chatwoot_contact_id)
+            except httpx.HTTPStatusError as exc:
+                if exc.response is None or exc.response.status_code != 404:
+                    raise
+                mappings.delete(runtime.instance.id, str(user.platform_chat_id))
         normalized_phone = self._normalize_phone_number(user.phone_number)
         resolved_name = str(user.display_name or user.platform_chat_id).strip() or str(
             user.platform_chat_id
@@ -2064,12 +2075,12 @@ class EnterpriseBaleService:
                 identifier=identifier,
                 fallback_name=resolved_name,
             )
+            mappings.save(runtime.instance.id, str(user.platform_chat_id), str(contact_id))
             return int(contact_id)
 
         create_payload = {
             "inbox_id": int(inbox_id),
             "name": resolved_name,
-            "identifier": identifier,
         }
         if normalized_phone:
             create_payload["phone_number"] = normalized_phone
@@ -2098,6 +2109,7 @@ class EnterpriseBaleService:
                     (retry_contact or {}).get("payload")
                 )
                 if retry_id:
+                    mappings.save(runtime.instance.id, str(user.platform_chat_id), str(retry_id))
                     return int(retry_id)
             # If a phone number was included the 422 may be due to its format;
             # retry the creation without it as a last resort.
@@ -2127,6 +2139,7 @@ class EnterpriseBaleService:
                 str(created)[:500],
             )
             raise RuntimeError("failed to create enterprise contact")
+        mappings.save(runtime.instance.id, str(user.platform_chat_id), str(contact_id))
         return int(contact_id)
 
     async def _find_contact_by_identifier(
@@ -2242,8 +2255,6 @@ class EnterpriseBaleService:
         payload = {
             "name": str(current_contact.get("name") or "").strip() or fallback_name,
             "phone_number": normalized_phone,
-            "identifier": str(current_contact.get("identifier") or "").strip()
-            or identifier,
         }
         try:
             await client.update_contact(account_id, contact_id, payload)

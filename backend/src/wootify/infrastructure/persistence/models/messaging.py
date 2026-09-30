@@ -71,6 +71,24 @@ class Conversation(Base):
     )
 
 
+class ContactMapping(Base):
+    """Instance-owned platform peer to Chatwoot contact mapping."""
+
+    __tablename__ = "contact_mappings"
+    __table_args__ = (
+        UniqueConstraint("instance_id", "platform_contact_id", name="uq_instance_platform_contact"),
+        Index("ix_contact_mappings_instance_chatwoot", "instance_id", "chatwoot_contact_id"),
+    )
+
+    id = Column(String(36), primary_key=True, default=_uuid)
+    instance_id = Column(String(36), ForeignKey("instances.id", ondelete="CASCADE"), nullable=False, index=True)
+    platform_contact_id = Column(String(255), nullable=False)
+    platform_contact_type = Column(String(32), nullable=True)
+    chatwoot_contact_id = Column(String(255), nullable=False)
+    created_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    updated_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now())
+
+
 class ConversationRuntimeState(Base):
     """Represents conversation runtime state."""
 

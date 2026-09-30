@@ -40,6 +40,22 @@ def test_adapter_normalize_private_message():
     assert event["outgoing"] is False
 
 
+def test_adapter_preserves_bale_reply_reference():
+    adapter = BalePvAdapter("test", {"bale_pv_phone_number": "989136421196"})
+    event = adapter.normalize_incoming_update({
+        "update_id": 124,
+        "message": {
+            "message_id": "889",
+            "date": 1,
+            "chat": {"id": "456", "type": "private"},
+            "from": {"id": 456, "first_name": "Sara"},
+            "text": "reply",
+            "reply_to_message": {"message_id": "888"},
+        },
+    })
+    assert event["reply_to"] == {"message_id": "888"}
+
+
 def test_adapter_normalize_group_message():
     adapter = BalePvAdapter("test", {"bale_pv_phone_number": "989136421196"})
     raw = {
@@ -2678,6 +2694,132 @@ async def test_contact_lookup_requires_exact_platform_identifier():
 
     assert (contact_id, created) == (77, False)
     client.create_contact.assert_not_awaited()
+
+
+@pytest.mark.anyio
+async def test_new_contact_uses_instance_map_without_chatwoot_identifier(db_session):
+    """A newly created contact must not claim Chatwoot's global identifier."""
+    from wootify.infrastructure.persistence.repositories.contact_mapping_repository import ContactMappingRepository
+
+    instance = _make_bridge_instance(db_session, "bale-pv-contact-map")
+    client = AsyncMock()
+    client.search_contacts = AsyncMock(return_value={"payload": []})
+    client.create_contact = AsyncMock(return_value={"id": 91})
+
+    first = await chatwoot_bridge._get_or_create_contact(
+        client,
+        account_id=1,
+        inbox_id=5,
+        chat_id="12345",
+        from_name="Sara",
+        chat_type="group",
+        db=db_session,
+        instance=instance,
+    )
+    second = await chatwoot_bridge._get_or_create_contact(
+        client,
+        account_id=1,
+        inbox_id=5,
+        chat_id="12345",
+        from_name="Sara",
+        chat_type="group",
+        db=db_session,
+        instance=instance,
+    )
+
+    assert first == (91, True)
+    assert second == (91, False)
+    assert "identifier" not in client.create_contact.await_args.args[1]
+    client.create_contact.assert_awaited_once()
+    mapped = ContactMappingRepository(db_session).get(instance.id, "12345")
+    assert mapped.chatwoot_contact_id == "91"
+    assert mapped.platform_contact_type == "group"
+
+
+@pytest.mark.anyio
+async def test_exact_phone_reuses_whatsapp_contact_without_identifier_write(db_session):
+    from wootify.infrastructure.persistence.repositories.contact_mapping_repository import ContactMappingRepository
+
+    instance = _make_bridge_instance(db_session, "bale-pv-shared-contact")
+    client = AsyncMock()
+    client.search_contacts = AsyncMock(side_effect=lambda account_id, query: {
+        "payload": [{
+            "id": 91,
+            "identifier": "989123456789@s.whatsapp.net",
+            "phone_number": "+989123456789",
+        }] if "989123456789" in query else []
+    })
+
+    contact_id, created = await chatwoot_bridge._get_or_create_contact(
+        client,
+        account_id=1,
+        inbox_id=5,
+        chat_id="456",
+        from_name="Sara",
+        phone_number="09123456789",
+        db=db_session,
+        instance=instance,
+    )
+
+    assert (contact_id, created) == (91, False)
+    assert ContactMappingRepository(db_session).get(instance.id, "456").chatwoot_contact_id == "91"
+    client.create_contact.assert_not_awaited()
+    client.update_contact.assert_not_awaited()
+
+
+@pytest.mark.anyio
+async def test_bale_reply_threads_to_mapped_chatwoot_parent(db_session):
+    from wootify.models import MessageDirection, MessageKind, MessageMapping, MessageStatus
+
+    instance = _make_bridge_instance(db_session, "bale-pv-inbound-reply")
+    conversation = Conversation(
+        instance_id=instance.id,
+        platform_conversation_id="456",
+        chatwoot_conversation_id="116",
+        chatwoot_contact_id="77",
+        chatwoot_inbox_id="5",
+        is_active=True,
+    )
+    db_session.add(conversation)
+    db_session.flush()
+    db_session.add(MessageMapping(
+        conversation_id=conversation.id,
+        direction=MessageDirection.platform_to_chatwoot,
+        message_kind=MessageKind.text,
+        platform_message_id="888",
+        chatwoot_message_id="999",
+        status=MessageStatus.sent,
+        platform_payload_json={"text": "parent"},
+    ))
+    db_session.commit()
+
+    client = AsyncMock()
+    client.post_message = AsyncMock(return_value={"id": 1111})
+    event = {
+        "chat_id": "456",
+        "chat_type": "private",
+        "from_name": "Sara",
+        "text": "reply",
+        "message_id": "889",
+        "reply_to": {"message_id": "888"},
+        "attachments": [],
+    }
+    with patch.object(
+        chatwoot_bridge,
+        "_chatwoot_client_for_instance",
+        return_value=(instance, {"account_id": 1, "inbox_id": 5}, client),
+    ):
+        result = await chatwoot_bridge.ingest_platform_event(
+            db_session, "bale-pv-inbound-reply", event
+        )
+
+    assert result["ok"] is True
+    assert client.post_message.await_args.args[2]["content_attributes"] == {"in_reply_to": 999}
+    reply_mapping = db_session.query(MessageMapping).filter_by(
+        conversation_id=conversation.id, platform_message_id="889"
+    ).one()
+    assert reply_mapping.platform_parent_message_id == "888"
+    assert reply_mapping.chatwoot_parent_message_id == "999"
 
 
 @pytest.mark.anyio

@@ -144,7 +144,7 @@ class MessagePayloadParser:
             "name": str(current_contact.get("name") or "").strip() or fallback_name,
             "phone_number": normalized_phone,
         }
-        for key in ("identifier", "email"):
+        for key in ("email",):
             value = str(current_contact.get(key) or "").strip()
             if value:
                 payload[key] = value
