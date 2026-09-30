@@ -2573,6 +2573,38 @@ def test_parse_raw_update_flags_service_notice():
     assert message["from"]["first_name"] == "Sara"
 
 
+def test_parse_raw_update_location_is_not_service_notice():
+    import json
+
+    from bale_pv_connector.messaging_messages import Peer
+    from bale_pv_connector.protobuf_wire import ProtobufMessage
+    from bale_pv_connector.update_parser import BaleUpdateType
+
+    payload = {
+        "dataType": "location",
+        "data": {"location": {"latitude": 35.721899889611116, "longitude": 51.33470010012388}},
+    }
+    message = ProtobufMessage().add_message(
+        7, ProtobufMessage().add_string(1, json.dumps(payload))
+    )
+    update = ProtobufMessage()
+    update.add_bytes(1, Peer(456).serialize())
+    update.add_int32(2, 456)
+    update.add_int64(4, 999)
+    update.add_bytes(5, message.serialize())
+    wrapper = ProtobufMessage().add_bytes(BaleUpdateType.NEW_MESSAGE, update.serialize())
+    inner = ProtobufMessage().add_bytes(1, wrapper.serialize())
+    frame = ProtobufMessage().add_bytes(1, inner.serialize()).serialize()
+
+    parsed = BalePvConnector._parse_raw_update(frame, user_cache={456: "Sara"}, self_user_id=999)
+    assert parsed is not None
+    assert parsed["message"]["text"] == (
+        "Location: https://www.google.com/maps/search/?api=1"
+        "&query=35.721899889611116%2C51.33470010012388"
+    )
+    assert "_service_notice" not in parsed["message"]
+
+
 def test_parse_raw_update_text_message_not_flagged():
     """Normal text messages must not be flagged as service notices."""
     from bale_pv_connector.messaging_messages import Peer, TextMessage

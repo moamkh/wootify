@@ -1,5 +1,7 @@
 """Tests for WebSocket update parser."""
 
+import json
+
 import pytest
 
 from bale_pv_connector.messaging_messages import Peer, TextMessage
@@ -137,6 +139,52 @@ def test_parse_new_text_message_update() -> None:
     assert parsed["peer"] == {"type": 1, "id": 123}
     assert parsed["text"] == "hello"
     assert parsed["message_type"] == "text"
+
+
+def test_parse_location_message_as_google_maps_link() -> None:
+    # This is the protobuf shape observed for a real Bale attachment-menu
+    # location share: Message G field 7 -> field 1 -> JSON app payload.
+    payload = {
+        "dataType": "location",
+        "data": {"location": {"latitude": 35.721899889611116, "longitude": 51.33470010012388}},
+    }
+    message = ProtobufMessage().add_message(
+        7, ProtobufMessage().add_string(1, json.dumps(payload))
+    )
+    update = ProtobufMessage()
+    update.add_bytes(1, Peer(1755271951).serialize())
+    update.add_int32(2, 1755271951)
+    update.add_int64(4, 6744217007062444690)
+    update.add_bytes(5, message.serialize())
+    wrapper = ProtobufMessage().add_bytes(BaleUpdateType.NEW_MESSAGE, update.serialize())
+    inner = ProtobufMessage().add_bytes(1, wrapper.serialize())
+    frame = ProtobufMessage().add_bytes(1, inner.serialize()).serialize()
+
+    parsed = parse_ws_update(frame)
+    assert parsed is not None
+    assert parsed["rid"] == "6744217007062444690"
+    assert parsed["message_type"] == "location"
+    assert parsed["text"] == (
+        "Location: https://www.google.com/maps/search/?api=1"
+        "&query=35.721899889611116%2C51.33470010012388"
+    )
+
+
+@pytest.mark.parametrize("coordinates", [
+    {"latitude": 91, "longitude": 0},
+    {"latitude": "35.7", "longitude": 51.3},
+    {"latitude": True, "longitude": 51.3},
+])
+def test_invalid_location_does_not_create_map_link(coordinates: dict) -> None:
+    from bale_pv_connector.update_parser import _parse_message_content
+
+    payload = {"dataType": "location", "data": {"location": coordinates}}
+    message = ProtobufMessage().add_message(
+        7, ProtobufMessage().add_string(1, json.dumps(payload))
+    )
+    parsed = _parse_message_content(message.serialize())
+    assert parsed is not None
+    assert parsed["message_type"] == "unsupported"
 
 
 def test_parse_deleted_message_update() -> None:

@@ -1,5 +1,13 @@
 # Changelog
 
+## 7.0.10 — 2026-09-30
+
+- Bridge Bale PV location shares as clickable Google Maps links in Chatwoot.
+  Decode the field-7 location payload and validate coordinates so these
+  messages are no longer misclassified as service notices and dropped.
+- Add parser and connector regression tests using the observed Bale location
+  payload shape. No database schema changes.
+
 ## 7.0.9 — 2026-09-30
 
 - Recover Bale PV delivery when Chatwoot has multiple contacts for the same

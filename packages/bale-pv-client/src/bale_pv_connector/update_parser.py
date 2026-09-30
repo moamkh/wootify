@@ -83,12 +83,49 @@ AudioMetadata:
     6: album? (string)
 """
 
+import json
 import logging
+import math
 from typing import Any, Dict, List, Optional
 
 from .protobuf_wire import ProtobufParser
 
 logger = logging.getLogger("bale_pv_connector.updates")
+
+
+def _parse_location_message(data: bytes) -> Optional[Dict[str, Any]]:
+    """Decode Bale's field-7 JSON payload and expose a usable map link."""
+    try:
+        payload_bytes = ProtobufParser(data).parse().get(1, [None])[0]
+        if not isinstance(payload_bytes, bytes):
+            return None
+        payload = json.loads(payload_bytes.decode("utf-8"))
+        if not isinstance(payload, dict) or payload.get("dataType") != "location":
+            return None
+        location = payload.get("data", {}).get("location")
+        if not isinstance(location, dict):
+            return None
+        latitude = location.get("latitude")
+        longitude = location.get("longitude")
+        if (
+            isinstance(latitude, bool) or isinstance(longitude, bool)
+            or not isinstance(latitude, (int, float))
+            or not isinstance(longitude, (int, float))
+            or not math.isfinite(latitude) or not math.isfinite(longitude)
+            or not -90 <= latitude <= 90
+            or not -180 <= longitude <= 180
+        ):
+            return None
+        return {
+            "text": (
+                "Location: https://www.google.com/maps/search/"
+                f"?api=1&query={latitude}%2C{longitude}"
+            ),
+            "message_type": "location",
+        }
+    except (UnicodeDecodeError, ValueError, TypeError, AttributeError, IndexError):
+        return None
+
 
 # Known WebSocket message-wrapper field numbers observed in live captures.
 # Field 55 is the classic UpdateMessage; other fields carry settings,
@@ -390,6 +427,14 @@ def _parse_message_content(data: bytes) -> Optional[Dict[str, Any]]:
                 "deleted": True,
             }
 
+        # Field 7 wraps a JSON app payload. Live Bale location shares encode
+        # {dataType: location, data: {location: {latitude, longitude}}} here.
+        location_bytes = fields.get(7, [None])[0]
+        if isinstance(location_bytes, bytes):
+            location = _parse_location_message(location_bytes)
+            if location:
+                return location
+
         # Field 4 = documentMessage (media: photo, video, audio, doc, etc.)
         doc_bytes = fields.get(4, [None])[0]
         if doc_bytes and isinstance(doc_bytes, bytes):
@@ -423,7 +468,7 @@ def _parse_message_content(data: bytes) -> Optional[Dict[str, Any]]:
         if fields:
             # The message body exists but uses a content type we do not parse
             # (e.g. ServiceMessage for the "<name> joined Bale" notice that Bale
-            # pushes when a contact registers, contact cards, locations, ...).
+            # pushes when a contact registers, contact cards, ...).
             # Tag it so downstream consumers can treat it as a non-displayable
             # service notice instead of posting an empty message.
             logger.info(
