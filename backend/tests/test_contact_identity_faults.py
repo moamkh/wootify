@@ -174,7 +174,12 @@ def test_mapping_cannot_be_rebound_or_ambiguously_reversed(db_session, sample_in
     repo.save(args["instance_id"], "123", "91")
     with pytest.raises(ContactMappingConflict):
         repo.save(args["instance_id"], "123", "92")
-    repo.save(args["instance_id"], "456", "91")
+    with pytest.raises(ContactMappingConflict):
+        repo.save(args["instance_id"], "456", "91")
+    # Older databases may already contain the ambiguity; reverse lookup must
+    # still reject those rows instead of choosing either recipient.
+    db_session.add(ContactMapping(instance_id=args["instance_id"], platform_contact_id="456", chatwoot_contact_id="91"))
+    db_session.flush()
     with pytest.raises(ContactMappingConflict):
         repo.unique_platform_id_for_chatwoot(args["instance_id"], "91")
 

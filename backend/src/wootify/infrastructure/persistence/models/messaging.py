@@ -106,6 +106,24 @@ class ContactCreation(Base):
     created_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
 
 
+class ContactAlias(Base):
+    """A separately verified Chatwoot contact for an existing platform peer."""
+
+    __tablename__ = "contact_aliases"
+    __table_args__ = (
+        UniqueConstraint("instance_id", "chatwoot_scope", "chatwoot_contact_id", name="uq_contact_alias_scope_contact"),
+        Index("ix_contact_aliases_instance_peer", "instance_id", "platform_contact_id"),
+    )
+
+    id = Column(String(36), primary_key=True, default=_uuid)
+    instance_id = Column(String(36), ForeignKey("instances.id", ondelete="CASCADE"), nullable=False, index=True)
+    chatwoot_scope = Column(String(64), nullable=False)
+    chatwoot_contact_id = Column(String(255), nullable=False)
+    platform_contact_id = Column(String(255), nullable=False)
+    verification_method = Column(String(32), nullable=False)
+    created_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
+
+
 class ConversationRuntimeState(Base):
     """Represents conversation runtime state."""
 

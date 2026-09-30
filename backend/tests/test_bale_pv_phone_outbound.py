@@ -64,6 +64,7 @@ class _FakeAdapter:
 
 class _FakeClient:
     def __init__(self):
+        self.base_url = 'http://chatwoot'
         self.posted_messages = []
         self.updated_contacts = []
 

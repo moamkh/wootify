@@ -416,6 +416,7 @@ async def test_webhook_send_persists_outbound_mapping(db):
     runtime.adapter = adapter
 
     client = AsyncMock()
+    client.base_url = "http://chatwoot"
 
     payload = {
         "event": "message_created",
@@ -467,6 +468,7 @@ async def test_webhook_media_delivery_is_deduplicated_and_deletable(db):
     runtime.status = "open"
     runtime.adapter = adapter
     client = AsyncMock()
+    client.base_url = "http://chatwoot"
     payload = {
         "event": "message_created",
         "message_type": "outgoing",
@@ -533,6 +535,7 @@ async def test_outbound_mapping_makes_echo_dedup(db):
     )
 
     client = AsyncMock()
+    client.base_url = "http://chatwoot"
     client.post_message = AsyncMock(return_value={"id": 99999})
     client.base_url = "http://chatwoot"
     client.get_contact = AsyncMock(side_effect=lambda account, cid: {"id": cid})

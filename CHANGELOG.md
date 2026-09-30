@@ -1,5 +1,17 @@
 # Changelog
 
+## 7.0.9 — 2026-09-30
+
+- Recover Bale PV delivery when Chatwoot has multiple contacts for the same
+  verified Bale user. Keep the original contact mapping and record additional
+  contacts as scoped, verified aliases after a fresh Bale phone lookup or a
+  matching legacy Wootify identifier.
+- Route later messages from verified aliases without repeating phone lookup.
+  Prevent a Chatwoot contact from being claimed by a different platform peer;
+  fail closed when identity cannot be verified. Preserve Chatwoot identifiers.
+- Add a `contact_aliases` migration and regression tests for duplicate contacts,
+  mismatched phone resolution, and cross-peer claims.
+
 ## 7.0.8 — 2026-09-30
 
 - Preserve contact identifiers owned by WhatsApp and other integrations at the

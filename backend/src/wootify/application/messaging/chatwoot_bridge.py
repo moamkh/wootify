@@ -42,7 +42,7 @@ from wootify.infrastructure.persistence.models import (
 from wootify.infrastructure.persistence.repositories.conversation_repository import (
     ConversationRepository,
 )
-from wootify.infrastructure.persistence.repositories.contact_mapping_repository import ContactMappingRepository
+from wootify.infrastructure.persistence.repositories.contact_mapping_repository import ContactMappingConflict, ContactMappingRepository
 from wootify.infrastructure.persistence.repositories.message_mapping_repository import (
     MessageMappingRepository,
 )
@@ -651,7 +651,7 @@ class ChatwootBridgeService:
         try:
             if not peer_id and chatwoot_contact_id:
                 peer_id = ContactMappingRepository(db).unique_platform_id_for_chatwoot(
-                    instance.id, str(chatwoot_contact_id)
+                    instance.id, str(chatwoot_contact_id), chatwoot_scope=contact_scope(client, account_id),
                 )
             # One-time compatibility import for contacts created by older Wootify
             # versions. The identifier is read only here and never used without
@@ -665,19 +665,23 @@ class ChatwootBridgeService:
                     )
                 )
                 if legacy_prefix and legacy_peer_id:
-                    ContactMappingRepository(db).save(
-                        instance.id,
-                        legacy_peer_id,
-                        str(chatwoot_contact_id),
-                        platform_contact_type=legacy_peer_type,
-                    )
+                    if ContactMappingRepository(db).get(instance.id, legacy_peer_id) is None:
+                        ContactMappingRepository(db).save(
+                            instance.id, legacy_peer_id, str(chatwoot_contact_id),
+                            platform_contact_type=legacy_peer_type,
+                            chatwoot_scope=contact_scope(client, account_id),
+                        )
                     peer_id = legacy_peer_id
             if peer_id:
                 mapped_peer = ContactMappingRepository(db).get(instance.id, peer_id)
                 if mapped_peer and mapped_peer.chatwoot_scope and mapped_peer.chatwoot_scope != contact_scope(client, account_id):
                     raise RuntimeError("chatwoot_account_changed_for_contact_mapping")
                 if mapped_peer and chatwoot_contact_id and str(mapped_peer.chatwoot_contact_id) != str(chatwoot_contact_id):
-                    raise RuntimeError("conversation_contact_mapping_conflict")
+                    await self._ensure_verified_contact_alias(
+                        db, client, instance, runtime, account_id=account_id,
+                        peer_id=peer_id, contact_id=str(chatwoot_contact_id),
+                        phone_number=phone_number, identifier=identifier,
+                    )
                 peer_type = mapped_peer.platform_contact_type if mapped_peer else None
                 if not peer_type and identifier:
                     legacy_id, legacy_type, _ = DestinationResolver.compatible_platform_destination(
@@ -732,6 +736,21 @@ class ChatwootBridgeService:
                 resolved_user = await self._resolve_bale_pv_phone(
                     db, instance, runtime, peer_id, chatwoot_contact_id
                 )
+                resolved_peer_id = str(resolved_user["id"])
+                if chatwoot_contact_id:
+                    existing_peer = ContactMappingRepository(db).get(instance.id, resolved_peer_id)
+                    if existing_peer and str(existing_peer.chatwoot_contact_id) != str(chatwoot_contact_id):
+                        await self._ensure_verified_contact_alias(
+                            db, client, instance, runtime, account_id=account_id,
+                            peer_id=resolved_peer_id, contact_id=str(chatwoot_contact_id),
+                            phone_number=phone_number, identifier=identifier,
+                        )
+                    elif not existing_peer:
+                        ContactMappingRepository(db).save(
+                            instance.id, resolved_peer_id, str(chatwoot_contact_id),
+                            platform_contact_type="user", chatwoot_scope=contact_scope(client, account_id),
+                        )
+                        db.commit()
                 await self._update_chatwoot_contact_for_bale_pv_phone(
                     client,
                     account_id,
@@ -740,10 +759,7 @@ class ChatwootBridgeService:
                     peer_id,
                     current_identifier=identifier,
                 )
-                peer_id = str(resolved_user["id"])
-                if chatwoot_contact_id:
-                    ContactMappingRepository(db).save(instance.id, peer_id, str(chatwoot_contact_id))
-                    db.commit()
+                peer_id = resolved_peer_id
                 # Keep the local conversation mapping in sync with the resolved id.
                 await self._sync_conversation_platform_id(
                     db, instance, original_peer_id, peer_id
@@ -1974,6 +1990,60 @@ class ChatwootBridgeService:
     def _normalize_bale_pv_phone(phone: str) -> str:
         """Normalize phone number to 98XXXXXXXXXX digits."""
         return ChatwootPayloadParser.normalize_bale_pv_phone(phone)
+
+    async def _ensure_verified_contact_alias(
+        self, db: Session, client: ChatwootClient, instance: Instance,
+        runtime: Any, *, account_id: int, peer_id: str, contact_id: str,
+        phone_number: Optional[str], identifier: Optional[str],
+    ) -> None:
+        """Accept a second Chatwoot contact after independently verifying its peer."""
+        mappings = ContactMappingRepository(db)
+        scope = contact_scope(client, account_id)
+        alias = mappings.get_verified_alias(instance.id, contact_id, scope)
+        if alias:
+            if str(alias.platform_contact_id) != str(peer_id):
+                raise ContactMappingConflict("contact_alias_owned_by_other_platform_peer")
+            return
+
+        legacy_id, _, legacy_prefix = DestinationResolver.compatible_platform_destination(
+            str(identifier or ""), expected_prefix=connector_registry.prefix(runtime.platform_type),
+            known_prefixes=connector_registry.all_prefixes(),
+        )
+        parsed_identifier = DestinationResolver.parse_platform_identifier(
+            str(identifier or ""), known_prefixes=connector_registry.all_prefixes(),
+        )
+        if legacy_prefix and legacy_id == str(peer_id) and parsed_identifier.get("instance_key") in (None, instance.instance_key):
+            method = "legacy_identifier"
+        elif runtime.platform_type == "bale_pv_enterprise" and phone_number:
+            normalized = self._normalize_bale_pv_phone(str(phone_number))
+            if not normalized:
+                raise ContactMappingConflict("contact_alias_requires_identity_verification")
+            # A persisted phone cache may be stale. Verify the alias against
+            # Bale again before permitting a different Chatwoot contact ID.
+            user = await runtime.adapter.resolve_phone_to_user(normalized)
+            if not user or str(user.get("id")) != str(peer_id):
+                raise ContactMappingConflict("contact_alias_phone_resolved_to_other_peer")
+            access_hash = user.get("access_hash")
+            runtime.adapter.cache_access_hash(
+                str(peer_id), int(access_hash) if access_hash is not None and str(access_hash).lstrip("-").isdigit() else None,
+            )
+            method = "bale_phone"
+        else:
+            raise ContactMappingConflict("contact_alias_requires_identity_verification")
+
+        try:
+            mappings.save_verified_alias(
+                instance.id, peer_id, contact_id,
+                chatwoot_scope=scope, verification_method=method,
+            )
+            db.commit()
+        except Exception:
+            db.rollback()
+            raise
+        logger.info(
+            "chatwoot_bridge.verified_contact_alias instance=%s peer_id=%s contact_id=%s method=%s",
+            instance.instance_key, peer_id, contact_id, method,
+        )
 
     async def _resolve_bale_pv_phone(
         self,

@@ -275,6 +275,7 @@ async def test_bale_pv_routes_enterprise_composite_identifier(db_session, monkey
     adapter.send_text.return_value = {"ok": True, "result": {"result": {"rid": 1234}}}
     runtime = SimpleNamespace(status="open", platform_type="bale_pv_enterprise", adapter=adapter)
     client = AsyncMock()
+    client.base_url = "http://chatwoot"
     service = ChatwootBridgeService()
     monkeypatch.setattr(bridge_module, "get_runtime", lambda _: runtime)
     monkeypatch.setattr(
@@ -314,6 +315,7 @@ async def test_instance_conversation_mapping_wins_over_contact_identifier(db_ses
     adapter.send_text.return_value = {"ok": True, "result": {"result": {"rid": 1235}}}
     runtime = SimpleNamespace(status="open", platform_type="bale_pv_enterprise", adapter=adapter)
     client = AsyncMock()
+    client.base_url = "http://chatwoot"
     service = ChatwootBridgeService()
     monkeypatch.setattr(bridge_module, "get_runtime", lambda _: runtime)
     monkeypatch.setattr(service, "_chatwoot_client_for_instance", lambda *_: (instance, {"account_id": 1}, client))
@@ -358,6 +360,7 @@ async def test_operator_reply_uses_explicit_chatwoot_parent_not_conversation_pre
     adapter.send_text.return_value = {"ok": True, "result": {"result": {"rid": 999}}}
     runtime = SimpleNamespace(status="open", platform_type="bale_pv_enterprise", adapter=adapter)
     client = AsyncMock()
+    client.base_url = "http://chatwoot"
     service = ChatwootBridgeService()
     monkeypatch.setattr(bridge_module, "get_runtime", lambda _: runtime)
     monkeypatch.setattr(service, "_chatwoot_client_for_instance", lambda *_: (instance, {"account_id": 3}, client))
@@ -378,6 +381,7 @@ async def test_operator_reply_uses_explicit_chatwoot_parent_not_conversation_pre
 async def test_failed_delivery_marks_original_message_and_keeps_private_note():
     service = ChatwootBridgeService()
     client = AsyncMock()
+    client.base_url = "http://chatwoot"
     payload = _payload("BALE_PV:USER:123", message_id=9010, conversation_id=79)
 
     await service._notify_delivery_failure(
@@ -404,6 +408,7 @@ async def test_failed_delivery_marks_original_message_and_keeps_private_note():
 async def test_disconnected_instance_marks_outgoing_message_failed(db_session, monkeypatch):
     instance = _instance(db_session, "disconnected-bale")
     client = AsyncMock()
+    client.base_url = "http://chatwoot"
     service = ChatwootBridgeService()
     monkeypatch.setattr(bridge_module, "get_runtime", lambda _: None)
     monkeypatch.setattr(
@@ -437,6 +442,7 @@ async def test_empty_outgoing_message_is_failed_without_platform_send(db_session
         status="open", platform_type="bale_pv_enterprise", adapter=adapter
     )
     client = AsyncMock()
+    client.base_url = "http://chatwoot"
     service = ChatwootBridgeService()
     monkeypatch.setattr(bridge_module, "get_runtime", lambda _: runtime)
     monkeypatch.setattr(
@@ -564,6 +570,7 @@ async def test_bale_deleted_message_is_soft_deleted_in_chatwoot(db_session, monk
     db_session.add(mapping)
     db_session.commit()
     client = AsyncMock()
+    client.base_url = "http://chatwoot"
     service = ChatwootBridgeService()
     monkeypatch.setattr(
         service,
@@ -616,6 +623,7 @@ async def test_sample_message_is_marked_seen_once_before_replies():
     """A controlled sample inbound message advances the seen cache once."""
     connector = BalePvConnector()
     client = AsyncMock()
+    client.base_url = "http://chatwoot"
     runtime = BalePvInstanceRuntime(
         instance_key="seen-sample",
         phone_number="989120000000",
