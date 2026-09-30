@@ -1,5 +1,17 @@
 # Changelog
 
+## 7.0.8 — 2026-09-30
+
+- Preserve contact identifiers owned by WhatsApp and other integrations at the
+  Chatwoot HTTP client boundary. Wootify contact routing uses instance-owned
+  mappings, and Bale, Eitaa, Telegram, and enterprise contacts share durable
+  contact resolution.
+- Recover contact creation after lost HTTP responses or local database failures
+  through a saved API-inbox source key; reject ambiguous matches and stop
+  delivery when account scope or peer identity conflicts.
+- Add the `contact_creations` migration, targeted failure/concurrency tests,
+  and deployment notes in `docs/contact-identity-hardening.md`.
+
 ## 7.0.7 — 2026-09-30
 
 - Store Wootify-managed platform contact identities in an instance-scoped

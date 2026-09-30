@@ -16,6 +16,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from wootify.infrastructure.chatwoot.client import ChatwootClient
+from wootify.application.messaging.contact_identity import contact_identity
 from wootify.application.messaging.destination_resolver import DestinationResolver
 from wootify.application.messaging.media_normalizer import MediaNormalizer
 from wootify.application.messaging.notification_policy import NotificationPolicy
@@ -404,6 +405,7 @@ class BridgeService:
             ContactMappingRepository(db).save(
                 runtime.instance.id, str(destination_chat_id), str(contact_id)
             )
+            db.commit()
 
         operator_name = self._extract_chatwoot_operator_name(payload)
         operator_note_text, operator_state_row, operator_state_value = self._resolve_operator_notification(
@@ -1575,7 +1577,6 @@ class BridgeService:
         missing-contact creation are performed.
         """
         identifier = self._prefixed_identifier(platform_key, chat_id)
-        mappings = ContactMappingRepository(db)
         normalized_phone = self._normalize_phone_number(phone_number)
 
         chat_kind = str(chat_type or 'user').strip().lower()
@@ -1601,120 +1602,34 @@ class BridgeService:
             if resolved_name == str(chat_id) and str(chat_id).isdigit():
                 source = self._source_prefix(platform_key).title()
                 resolved_name = f'{source} User {chat_id}'
-        mapped = mappings.get(instance_id, chat_id)
-        if mapped and str(mapped.chatwoot_contact_id).isdigit():
-            try:
-                fetched = await client.get_contact(account_id, int(mapped.chatwoot_contact_id))
-                current = self._extract_contact_payload(fetched)
-                if current:
-                    if chat_type and mapped.platform_contact_type != str(chat_type).lower():
-                        mappings.save(
-                            instance_id, chat_id, str(mapped.chatwoot_contact_id),
-                            platform_contact_type=chat_type,
-                        )
-                    if not skip_profile_sync:
-                        await self._sync_contact_name_if_needed(
-                            client,
-                            account_id=account_id,
-                            contact_id=int(mapped.chatwoot_contact_id),
-                            current_contact=current,
-                            new_name=resolved_name,
-                            additional_attributes=additional_attributes,
-                        )
-                    await self._sync_contact_phone_if_needed(
-                        client,
-                        account_id=account_id,
-                        contact_id=int(mapped.chatwoot_contact_id),
-                        current_contact=current,
-                        phone_number=normalized_phone,
-                        fallback_name=resolved_name,
-                    )
-                    return int(mapped.chatwoot_contact_id)
-            except httpx.HTTPStatusError as exc:
-                if exc.response is None or exc.response.status_code != 404:
-                    raise
-            mappings.delete(instance_id, chat_id)
-        try:
-            found = await client.search_contacts(account_id, identifier)
-            payload = found.get('payload') if isinstance(found, dict) else None
-            if isinstance(payload, list) and payload:
-                first = next(
-                    (item for item in payload if isinstance(item, dict) and str(item.get('identifier') or '') == identifier),
-                    {},
-                )
-                cid = self._extract_id(first)
-                if cid:
-                    if not skip_profile_sync:
-                        await self._sync_contact_name_if_needed(
-                            client,
-                            account_id=account_id,
-                            contact_id=int(cid),
-                            current_contact=first,
-                            new_name=resolved_name,
-                            additional_attributes=additional_attributes,
-                        )
-                    await self._sync_contact_phone_if_needed(
-                        client,
-                        account_id=account_id,
-                        contact_id=int(cid),
-                        current_contact=first,
-                        phone_number=normalized_phone,
-                        fallback_name=resolved_name,
-                    )
-                    mappings.save(instance_id, chat_id, str(cid), platform_contact_type=chat_type)
-                    return int(cid)
-        except Exception:
-            pass
-
+        payload: dict[str, Any] = {"name": resolved_name}
         if normalized_phone:
-            phone_contact = await self._find_contact_by_phone(
-                client,
-                account_id=account_id,
-                phone_number=normalized_phone,
-            )
-            phone_contact_id = self._extract_id(phone_contact)
-            if phone_contact_id:
-                logger.info(
-                    'reusing chatwoot contact by phone account_id=%s contact_id=%s phone=%s',
-                    account_id,
-                    phone_contact_id,
-                    normalized_phone,
-                )
-                mappings.save(instance_id, chat_id, str(phone_contact_id), platform_contact_type=chat_type)
-                return int(phone_contact_id)
-
-        create_payload: dict[str, Any] = {
-            'inbox_id': int(inbox_id),
-            'name': resolved_name,
-        }
-        if normalized_phone:
-            create_payload['phone_number'] = normalized_phone
+            payload["phone_number"] = normalized_phone
         if first_name:
-            create_payload['name'] = str(first_name).strip()
+            payload["name"] = str(first_name).strip()
             if last_name:
-                create_payload['name'] = f"{create_payload['name']} {str(last_name).strip()}".strip()
+                payload["name"] = f"{payload['name']} {str(last_name).strip()}".strip()
         if additional_attributes:
-            create_payload['additional_attributes'] = additional_attributes
-
-        created = await client.create_contact(
-            account_id,
-            create_payload,
+            payload["additional_attributes"] = additional_attributes
+        cid, created = await contact_identity.resolve(
+            db, client, instance_id=instance_id, account_id=account_id,
+            inbox_id=inbox_id, peer_id=chat_id, payload=payload,
+            legacy_identifiers=(identifier,), peer_type=chat_kind,
         )
-        cid = self._extract_id(created) or self._extract_id((created or {}).get('payload'))
-        if not cid:
-            cid = self._extract_id(((created or {}).get('payload') or {}).get('contact'))
-        if not cid:
-            raise RuntimeError('Failed to create Chatwoot contact')
-        mappings.save(instance_id, chat_id, str(cid), platform_contact_type=chat_type)
-        await self._sync_contact_phone_if_needed(
-            client,
-            account_id=account_id,
-            contact_id=int(cid),
-            current_contact=(created.get('payload') if isinstance(created, dict) else {}) or {},
-            phone_number=normalized_phone,
-            fallback_name=resolved_name,
-        )
-        return int(cid)
+        if not created:
+            current = contact_identity._contact(await client.get_contact(account_id, cid))
+            if not skip_profile_sync:
+                await self._sync_contact_name_if_needed(
+                    client, account_id=account_id, contact_id=cid,
+                    current_contact=current, new_name=resolved_name,
+                    additional_attributes=additional_attributes,
+                )
+            await self._sync_contact_phone_if_needed(
+                client, account_id=account_id, contact_id=cid,
+                current_contact=current, phone_number=normalized_phone,
+                fallback_name=resolved_name,
+            )
+        return cid
 
     async def _sync_contact_name_if_needed(
         self,

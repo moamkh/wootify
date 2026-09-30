@@ -85,8 +85,25 @@ class ContactMapping(Base):
     platform_contact_id = Column(String(255), nullable=False)
     platform_contact_type = Column(String(32), nullable=True)
     chatwoot_contact_id = Column(String(255), nullable=False)
+    chatwoot_scope = Column(String(64), nullable=True)
     created_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
     updated_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now())
+
+
+class ContactCreation(Base):
+    """Durable recovery key saved before an external contact creation request."""
+
+    __tablename__ = "contact_creations"
+    __table_args__ = (
+        UniqueConstraint("instance_id", "chatwoot_scope", "platform_contact_id", name="uq_contact_creation_peer_scope"),
+    )
+    id = Column(String(36), primary_key=True, default=_uuid)
+    instance_id = Column(String(36), ForeignKey("instances.id", ondelete="CASCADE"), nullable=False, index=True)
+    platform_contact_id = Column(String(255), nullable=False)
+    chatwoot_scope = Column(String(64), nullable=False)
+    chatwoot_inbox_id = Column(String(255), nullable=False)
+    chatwoot_contact_id = Column(String(255), nullable=True)
+    created_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
 
 
 class ConversationRuntimeState(Base):

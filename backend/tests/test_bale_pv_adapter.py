@@ -291,6 +291,11 @@ async def test_webhook_resolves_phone_to_bale_user(db_session):
     runtime.adapter = adapter
 
     client = AsyncMock()
+    client.base_url = "http://chatwoot"
+    client.get_contact = AsyncMock(side_effect=lambda account, cid: {"id": cid})
+    client.get_contact_by_source = AsyncMock(side_effect=httpx.HTTPStatusError(
+        "not found", request=httpx.Request("POST", "http://chatwoot"), response=httpx.Response(404)))
+    client.get_inbox = AsyncMock(return_value={"channel_type": "Channel::Api"})
 
     payload = {
         "event": "message_created",
@@ -365,6 +370,11 @@ async def test_webhook_uses_cached_phone_resolution(db_session):
     runtime.adapter = adapter
 
     client = AsyncMock()
+    client.base_url = "http://chatwoot"
+    client.get_contact = AsyncMock(side_effect=lambda account, cid: {"id": cid})
+    client.get_contact_by_source = AsyncMock(side_effect=httpx.HTTPStatusError(
+        "not found", request=httpx.Request("POST", "http://chatwoot"), response=httpx.Response(404)))
+    client.get_inbox = AsyncMock(return_value={"channel_type": "Channel::Api"})
 
     payload = {
         "event": "message_created",
@@ -433,6 +443,11 @@ async def test_webhook_does_not_resolve_when_identifier_present(db_session):
     runtime.adapter = adapter
 
     client = AsyncMock()
+    client.base_url = "http://chatwoot"
+    client.get_contact = AsyncMock(side_effect=lambda account, cid: {"id": cid})
+    client.get_contact_by_source = AsyncMock(side_effect=httpx.HTTPStatusError(
+        "not found", request=httpx.Request("POST", "http://chatwoot"), response=httpx.Response(404)))
+    client.get_inbox = AsyncMock(return_value={"channel_type": "Channel::Api"})
 
     payload = {
         "event": "message_created",
@@ -500,6 +515,11 @@ async def test_webhook_outbound_persists_conversation_mapping(db_session):
     runtime.adapter = adapter
 
     client = AsyncMock()
+    client.base_url = "http://chatwoot"
+    client.get_contact = AsyncMock(side_effect=lambda account, cid: {"id": cid})
+    client.get_contact_by_source = AsyncMock(side_effect=httpx.HTTPStatusError(
+        "not found", request=httpx.Request("POST", "http://chatwoot"), response=httpx.Response(404)))
+    client.get_inbox = AsyncMock(return_value={"channel_type": "Channel::Api"})
 
     payload = {
         "event": "message_created",
@@ -593,6 +613,11 @@ def _mk_dedup_env(db_session, instance_key):
     runtime.adapter = adapter
 
     client = AsyncMock()
+    client.base_url = "http://chatwoot"
+    client.get_contact = AsyncMock(side_effect=lambda account, cid: {"id": cid})
+    client.get_contact_by_source = AsyncMock(side_effect=httpx.HTTPStatusError(
+        "not found", request=httpx.Request("POST", "http://chatwoot"), response=httpx.Response(404)))
+    client.get_inbox = AsyncMock(return_value={"channel_type": "Channel::Api"})
     return instance, adapter, runtime, client
 
 
@@ -642,6 +667,11 @@ async def test_webhook_outbound_dedup_same_chatwoot_message_id(db_session):
 async def test_delivery_failure_note_is_deduplicated_and_uses_platform_name():
     service = ChatwootBridgeService()
     client = AsyncMock()
+    client.base_url = "http://chatwoot"
+    client.get_contact = AsyncMock(side_effect=lambda account, cid: {"id": cid})
+    client.get_contact_by_source = AsyncMock(side_effect=httpx.HTTPStatusError(
+        "not found", request=httpx.Request("POST", "http://chatwoot"), response=httpx.Response(404)))
+    client.get_inbox = AsyncMock(return_value={"channel_type": "Channel::Api"})
     platform = MagicMock()
     platform.key = "instagram_pv_enterprise"
     payload = {"id": 9002, "conversation": {"id": 77}}
@@ -745,6 +775,11 @@ async def test_webhook_forwards_template_automation_message(db_session):
     runtime.adapter = adapter
 
     client = AsyncMock()
+    client.base_url = "http://chatwoot"
+    client.get_contact = AsyncMock(side_effect=lambda account, cid: {"id": cid})
+    client.get_contact_by_source = AsyncMock(side_effect=httpx.HTTPStatusError(
+        "not found", request=httpx.Request("POST", "http://chatwoot"), response=httpx.Response(404)))
+    client.get_inbox = AsyncMock(return_value={"channel_type": "Channel::Api"})
 
     payload = {
         "event": "message_created",
@@ -810,6 +845,11 @@ async def test_webhook_forwards_bot_sender_message(db_session):
     runtime.adapter = adapter
 
     client = AsyncMock()
+    client.base_url = "http://chatwoot"
+    client.get_contact = AsyncMock(side_effect=lambda account, cid: {"id": cid})
+    client.get_contact_by_source = AsyncMock(side_effect=httpx.HTTPStatusError(
+        "not found", request=httpx.Request("POST", "http://chatwoot"), response=httpx.Response(404)))
+    client.get_inbox = AsyncMock(return_value={"channel_type": "Channel::Api"})
 
     payload = {
         "event": "message_created",
@@ -877,6 +917,11 @@ async def test_webhook_ignores_incoming_customer_message(db_session):
     runtime.adapter = adapter
 
     client = AsyncMock()
+    client.base_url = "http://chatwoot"
+    client.get_contact = AsyncMock(side_effect=lambda account, cid: {"id": cid})
+    client.get_contact_by_source = AsyncMock(side_effect=httpx.HTTPStatusError(
+        "not found", request=httpx.Request("POST", "http://chatwoot"), response=httpx.Response(404)))
+    client.get_inbox = AsyncMock(return_value={"channel_type": "Channel::Api"})
 
     payload = {
         "event": "message_created",
@@ -937,6 +982,11 @@ async def test_webhook_ignores_edit_reply_echo(db_session):
     runtime.adapter = adapter
 
     client = AsyncMock()
+    client.base_url = "http://chatwoot"
+    client.get_contact = AsyncMock(side_effect=lambda account, cid: {"id": cid})
+    client.get_contact_by_source = AsyncMock(side_effect=httpx.HTTPStatusError(
+        "not found", request=httpx.Request("POST", "http://chatwoot"), response=httpx.Response(404)))
+    client.get_inbox = AsyncMock(return_value={"channel_type": "Channel::Api"})
 
     payload = {
         "event": "message_created",
@@ -1061,6 +1111,11 @@ async def test_webhook_propagates_message_updated_to_bale(db_session):
     runtime.adapter = adapter
 
     client = AsyncMock()
+    client.base_url = "http://chatwoot"
+    client.get_contact = AsyncMock(side_effect=lambda account, cid: {"id": cid})
+    client.get_contact_by_source = AsyncMock(side_effect=httpx.HTTPStatusError(
+        "not found", request=httpx.Request("POST", "http://chatwoot"), response=httpx.Response(404)))
+    client.get_inbox = AsyncMock(return_value={"channel_type": "Channel::Api"})
 
     payload = {
         "event": "message_updated",
@@ -1141,6 +1196,11 @@ async def test_webhook_does_not_edit_authenticated_users_bale_message(db_session
     adapter = AsyncMock()
     runtime = MagicMock(status="open", adapter=adapter)
     client = AsyncMock()
+    client.base_url = "http://chatwoot"
+    client.get_contact = AsyncMock(side_effect=lambda account, cid: {"id": cid})
+    client.get_contact_by_source = AsyncMock(side_effect=httpx.HTTPStatusError(
+        "not found", request=httpx.Request("POST", "http://chatwoot"), response=httpx.Response(404)))
+    client.get_inbox = AsyncMock(return_value={"channel_type": "Channel::Api"})
     payload = {
         "event": "message_updated",
         "id": 999,
@@ -1222,6 +1282,11 @@ async def test_webhook_skips_message_updated_when_content_unchanged(db_session):
     runtime.adapter = adapter
 
     client = AsyncMock()
+    client.base_url = "http://chatwoot"
+    client.get_contact = AsyncMock(side_effect=lambda account, cid: {"id": cid})
+    client.get_contact_by_source = AsyncMock(side_effect=httpx.HTTPStatusError(
+        "not found", request=httpx.Request("POST", "http://chatwoot"), response=httpx.Response(404)))
+    client.get_inbox = AsyncMock(return_value={"channel_type": "Channel::Api"})
 
     payload = {
         "event": "message_updated",
@@ -1302,6 +1367,11 @@ async def test_webhook_skips_message_updated_for_edit_reply(db_session):
     runtime.adapter = adapter
 
     client = AsyncMock()
+    client.base_url = "http://chatwoot"
+    client.get_contact = AsyncMock(side_effect=lambda account, cid: {"id": cid})
+    client.get_contact_by_source = AsyncMock(side_effect=httpx.HTTPStatusError(
+        "not found", request=httpx.Request("POST", "http://chatwoot"), response=httpx.Response(404)))
+    client.get_inbox = AsyncMock(return_value={"channel_type": "Channel::Api"})
 
     payload = {
         "event": "message_updated",
@@ -1383,6 +1453,11 @@ async def test_webhook_propagates_message_updated_deleted(db_session):
     runtime.adapter = adapter
 
     client = AsyncMock()
+    client.base_url = "http://chatwoot"
+    client.get_contact = AsyncMock(side_effect=lambda account, cid: {"id": cid})
+    client.get_contact_by_source = AsyncMock(side_effect=httpx.HTTPStatusError(
+        "not found", request=httpx.Request("POST", "http://chatwoot"), response=httpx.Response(404)))
+    client.get_inbox = AsyncMock(return_value={"channel_type": "Channel::Api"})
 
     payload = {
         "event": "message_updated",
@@ -1473,6 +1548,11 @@ async def test_ingest_recovers_from_missing_conversation(db_session):
     db_session.commit()
 
     client = AsyncMock()
+    client.base_url = "http://chatwoot"
+    client.get_contact = AsyncMock(side_effect=lambda account, cid: {"id": cid})
+    client.get_contact_by_source = AsyncMock(side_effect=httpx.HTTPStatusError(
+        "not found", request=httpx.Request("POST", "http://chatwoot"), response=httpx.Response(404)))
+    client.get_inbox = AsyncMock(return_value={"channel_type": "Channel::Api"})
     # First post fails with 404; retry succeeds.
     not_found = httpx.Response(404, json={"error": "Resource could not be found"})
     client.post_message = AsyncMock(
@@ -1557,6 +1637,11 @@ async def test_webhook_marks_conversation_resolved(db_session):
     db_session.commit()
 
     client = AsyncMock()
+    client.base_url = "http://chatwoot"
+    client.get_contact = AsyncMock(side_effect=lambda account, cid: {"id": cid})
+    client.get_contact_by_source = AsyncMock(side_effect=httpx.HTTPStatusError(
+        "not found", request=httpx.Request("POST", "http://chatwoot"), response=httpx.Response(404)))
+    client.get_inbox = AsyncMock(return_value={"channel_type": "Channel::Api"})
     runtime = MagicMock()
     runtime.status = "open"
     payload = {
@@ -1915,6 +2000,11 @@ async def test_post_message_to_chatwoot_uses_unique_filenames(db_session):
     db_session.commit()
 
     client = AsyncMock()
+    client.base_url = "http://chatwoot"
+    client.get_contact = AsyncMock(side_effect=lambda account, cid: {"id": cid})
+    client.get_contact_by_source = AsyncMock(side_effect=httpx.HTTPStatusError(
+        "not found", request=httpx.Request("POST", "http://chatwoot"), response=httpx.Response(404)))
+    client.get_inbox = AsyncMock(return_value={"channel_type": "Channel::Api"})
     client.post_message_with_attachments = AsyncMock(return_value={"id": 42})
 
     attachments = [
@@ -2122,6 +2212,11 @@ async def test_ingest_skips_duplicate_platform_message_before_posting(db_session
     db_session.commit()
 
     client = AsyncMock()
+    client.base_url = "http://chatwoot"
+    client.get_contact = AsyncMock(side_effect=lambda account, cid: {"id": cid})
+    client.get_contact_by_source = AsyncMock(side_effect=httpx.HTTPStatusError(
+        "not found", request=httpx.Request("POST", "http://chatwoot"), response=httpx.Response(404)))
+    client.get_inbox = AsyncMock(return_value={"channel_type": "Channel::Api"})
     client.post_message = AsyncMock(return_value={"id": 12345})
     client.post_message_with_attachments = AsyncMock(return_value={"id": 12345})
     client.search_contacts = AsyncMock(return_value={"payload": [{"id": contact_id, "identifier": "BALE_PV:770408072"}]})
@@ -2207,6 +2302,11 @@ async def test_ingest_posts_edit_as_reply_when_text_changes(db_session):
     db_session.commit()
 
     client = AsyncMock()
+    client.base_url = "http://chatwoot"
+    client.get_contact = AsyncMock(side_effect=lambda account, cid: {"id": cid})
+    client.get_contact_by_source = AsyncMock(side_effect=httpx.HTTPStatusError(
+        "not found", request=httpx.Request("POST", "http://chatwoot"), response=httpx.Response(404)))
+    client.get_inbox = AsyncMock(return_value={"channel_type": "Channel::Api"})
     client.post_message = AsyncMock(return_value={"id": 1111})
     client.post_message_with_attachments = AsyncMock(return_value={"id": 1111})
     client.search_contacts = AsyncMock(return_value={"payload": [{"id": contact_id, "identifier": "BALE_PV:770408072"}]})
@@ -2386,6 +2486,11 @@ async def test_resolve_group_title_uses_load_groups():
     connector._instances["test-instance"] = runtime
 
     client = AsyncMock()
+    client.base_url = "http://chatwoot"
+    client.get_contact = AsyncMock(side_effect=lambda account, cid: {"id": cid})
+    client.get_contact_by_source = AsyncMock(side_effect=httpx.HTTPStatusError(
+        "not found", request=httpx.Request("POST", "http://chatwoot"), response=httpx.Response(404)))
+    client.get_inbox = AsyncMock(return_value={"channel_type": "Channel::Api"})
     client.load_groups = AsyncMock(return_value=_build_load_groups_response_body([
         (395054013, "testprivategroup", 999),
     ]))
@@ -2602,6 +2707,11 @@ async def test_ingest_service_notice_creates_contact_only(db_session):
     instance = _make_bridge_instance(db_session, "bale-pv-notice")
 
     client = AsyncMock()
+    client.base_url = "http://chatwoot"
+    client.get_contact = AsyncMock(side_effect=lambda account, cid: {"id": cid})
+    client.get_contact_by_source = AsyncMock(side_effect=httpx.HTTPStatusError(
+        "not found", request=httpx.Request("POST", "http://chatwoot"), response=httpx.Response(404)))
+    client.get_inbox = AsyncMock(return_value={"channel_type": "Channel::Api"})
     client.search_contacts = AsyncMock(return_value={"payload": []})
     client.create_contact = AsyncMock(return_value={"id": 77})
     client.create_conversation = AsyncMock(return_value={"id": 116})
@@ -2646,6 +2756,11 @@ async def test_ingest_bale_system_notice_skips_contact_and_conversation(db_sessi
     """Bale's own security messages must never trigger customer automations."""
     instance = _make_bridge_instance(db_session, "bale-pv-system-notice")
     client = AsyncMock()
+    client.base_url = "http://chatwoot"
+    client.get_contact = AsyncMock(side_effect=lambda account, cid: {"id": cid})
+    client.get_contact_by_source = AsyncMock(side_effect=httpx.HTTPStatusError(
+        "not found", request=httpx.Request("POST", "http://chatwoot"), response=httpx.Response(404)))
+    client.get_inbox = AsyncMock(return_value={"channel_type": "Channel::Api"})
     event = {
         "chat_id": "10",
         "chat_type": "private",
@@ -2674,9 +2789,14 @@ async def test_ingest_bale_system_notice_skips_contact_and_conversation(db_sessi
 
 
 @pytest.mark.anyio
-async def test_contact_lookup_requires_exact_platform_identifier():
+async def test_contact_lookup_requires_exact_platform_identifier(db_session):
     """A fuzzy Chatwoot result must not attach a short Bale ID to another user."""
     client = AsyncMock()
+    client.base_url = "http://chatwoot"
+    client.get_contact = AsyncMock(side_effect=lambda account, cid: {"id": cid})
+    client.get_contact_by_source = AsyncMock(side_effect=httpx.HTTPStatusError(
+        "not found", request=httpx.Request("POST", "http://chatwoot"), response=httpx.Response(404)))
+    client.get_inbox = AsyncMock(return_value={"channel_type": "Channel::Api"})
     client.search_contacts = AsyncMock(return_value={
         "payload": [
             {"id": 4445, "identifier": "BALE_PV:1026491874"},
@@ -2690,6 +2810,8 @@ async def test_contact_lookup_requires_exact_platform_identifier():
         inbox_id=5,
         chat_id="10",
         from_name="Bale",
+        db=db_session,
+        instance=_make_bridge_instance(db_session, "exact-contact"),
     )
 
     assert (contact_id, created) == (77, False)
@@ -2703,6 +2825,11 @@ async def test_new_contact_uses_instance_map_without_chatwoot_identifier(db_sess
 
     instance = _make_bridge_instance(db_session, "bale-pv-contact-map")
     client = AsyncMock()
+    client.base_url = "http://chatwoot"
+    client.get_contact = AsyncMock(side_effect=lambda account, cid: {"id": cid})
+    client.get_contact_by_source = AsyncMock(side_effect=httpx.HTTPStatusError(
+        "not found", request=httpx.Request("POST", "http://chatwoot"), response=httpx.Response(404)))
+    client.get_inbox = AsyncMock(return_value={"channel_type": "Channel::Api"})
     client.search_contacts = AsyncMock(return_value={"payload": []})
     client.create_contact = AsyncMock(return_value={"id": 91})
 
@@ -2742,7 +2869,12 @@ async def test_exact_phone_reuses_whatsapp_contact_without_identifier_write(db_s
 
     instance = _make_bridge_instance(db_session, "bale-pv-shared-contact")
     client = AsyncMock()
-    client.search_contacts = AsyncMock(side_effect=lambda account_id, query: {
+    client.base_url = "http://chatwoot"
+    client.get_contact = AsyncMock(side_effect=lambda account, cid: {"id": cid})
+    client.get_contact_by_source = AsyncMock(side_effect=httpx.HTTPStatusError(
+        "not found", request=httpx.Request("POST", "http://chatwoot"), response=httpx.Response(404)))
+    client.get_inbox = AsyncMock(return_value={"channel_type": "Channel::Api"})
+    client.search_contacts = AsyncMock(side_effect=lambda account_id, query, page=1: {
         "payload": [{
             "id": 91,
             "identifier": "989123456789@s.whatsapp.net",
@@ -2794,6 +2926,11 @@ async def test_bale_reply_threads_to_mapped_chatwoot_parent(db_session):
     db_session.commit()
 
     client = AsyncMock()
+    client.base_url = "http://chatwoot"
+    client.get_contact = AsyncMock(side_effect=lambda account, cid: {"id": cid})
+    client.get_contact_by_source = AsyncMock(side_effect=httpx.HTTPStatusError(
+        "not found", request=httpx.Request("POST", "http://chatwoot"), response=httpx.Response(404)))
+    client.get_inbox = AsyncMock(return_value={"channel_type": "Channel::Api"})
     client.post_message = AsyncMock(return_value={"id": 1111})
     event = {
         "chat_id": "456",
@@ -2828,6 +2965,11 @@ async def test_ingest_service_notice_repeated_does_not_duplicate(db_session):
     instance = _make_bridge_instance(db_session, "bale-pv-notice2")
 
     client = AsyncMock()
+    client.base_url = "http://chatwoot"
+    client.get_contact = AsyncMock(side_effect=lambda account, cid: {"id": cid})
+    client.get_contact_by_source = AsyncMock(side_effect=httpx.HTTPStatusError(
+        "not found", request=httpx.Request("POST", "http://chatwoot"), response=httpx.Response(404)))
+    client.get_inbox = AsyncMock(return_value={"channel_type": "Channel::Api"})
     client.search_contacts = AsyncMock(return_value={"payload": [{"id": 77, "identifier": "BALE_PV:456"}]})
 
     event = {
@@ -2862,6 +3004,11 @@ async def test_ingest_outgoing_echo_unaffected_by_flag(db_session):
     instance = _make_bridge_instance(db_session, "bale-pv-notice3")
 
     client = AsyncMock()
+    client.base_url = "http://chatwoot"
+    client.get_contact = AsyncMock(side_effect=lambda account, cid: {"id": cid})
+    client.get_contact_by_source = AsyncMock(side_effect=httpx.HTTPStatusError(
+        "not found", request=httpx.Request("POST", "http://chatwoot"), response=httpx.Response(404)))
+    client.get_inbox = AsyncMock(return_value={"channel_type": "Channel::Api"})
     client.search_contacts = AsyncMock(return_value={"payload": [{"id": 77, "identifier": "BALE_PV:456"}]})
     client.list_contact_conversations = AsyncMock(return_value=[])
     client.create_conversation = AsyncMock(return_value={"id": 116})
@@ -2939,6 +3086,11 @@ async def test_ingest_recovers_when_remote_contact_deleted(db_session):
     db_session.commit()
 
     client = AsyncMock()
+    client.base_url = "http://chatwoot"
+    client.get_contact = AsyncMock(side_effect=lambda account, cid: {"id": cid})
+    client.get_contact_by_source = AsyncMock(side_effect=httpx.HTTPStatusError(
+        "not found", request=httpx.Request("POST", "http://chatwoot"), response=httpx.Response(404)))
+    client.get_inbox = AsyncMock(return_value={"channel_type": "Channel::Api"})
     client.post_message = AsyncMock(
         side_effect=[
             _chatwoot_404("POST", "http://chatwoot/api/v1/accounts/1/conversations/70/messages"),
@@ -2946,6 +3098,14 @@ async def test_ingest_recovers_when_remote_contact_deleted(db_session):
         ]
     )
     # Contact gone: listing its conversations 404s, search finds nothing,
+    contact_lookups = 0
+    async def get_contact_after_deletion(account, cid):
+        nonlocal contact_lookups
+        contact_lookups += 1
+        if cid == 53 and contact_lookups > 1:
+            raise _chatwoot_404("GET", "http://chatwoot/api/v1/accounts/1/contacts/53")
+        return {"id": cid}
+    client.get_contact.side_effect = get_contact_after_deletion
     # first create_conversation (with stale contact_id) 404s, then the
     # recreated contact + conversation succeed.
     client.list_contact_conversations = AsyncMock(

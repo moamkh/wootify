@@ -8,8 +8,10 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import time
 from typing import Any, Dict, Optional
+from urllib.parse import urlencode
 
 import httpx
 
@@ -122,6 +124,19 @@ class ChatwootClient:
     ) -> Any:
         """Internal helper to request with retry on transient errors."""
         import asyncio
+
+        # Contact identifiers belong to the integration that created them
+        # (notably WhatsApp JIDs). Protect them even if a future caller passes
+        # identifier=None, an empty string, or an obsolete Wootify identifier.
+        if method.upper() in {"POST", "PUT", "PATCH"} and re.fullmatch(
+            r"/api/v1/accounts/\d+/contacts(?:/\d+)?", path
+        ):
+            if (json_data and "identifier" in json_data) or (data and "identifier" in data):
+                logger.warning("chatwoot.contact_identifier_write_blocked")
+            if json_data is not None:
+                json_data = {key: value for key, value in json_data.items() if key != "identifier"}
+            if data is not None:
+                data = {key: value for key, value in data.items() if key != "identifier"}
 
         url = f"{self.base_url}{path}"
         target = self._safe_target(path)
@@ -429,6 +444,20 @@ class ChatwootClient:
             "POST",
             f"/api/v1/accounts/{account_id}/contacts",
             json_data=data,
+            retry_on_read_errors=False,
+        )
+
+    async def get_inbox(self, account_id: int, inbox_id: int) -> Any:
+        """Read the inbox type before provisioning an API-channel contact."""
+        return await self._request("GET", f"/api/v1/accounts/{account_id}/inboxes/{inbox_id}")
+
+    async def get_contact_by_source(self, account_id: int, inbox_id: int, source_id: str) -> Any:
+        """Read an inbox-scoped association; this POST is a read-only filter."""
+        return await self._request(
+            "POST",
+            f"/api/v1/accounts/{account_id}/contact_inboxes/filter",
+            json_data={"inbox_id": inbox_id, "source_id": source_id},
+            log_http_error=False,
         )
 
     async def update_contact(
@@ -532,7 +561,7 @@ class ChatwootClient:
         """Search contacts."""
         return await self._request(
             "GET",
-            f"/api/v1/accounts/{account_id}/contacts/search?q={q}&page={page}",
+            f"/api/v1/accounts/{account_id}/contacts/search?{urlencode({'q': q, 'page': page})}",
         )
 
     async def delete_contact(

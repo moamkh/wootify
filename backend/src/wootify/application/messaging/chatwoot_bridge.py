@@ -22,6 +22,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from wootify.application.messaging.media_normalizer import MediaNormalizer
+from wootify.application.messaging.contact_identity import contact_identity, contact_scope
 from wootify.application.messaging.destination_resolver import DestinationResolver
 from wootify.application.messaging.payload_parser import (
     ChatwootPayloadParser,
@@ -647,48 +648,67 @@ class ChatwootBridgeService:
         if mapped_conversation and mapped_conversation.platform_conversation_id:
             peer_id = str(mapped_conversation.platform_conversation_id)
 
-        if not peer_id and chatwoot_contact_id:
-            peer_id = ContactMappingRepository(db).unique_platform_id_for_chatwoot(
-                instance.id, str(chatwoot_contact_id)
-            )
-        # One-time compatibility import for contacts created by older Wootify
-        # versions. The identifier is read only here and never used without
-        # first recording an instance-owned mapping.
-        if not peer_id and identifier and chatwoot_contact_id:
-            legacy_peer_id, legacy_peer_type, legacy_prefix = (
-                DestinationResolver.compatible_platform_destination(
-                    str(identifier),
-                    expected_prefix=connector_registry.prefix(runtime.platform_type),
-                    known_prefixes=connector_registry.all_prefixes(),
+        try:
+            if not peer_id and chatwoot_contact_id:
+                peer_id = ContactMappingRepository(db).unique_platform_id_for_chatwoot(
+                    instance.id, str(chatwoot_contact_id)
                 )
-            )
-            if legacy_prefix and legacy_peer_id:
-                ContactMappingRepository(db).save(
-                    instance.id,
-                    legacy_peer_id,
-                    str(chatwoot_contact_id),
-                    platform_contact_type=legacy_peer_type,
+            # One-time compatibility import for contacts created by older Wootify
+            # versions. The identifier is read only here and never used without
+            # first recording an instance-owned mapping.
+            if not peer_id and identifier and chatwoot_contact_id:
+                legacy_peer_id, legacy_peer_type, legacy_prefix = (
+                    DestinationResolver.compatible_platform_destination(
+                        str(identifier),
+                        expected_prefix=connector_registry.prefix(runtime.platform_type),
+                        known_prefixes=connector_registry.all_prefixes(),
+                    )
                 )
-                peer_id = legacy_peer_id
-        if peer_id:
-            mapped_peer = ContactMappingRepository(db).get(instance.id, peer_id)
-            peer_type = mapped_peer.platform_contact_type if mapped_peer else None
-            if mapped_conversation and chatwoot_contact_id and not mapped_peer:
-                ContactMappingRepository(db).save(instance.id, peer_id, str(chatwoot_contact_id))
-        elif (
-            runtime.platform_type == "bale_pv_enterprise"
-            and identifier
-            and self._is_phone_number_destination(str(identifier))
-        ):
-            peer_id = self._normalize_bale_pv_phone(str(identifier))
-            is_phone_destination = True
-        elif (
-            runtime.platform_type == "bale_pv_enterprise"
-            and phone_number
-            and not str(identifier or "").lower().endswith("@g.us")
-        ):
-            peer_id = self._normalize_bale_pv_phone(str(phone_number))
-            is_phone_destination = True
+                if legacy_prefix and legacy_peer_id:
+                    ContactMappingRepository(db).save(
+                        instance.id,
+                        legacy_peer_id,
+                        str(chatwoot_contact_id),
+                        platform_contact_type=legacy_peer_type,
+                    )
+                    peer_id = legacy_peer_id
+            if peer_id:
+                mapped_peer = ContactMappingRepository(db).get(instance.id, peer_id)
+                if mapped_peer and mapped_peer.chatwoot_scope and mapped_peer.chatwoot_scope != contact_scope(client, account_id):
+                    raise RuntimeError("chatwoot_account_changed_for_contact_mapping")
+                if mapped_peer and chatwoot_contact_id and str(mapped_peer.chatwoot_contact_id) != str(chatwoot_contact_id):
+                    raise RuntimeError("conversation_contact_mapping_conflict")
+                peer_type = mapped_peer.platform_contact_type if mapped_peer else None
+                if not peer_type and identifier:
+                    legacy_id, legacy_type, _ = DestinationResolver.compatible_platform_destination(
+                        str(identifier), expected_prefix=connector_registry.prefix(runtime.platform_type),
+                        known_prefixes=connector_registry.all_prefixes(),
+                    )
+                    if legacy_id == peer_id:
+                        peer_type = legacy_type
+                if mapped_conversation and chatwoot_contact_id and not mapped_peer:
+                    ContactMappingRepository(db).save(
+                        instance.id, peer_id, str(chatwoot_contact_id), platform_contact_type=peer_type,
+                    )
+            elif (
+                runtime.platform_type == "bale_pv_enterprise"
+                and identifier
+                and self._is_phone_number_destination(str(identifier))
+            ):
+                peer_id = self._normalize_bale_pv_phone(str(identifier))
+                is_phone_destination = True
+            elif (
+                runtime.platform_type == "bale_pv_enterprise"
+                and phone_number
+                and not str(identifier or "").lower().endswith("@g.us")
+            ):
+                peer_id = self._normalize_bale_pv_phone(str(phone_number))
+                is_phone_destination = True
+            db.commit()
+        except Exception as exc:
+            db.rollback()
+            await self._notify_delivery_failure(client, account_id, payload, peer_id, exc, platform_type=runtime.platform_type)
+            return {"ok": False, "detail": "contact_mapping_conflict"}
 
         if not peer_id:
             await self._notify_delivery_failure(
@@ -723,6 +743,7 @@ class ChatwootBridgeService:
                 peer_id = str(resolved_user["id"])
                 if chatwoot_contact_id:
                     ContactMappingRepository(db).save(instance.id, peer_id, str(chatwoot_contact_id))
+                    db.commit()
                 # Keep the local conversation mapping in sync with the resolved id.
                 await self._sync_conversation_platform_id(
                     db, instance, original_peer_id, peer_id
@@ -757,6 +778,8 @@ class ChatwootBridgeService:
                         peer_id,
                         exc,
                     )
+
+                    raise
 
             # Idempotent delivery: skip if this exact Chatwoot message was
             # already forwarded (webhook redelivery), and suppress duplicate
@@ -1205,138 +1228,33 @@ class ChatwootBridgeService:
         db: Optional[Session] = None,
         instance: Optional[Instance] = None,
     ) -> tuple[int, bool]:
-        """Find or create a Chatwoot contact for this chat.
-
-        If ``avatar_bytes`` is provided and a new contact is created, the avatar
-        is uploaded immediately. For existing contacts the avatar is left alone
-        to avoid overwriting user-changed photos on every message.
-
-        Returns ``(contact_id, created)``.
-        """
-        # Fast path: reuse the locally persisted contact mapping and skip the
-        # remote contacts/search call. A deleted remote contact surfaces as a
-        # 404 when posting, which triggers the recreate/refresh path.
-        if db is not None and instance is not None:
-            contact_map = ContactMappingRepository(db)
-            mapped_contact = contact_map.get(instance.id, chat_id)
-            if mapped_contact:
-                try:
-                    return int(mapped_contact.chatwoot_contact_id), False
-                except (TypeError, ValueError):
-                    contact_map.delete(instance.id, chat_id)
-            local = (
-                db.query(Conversation)
-                .filter(
-                    Conversation.instance_id == instance.id,
-                    Conversation.platform_conversation_id == chat_id,
-                    Conversation.is_active.is_(True),
-                )
-                .order_by(Conversation.id.desc())
-                .first()
-            )
-            if local and local.chatwoot_contact_id:
-                try:
-                    contact_map.save(instance.id, chat_id, str(local.chatwoot_contact_id), platform_contact_type=chat_type)
-                    return int(local.chatwoot_contact_id), False
-                except (TypeError, ValueError):
-                    pass
-
-        legacy_identifier = connector_registry.prefixed_source_id(platform_key, chat_id)
-        prefixed_identifier = legacy_identifier
+        """Resolve a durable local identity, then optionally upload a new avatar."""
+        if db is None or instance is None:
+            raise ValueError("contact_resolution_requires_instance_database")
+        legacy = connector_registry.prefixed_source_id(platform_key, chat_id)
+        identifiers = (legacy,)
         if platform_key == "bale_pv_enterprise":
-            type_token = {
-                "private": "USER",
-                "user": "USER",
-                "group": "GROUP",
-                "channel": "CHANNEL",
-            }.get(str(chat_type or "").strip().lower())
-            if type_token:
-                prefixed_identifier = connector_registry.prefixed_source_id(
-                    platform_key, f"{type_token}:{chat_id}"
-                )
-        try:
-            for lookup_identifier in dict.fromkeys((prefixed_identifier, legacy_identifier)):
-                found = await client.search_contacts(account_id, lookup_identifier)
-                payload = found.get("payload") if isinstance(found, dict) else None
-                if not isinstance(payload, list):
-                    continue
-                # Chatwoot contact search is fuzzy. Never use a result unless
-                # the identifier is an exact match.
-                for candidate in payload:
-                    if not isinstance(candidate, dict):
-                        continue
-                    if str(candidate.get("identifier") or "") != lookup_identifier:
-                        continue
-                    cid = self._extract_id(candidate)
-                    if cid:
-                        if db is not None and instance is not None:
-                            ContactMappingRepository(db).save(instance.id, chat_id, str(cid), platform_contact_type=chat_type)
-                        return int(cid), False
-        except Exception:
-            pass
-
-        # The same person may already exist in Chatwoot through WhatsApp.
-        # Reuse an exact phone match without altering that contact's identifier.
-        normalized_phone = self._normalize_bale_pv_phone(phone_number or "") if phone_number else ""
-        if normalized_phone:
-            for phone_query in dict.fromkeys((str(phone_number).strip(), f"+{normalized_phone}")):
-                try:
-                    found = await client.search_contacts(account_id, phone_query)
-                except Exception:
-                    continue
-                candidates = found.get("payload") if isinstance(found, dict) else None
-                if not isinstance(candidates, list):
-                    continue
-                for candidate in candidates:
-                    if not isinstance(candidate, dict):
-                        continue
-                    candidate_phone = self._normalize_bale_pv_phone(
-                        str(candidate.get("phone_number") or "")
-                    )
-                    if candidate_phone != normalized_phone:
-                        continue
-                    cid = self._extract_id(candidate)
-                    if cid:
-                        if db is not None and instance is not None:
-                            ContactMappingRepository(db).save(
-                                instance.id, chat_id, str(cid), platform_contact_type=chat_type
-                            )
-                        return int(cid), False
-
-        create_payload: Dict[str, Any] = {
-            "inbox_id": inbox_id,
-            "name": from_name,
-        }
-        if platform_key == "bale_pv_enterprise":
-            create_payload["custom_attributes"] = {
-                "bale_peer_type": str(chat_type or "private").lower(),
-                "bale_sendability": "unknown",
-            }
+            token = {"private": "USER", "user": "USER", "group": "GROUP", "channel": "CHANNEL"}.get(chat_type)
+            if token:
+                identifiers = (connector_registry.prefixed_source_id(platform_key, f"{token}:{chat_id}"), legacy)
+        payload: Dict[str, Any] = {"name": from_name}
         if phone_number:
-            create_payload["phone_number"] = phone_number
-
-        created = await client.create_contact(account_id, create_payload)
-        cid = self._extract_id(created) or self._extract_id((created or {}).get("payload"))
-        if not cid:
-            raise RuntimeError("Failed to create Chatwoot contact")
-
-        if db is not None and instance is not None:
-            ContactMappingRepository(db).save(instance.id, chat_id, str(cid), platform_contact_type=chat_type)
-
-        if avatar_bytes:
+            payload["phone_number"] = phone_number
+        if platform_key == "bale_pv_enterprise":
+            payload["custom_attributes"] = {
+                "bale_peer_type": chat_type, "bale_sendability": "unknown",
+            }
+        cid, created = await contact_identity.resolve(
+            db, client, instance_id=str(instance.id), account_id=account_id,
+            inbox_id=inbox_id, peer_id=chat_id, payload=payload,
+            legacy_identifiers=identifiers, peer_type=chat_type,
+        )
+        if created and avatar_bytes:
             try:
-                await client.update_contact_avatar(
-                    account_id, int(cid), avatar_bytes, filename=avatar_filename
-                )
+                await client.update_contact_avatar(account_id, cid, avatar_bytes, filename=avatar_filename)
             except Exception as exc:
-                logger.warning(
-                    "chatwoot_bridge.avatar_upload_failed account_id=%s contact_id=%s error=%s",
-                    account_id,
-                    cid,
-                    exc,
-                )
-
-        return int(cid), True
+                logger.warning("chatwoot_bridge.avatar_upload_failed contact_id=%s error=%s", cid, exc)
+        return cid, created
 
     async def _get_or_create_conversation(
         self,

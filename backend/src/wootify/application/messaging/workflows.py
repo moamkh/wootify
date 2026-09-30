@@ -92,6 +92,7 @@ class BalePvSyncWorkflow:
                 else:
                     created += 1
             except Exception as exc:
+                db.rollback()
                 logger.warning("sync_bale_pv_contact_failed instance=%s uid=%s name=%s error=%s", instance_key, uid, name, exc)
                 failed += 1
             await asyncio.sleep(2.0)
@@ -164,6 +165,7 @@ class BalePvSyncWorkflow:
                 if was_existing: updated += 1
                 else: created += 1
             except Exception as exc:
+                db.rollback()
                 logger.warning("sync_bale_dialog_failed instance=%s peer=%s type=%s error=%s", instance_key, peer_id, peer_type_label, exc)
                 failed += 1
             await asyncio.sleep(1.0)

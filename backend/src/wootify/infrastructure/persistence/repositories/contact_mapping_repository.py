@@ -6,6 +6,10 @@ from sqlalchemy.exc import IntegrityError
 from wootify.infrastructure.persistence.models import ContactMapping
 
 
+class ContactMappingConflict(RuntimeError):
+    """An identity is ambiguous; delivery must stop instead of guessing."""
+
+
 class ContactMappingRepository:
     def __init__(self, db: Session) -> None:
         self.db = db
@@ -31,7 +35,9 @@ class ContactMappingRepository:
             .limit(2)
             .all()
         )
-        return str(rows[0][0]) if len(rows) == 1 else None
+        if len(rows) > 1:
+            raise ContactMappingConflict("multiple_platform_peers_for_chatwoot_contact")
+        return str(rows[0][0]) if rows else None
 
     def save(
         self,
@@ -40,6 +46,7 @@ class ContactMappingRepository:
         chatwoot_contact_id: str,
         *,
         platform_contact_type: str | None = None,
+        chatwoot_scope: str | None = None,
     ) -> ContactMapping:
         row = self.get(instance_id, platform_contact_id)
         if row is None:
@@ -58,9 +65,20 @@ class ContactMappingRepository:
                 row = self.get(instance_id, platform_contact_id)
                 if row is None:
                     raise
-        row.chatwoot_contact_id = str(chatwoot_contact_id)
+        if row.chatwoot_contact_id != str(chatwoot_contact_id):
+            raise ContactMappingConflict("contact_mapping_rebind_requires_verified_recovery")
+        if chatwoot_scope and row.chatwoot_scope and row.chatwoot_scope != chatwoot_scope:
+            raise ContactMappingConflict("chatwoot_account_changed_for_contact_mapping")
+        if chatwoot_scope:
+            row.chatwoot_scope = chatwoot_scope
         if platform_contact_type:
-            row.platform_contact_type = str(platform_contact_type).lower()
+            peer_type = str(platform_contact_type).lower()
+            peer_type = "user" if peer_type == "private" else peer_type
+            current_type = "user" if row.platform_contact_type == "private" else row.platform_contact_type
+            if current_type and current_type != "unknown" and peer_type != "unknown" and current_type != peer_type:
+                raise ContactMappingConflict("platform_peer_type_conflict")
+            if peer_type != "unknown":
+                row.platform_contact_type = peer_type
         self.db.add(row)
         self.db.flush()
         return row

@@ -534,6 +534,8 @@ async def test_outbound_mapping_makes_echo_dedup(db):
 
     client = AsyncMock()
     client.post_message = AsyncMock(return_value={"id": 99999})
+    client.base_url = "http://chatwoot"
+    client.get_contact = AsyncMock(side_effect=lambda account, cid: {"id": cid})
 
     echo_event = {
         "chat_id": "12345",

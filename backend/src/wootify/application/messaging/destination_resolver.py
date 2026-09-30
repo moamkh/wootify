@@ -108,6 +108,13 @@ class DestinationResolver:
         sender_meta = (conversation.get("meta") or {}).get("sender") if isinstance(conversation.get("meta"), dict) else {}
         source_id = str(contact_inbox.get("source_id") or "").strip() or None
         identifier = str(sender_meta.get("identifier") or "").strip() or None
+        # Foreign WhatsApp JIDs must never become a Bale/Telegram/Eitaa peer.
+        # These connectors address numeric peers, not WhatsApp source IDs.
+        if cls.prefix_namespace(expected_prefix) in {"BALE", "TELEGRAM", "EITAA"}:
+            if source_id and "@" in source_id:
+                source_id = None
+            if identifier and "@" in identifier:
+                identifier = None
         for raw in (source_id, identifier):
             value, _, source_prefix = cls.compatible_platform_destination(
                 raw,

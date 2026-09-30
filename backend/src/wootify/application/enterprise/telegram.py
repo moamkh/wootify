@@ -21,6 +21,7 @@ from wootify.application.enterprise import (
     EnterpriseSessionTransitionPolicy,
 )
 from wootify.infrastructure.chatwoot.client import ChatwootClient
+from wootify.application.messaging.contact_identity import contact_identity
 from wootify.config import settings
 from wootify.connectors.registry import connector_registry
 from wootify.infrastructure.persistence.models import (
@@ -34,7 +35,6 @@ from wootify.infrastructure.persistence.models import (
 from wootify.infrastructure.persistence.repositories.enterprise_document_asset_repository import (
     EnterpriseDocumentAssetRepository,
 )
-from wootify.infrastructure.persistence.repositories.contact_mapping_repository import ContactMappingRepository
 from wootify.infrastructure.persistence.repositories.enterprise_manual_group_repository import (
     EnterpriseManualGroupRepository,
 )
@@ -1217,85 +1217,21 @@ class EnterpriseTelegramService:
         )
 
     async def _get_or_create_contact(
-        self,
-        db: Session,
-        runtime: Any,
-        user: EnterpriseTelegramUser,
-        inbox_id: int,
+        self, db: Session, runtime: Any, user: EnterpriseTelegramUser, inbox_id: int,
     ) -> str:
-        """Resolve a Chatwoot contact for a Telegram enterprise user."""
+        """Resolve the contact using the common durable identity service."""
         client = self._get_chatwoot_client(runtime.chatwoot)
-        account_id = int(runtime.chatwoot["account_id"])
-        identifier = self._enterprise_source_id(
-            runtime.instance.instance_key, user.platform_chat_id
-        )
-        mappings = ContactMappingRepository(db)
-        mapped = mappings.get(runtime.instance.id, str(user.platform_chat_id))
-        if mapped and str(mapped.chatwoot_contact_id).isdigit():
-            try:
-                await client.get_contact(account_id, int(mapped.chatwoot_contact_id))
-                return str(mapped.chatwoot_contact_id)
-            except httpx.HTTPStatusError as exc:
-                if exc.response is None or exc.response.status_code != 404:
-                    raise
-                mappings.delete(runtime.instance.id, str(user.platform_chat_id))
-        resolved_name = str(user.display_name or user.platform_chat_id).strip() or str(
-            user.platform_chat_id
-        )
-
-        current_contact = await self._find_contact_by_identifier(
-            client, account_id, identifier
-        )
-        if current_contact:
-            contact_id = self._extract_id(current_contact) or self._extract_id(
-                (current_contact or {}).get("payload")
-            )
-            if not contact_id:
-                raise RuntimeError("failed to resolve existing enterprise contact id")
-            mappings.save(runtime.instance.id, str(user.platform_chat_id), str(contact_id))
-            return str(contact_id)
-
-        create_payload = {
-            "inbox_id": int(inbox_id),
-            "name": resolved_name,
-        }
+        peer_id = str(user.platform_chat_id)
+        identifier = self._enterprise_source_id(runtime.instance.instance_key, peer_id)
+        payload = {"name": str(user.display_name or peer_id).strip() or peer_id}
         if user.phone_number:
-            create_payload["phone_number"] = str(user.phone_number).strip()
-
-        try:
-            created = await client.create_contact(account_id, create_payload)
-        except httpx.HTTPStatusError as exc:
-            if exc.response.status_code != 422:
-                raise
-            retry_contact = await self._find_contact_by_identifier(
-                client, account_id, identifier
-            )
-            if retry_contact:
-                retry_id = self._extract_id(retry_contact) or self._extract_id(
-                    (retry_contact or {}).get("payload")
-                )
-                if retry_id:
-                    mappings.save(runtime.instance.id, str(user.platform_chat_id), str(retry_id))
-                    return str(retry_id)
-            if user.phone_number and "phone_number" in create_payload:
-                fallback_payload = {
-                    k: v for k, v in create_payload.items() if k != "phone_number"
-                }
-                created = await client.create_contact(account_id, fallback_payload)
-            else:
-                raise RuntimeError(
-                    f"create_contact returned 422 for identifier={identifier!r}: "
-                    f"{exc.response.text[:300]}"
-                ) from exc
-
-        contact_id = (
-            self._extract_id(created)
-            or self._extract_id((created or {}).get("payload"))
-            or self._extract_id(((created or {}).get("payload") or {}).get("contact"))
+            payload["phone_number"] = str(user.phone_number).strip()
+        contact_id, _ = await contact_identity.resolve(
+            db, client, instance_id=str(runtime.instance.id),
+            account_id=int(runtime.chatwoot["account_id"]),
+            inbox_id=inbox_id, peer_id=peer_id, payload=payload,
+            legacy_identifiers=(identifier,), peer_type="user",
         )
-        if not contact_id:
-            raise RuntimeError("failed to create enterprise contact")
-        mappings.save(runtime.instance.id, str(user.platform_chat_id), str(contact_id))
         return str(contact_id)
 
     async def _find_contact_by_identifier(
