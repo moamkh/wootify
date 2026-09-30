@@ -1,5 +1,19 @@
 # Changelog
 
+## 7.0.7 — 2026-09-30
+
+- Store Wootify-managed platform contact identities in an instance-scoped
+  `contact_mappings` table instead of writing them into Chatwoot contact
+  identifiers. Preserve identifiers owned by WhatsApp or other connectors;
+  import older Wootify identifiers into the local map without modifying them.
+- Reuse existing Chatwoot contacts by exact phone match and keep Bale peer
+  type in Wootify's map for group/channel routing. Add stale-contact recovery
+  and a database migration for the new mapping table.
+- Thread Bale PV replies in Chatwoot by translating the quoted Bale message ID
+  through the stored message mapping into Chatwoot's `in_reply_to` field.
+  Messages still arrive normally if their quoted parent is unavailable.
+- Preserve the target of Chatwoot operator replies sent to Bale PV.
+
 ## 7.0.6 — 2026-09-26
 
 - Send Bale Enterprise content and its restored root keyboard in one message
