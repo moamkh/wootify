@@ -546,6 +546,28 @@ def _parse_media_batch_update(data: bytes) -> List[Dict[str, Any]]:
         return []
 
 
+def _parse_reply_header(data: bytes) -> Optional[int]:
+    """Return the quoted RID from an UpdateMessage field-7 reply wrapper.
+
+    In observed Web Bale replies, field 1 is a nested message whose field 1
+    is the quoted RID. A forward instead has a peer in field 1 (whose field 1
+    is only the peer type) and usually an original-sender peer in field 2.
+    """
+    try:
+        fields = ProtobufParser(data).parse()
+        reference_bytes = fields.get(1, [None])[0]
+        if not isinstance(reference_bytes, bytes):
+            return None
+        reference = ProtobufParser(reference_bytes).parse()
+        rid = reference.get(1, [None])[0]
+        # A peer type is 1, 2, or 3; Bale message RIDs are large int64s.
+        if isinstance(rid, int) and rid > 2**32 and not fields.get(2):
+            return rid
+    except Exception:
+        pass
+    return None
+
+
 def _parse_forward_header(data: bytes) -> Optional[Dict[str, Any]]:
     """Parse UpdateMessage field 7 (forwarded message header).
 
@@ -1055,13 +1077,15 @@ def parse_ws_update(data: bytes) -> Optional[Dict[str, Any]]:
             rid = update.get(4, [None])[0]
             msg_bytes = update.get(5, [None])[0]
 
-            # Field 7 carries forwarded-message metadata. Parse it explicitly so
-            # we can extract the original attachment/caption and avoid treating
-            # it as a reply-to reference.
+            # Field 7 carries either a reply quote or forwarded-message
+            # metadata. Distinguish the two before parsing forwarded content.
             forward_info: Optional[Dict[str, Any]] = None
             forward_bytes = update.get(7, [None])[0]
+            header_reply_id: Optional[int] = None
             if isinstance(forward_bytes, bytes) and forward_bytes:
-                forward_info = _parse_forward_header(forward_bytes)
+                header_reply_id = _parse_reply_header(forward_bytes)
+                if header_reply_id is None:
+                    forward_info = _parse_forward_header(forward_bytes)
 
             # Field 13 appears to be a reply-to reference message:
             #   {1: reply_to_msg_id (int64), 2: access_hash or peer_id (int64)}
@@ -1126,11 +1150,11 @@ def parse_ws_update(data: bytes) -> Optional[Dict[str, Any]]:
             # Try to extract reply-to message reference from undocumented fields
             # (common candidates: 6, 7, 8 in UpdateMessage protobuf). Skip field 7
             # when it has already been identified as a forward header.
-            reply_to_msg_id: Optional[int] = None
+            reply_to_msg_id: Optional[int] = header_reply_id
             reply_candidates = [6, 8]
-            if forward_info is None:
+            if forward_info is None and header_reply_id is None:
                 reply_candidates.append(7)
-            for candidate_field in reply_candidates:
+            for candidate_field in (reply_candidates if reply_to_msg_id is None else []):
                 candidate_bytes = update.get(candidate_field, [None])[0]
                 if isinstance(candidate_bytes, bytes) and len(candidate_bytes) >= 2:
                     try:

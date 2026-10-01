@@ -1,5 +1,7 @@
 """Tests for messaging protobuf builders."""
 
+import pytest
+
 from bale_pv_connector.messaging_messages import (
     Peer,
     SendMessageRequest,
@@ -15,11 +17,12 @@ def test_text_message_serialization() -> None:
     assert parsed[1] == [b"hello"]
 
 
-def test_send_message_request_serialization() -> None:
+@pytest.mark.parametrize("quoted_rid", [100, 16089774319633367380])
+def test_send_message_request_serialization(quoted_rid: int) -> None:
     req = SendMessageRequest(
         peer_id=12345,
         text="hi there",
-        reply_to_message_id=100,
+        reply_to_message_id=quoted_rid,
         random_id=42,
     )
     data = req.serialize()
@@ -31,9 +34,12 @@ def test_send_message_request_serialization() -> None:
 
     assert parsed[2] == [42]
 
-    reply_peer_raw = parsed[4][0]
-    reply_peer = ProtobufParser(reply_peer_raw).parse()
-    assert reply_peer[2] == [100]
+    assert 4 not in parsed
+    reply_reference = ProtobufParser(parsed[5][0]).parse()
+    reply_peer = ProtobufParser(reply_reference[1][0]).parse()
+    assert reply_peer[1] == [Peer.PEER_TYPE_USER]
+    assert reply_peer[2] == [12345]
+    assert reply_reference[2] == [quoted_rid]
 
     message_raw = parsed[3][0]
     message = ProtobufParser(message_raw).parse()

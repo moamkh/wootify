@@ -844,6 +844,13 @@ class ChatwootBridgeService:
                 )
                 if mapping and mapping.platform_message_id:
                     reply_to = mapping.platform_message_id
+                    logger.info(
+                        "chatwoot_bridge.reply_parent_mapped instance=%s conversation_id=%s parent_message_id=%s platform_parent_id=%s",
+                        instance_key,
+                        chatwoot_conversation_id,
+                        parent_id,
+                        reply_to,
+                    )
                 else:
                     logger.info(
                         "chatwoot_bridge.reply_parent_not_mapped instance=%s conversation_id=%s parent_message_id=%s",

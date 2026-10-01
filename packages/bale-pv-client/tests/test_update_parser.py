@@ -141,6 +141,32 @@ def test_parse_new_text_message_update() -> None:
     assert parsed["message_type"] == "text"
 
 
+def test_parse_web_bale_field_seven_quoted_reply() -> None:
+    """A real reply wrapper has a nested RID, not a forwarded peer."""
+    quoted_rid = 16089774319633367380
+    reply_header = ProtobufMessage()
+    reply_header.add_message(1, ProtobufMessage().add_int64(1, quoted_rid))
+    reply_header.add_int64(3, 1755271951)
+    reply_header.add_int64(4, 1790777608932)
+    reply_header.add_bytes(5, _build_text_message("original"))
+    reply_header.add_message(6, ProtobufMessage().add_int32(1, 1))
+
+    update = ProtobufMessage()
+    update.add_bytes(1, Peer(1755271951).serialize())
+    update.add_int32(2, 1755271951)
+    update.add_int64(4, 7782419478318198927)
+    update.add_bytes(5, _build_text_message("gggg"))
+    update.add_message(7, reply_header)
+    wrapper = ProtobufMessage().add_bytes(BaleUpdateType.NEW_MESSAGE, update.serialize())
+    inner = ProtobufMessage().add_bytes(1, wrapper.serialize())
+    frame = ProtobufMessage().add_bytes(1, inner.serialize()).serialize()
+
+    parsed = parse_ws_update(frame)
+    assert parsed is not None
+    assert parsed["reply_to_msg_id"] == quoted_rid
+    assert "forward_from" not in parsed
+
+
 def test_parse_location_message_as_google_maps_link() -> None:
     # This is the protobuf shape observed for a real Bale attachment-menu
     # location share: Message G field 7 -> field 1 -> JSON app payload.

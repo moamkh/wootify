@@ -1,5 +1,17 @@
 # Changelog
 
+## 7.0.11 — 2026-10-01
+
+- Preserve Bale PV quoted replies in both directions. Parse the field-7 reply
+  wrapper separately from forwarded-message metadata, then resolve its Bale
+  parent RID to Chatwoot's `in_reply_to` message ID.
+- Encode outbound Bale quotes in `SendMessage` field 5 as a quoted-message
+  reference containing the conversation peer and parent RID. Field 4 is
+  `isOnlyForUser`, so the previous encoding sent reply text without its quote.
+- Log reply parent IDs at mapping and send boundaries for diagnosis. Add
+  regression tests for the observed reply frame and outbound wire format.
+  No database migration is required.
+
 ## 7.0.10 — 2026-09-30
 
 - Bridge Bale PV location shares as clickable Google Maps links in Chatwoot.

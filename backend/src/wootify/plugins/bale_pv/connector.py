@@ -660,10 +660,11 @@ class BalePvConnector:
                     text=text,
                 )
             self._logger.info(
-                "bale_pv send_text ok instance=%s chat_id=%s rid=%s",
+                "bale_pv send_text ok instance=%s chat_id=%s rid=%s reply_to=%s",
                 instance,
                 chat_id,
                 rid,
+                reply_to,
             )
             return {
                 "ok": True,

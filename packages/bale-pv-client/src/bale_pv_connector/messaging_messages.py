@@ -399,8 +399,14 @@ class SendMessageRequest:
         msg.add_int64(2, self.random_id)
         msg.add_message(3, MessageContent(text=self.text, document=self.document))
         if self.reply_to_message_id is not None:
-            # Field 4: replyTo peer (same type, different message_id as id)
-            msg.add_message(4, Peer(self.reply_to_message_id, self.peer_type))
+            # Web Bale's SendMessage field 5 is quotedMessageReference:
+            # {1: conversation peer, 2: quoted message RID}. Field 4 is the
+            # unrelated isOnlyForUser option, so placing a Peer there silently
+            # sends the text without a visible reply.
+            reference = ProtobufMessage()
+            reference.add_message(1, Peer(self.peer_id, self.peer_type))
+            reference.add_int64(2, self.reply_to_message_id)
+            msg.add_message(5, reference)
         # Field 6 is a duplicate peer in captures
         msg.add_message(6, peer)
         return msg.serialize()
