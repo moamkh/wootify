@@ -56,12 +56,10 @@ class BalePvPhoneMapping(Base):
 class InboundEventRetry(Base):
     """Persisted inbound platform update that failed delivery to Chatwoot.
 
-    Rows are written by ``BalePollingService`` when a polled update exhausts
-    its in-memory refetch budget (see ``_record_update_failure``) and are
-    retried by the polling service retry-queue drainer until delivery
-    succeeds or the owning instance is deleted.  This makes inbound delivery
-    survive extended Chatwoot outages (platforms only keep unconfirmed
-    updates for ~24h, so refetch alone cannot cover long downtimes).
+    Bale PV rows are written before the first Chatwoot delivery attempt;
+    other polled platforms can still enqueue after their refetch budget is
+    exhausted. The polling service retries rows until delivery succeeds or
+    the owning instance is deleted, surviving Chatwoot outages and restarts.
     """
 
     __tablename__ = "inbound_event_retries"

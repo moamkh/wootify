@@ -1,5 +1,21 @@
 # Changelog
 
+## 7.1.0 — 2026-10-04
+
+- Persist every Bale PV WebSocket update in the existing inbound-event queue
+  before attempting delivery to Chatwoot. A database write failure retains the
+  drained batch in memory and pauses further polling until it can be committed.
+- Wake the queue worker as soon as a batch is persisted, and retry failed
+  deliveries with backoff across process restarts and Chatwoot outages. A
+  blocked conversation no longer prevents updates for other Bale peers from
+  being delivered.
+- Deduplicate repeated Bale updates while keeping message edits and deletions
+  distinct. Treat explicit bridge rejections and missing adapter runtimes as
+  failures to retry instead of silently dropping those updates.
+- Add regression tests for persistence-before-delivery, deduplication,
+  per-peer ordering, failed delivery, and poller routing. This release reuses
+  the existing `inbound_event_retries` table; no schema migration is added.
+
 ## 7.0.11 — 2026-10-01
 
 - Preserve Bale PV quoted replies in both directions. Parse the field-7 reply

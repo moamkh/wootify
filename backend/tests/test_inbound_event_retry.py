@@ -191,3 +191,160 @@ def test_drain_purges_rows_of_deleted_instances(monkeypatch, session_factory):
 
     assert calls == []
     assert _queued_rows(session_factory) == []
+
+
+def test_bale_updates_are_persisted_before_delivery_and_deduped(monkeypatch, session_factory):
+    service, _ = _service(monkeypatch, session_factory)
+    update = {'update_id': 42, 'message': {'message_id': '42', 'chat': {'id': 7}, 'text': 'hello'}}
+    edited = {'update_id': 42, 'message': {'message_id': '42', 'chat': {'id': 7},
+                                          'text': 'hello again', '_edited': True}}
+    deleted = {'update_id': 42, 'message': {'message_id': '42', 'chat': {'id': 7},
+                                           '_deleted': True}}
+
+    service._persist_bale_updates('inst-1', 'bale_pv_enterprise', [update, update, edited, deleted])
+
+    rows = _queued_rows(session_factory)
+    assert len(rows) == 3
+    assert rows[0]['update_id'] == '42'
+    assert rows[1]['update_id'].startswith('42:edit:')
+    assert rows[2]['update_id'] == '42:delete'
+    assert all(row['attempts'] == 0 for row in rows)
+
+
+def test_bale_queue_retries_chatwoot_failure_until_recovery(monkeypatch, session_factory):
+    service, _ = _service(monkeypatch, session_factory)
+    with session_factory() as db:
+        _make_instance(db)
+    calls = []
+    available = {'value': False}
+
+    async def normalize(instance_key, update):
+        return {'chat_id': '7', 'platform_message_id': str(update['update_id'])}
+
+    async def ingest(db, instance_key, event):
+        calls.append(event)
+        if not available['value']:
+            raise ConnectionError('Chatwoot DNS unavailable')
+        return {'ok': True}
+
+    service._normalize_with_adapter = normalize
+    monkeypatch.setattr(polling_module, 'chatwoot_bridge', SimpleNamespace(ingest_platform_event=ingest))
+    service._persist_bale_updates(
+        'inst-1', 'bale_pv_enterprise',
+        [{'update_id': 42, 'message': {'message_id': '42', 'chat': {'id': 7}, 'text': 'hello'}}],
+    )
+
+    assert calls == []  # Persistence must not require Chatwoot to be online.
+    asyncio.run(service._drain_retry_queue())
+    rows = _queued_rows(session_factory)
+    assert len(rows) == 1
+    assert rows[0]['attempts'] == 1
+    assert 'Chatwoot DNS unavailable' in rows[0]['last_error']
+
+    available['value'] = True
+    with session_factory() as db:
+        row = db.query(InboundEventRetry).one()
+        row.next_attempt_at = datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(seconds=1)
+        db.commit()
+    asyncio.run(service._drain_retry_queue())
+
+    assert len(calls) == 2
+    assert _queued_rows(session_factory) == []
+
+
+def test_bale_failure_blocks_only_its_own_peer(monkeypatch, session_factory):
+    service, _ = _service(monkeypatch, session_factory)
+    with session_factory() as db:
+        _make_instance(db)
+    calls = []
+
+    async def normalize(instance_key, update):
+        return {'chat_id': str(update['message']['chat']['id'])}
+
+    async def ingest(db, instance_key, event):
+        calls.append(event['chat_id'])
+        if event['chat_id'] == '7':
+            raise ConnectionError('peer 7 failed')
+        return {'ok': True}
+
+    service._normalize_with_adapter = normalize
+    monkeypatch.setattr(polling_module, 'chatwoot_bridge', SimpleNamespace(ingest_platform_event=ingest))
+    service._persist_bale_updates('inst-1', 'bale_pv_enterprise', [
+        {'update_id': 1, 'message': {'chat': {'id': 7}}},
+        {'update_id': 2, 'message': {'chat': {'id': 7}}},
+        {'update_id': 3, 'message': {'chat': {'id': 8}}},
+    ])
+
+    asyncio.run(service._drain_retry_queue())
+
+    assert calls == ['7', '8']
+    assert [row['update_id'] for row in _queued_rows(session_factory)] == ['1', '2']
+
+
+def test_bale_queue_retains_non_exception_delivery_failure(monkeypatch, session_factory):
+    service, _ = _service(monkeypatch, session_factory)
+    with session_factory() as db:
+        _make_instance(db)
+
+    async def normalize(instance_key, update):
+        return {'chat_id': '7'}
+
+    async def ingest(db, instance_key, event):
+        return {'ok': False, 'detail': 'chatwoot_not_enabled'}
+
+    service._normalize_with_adapter = normalize
+    monkeypatch.setattr(polling_module, 'chatwoot_bridge', SimpleNamespace(ingest_platform_event=ingest))
+    service._persist_bale_updates(
+        'inst-1', 'bale_pv_enterprise',
+        [{'update_id': 42, 'message': {'chat': {'id': 7}}}],
+    )
+
+    asyncio.run(service._drain_retry_queue())
+
+    rows = _queued_rows(session_factory)
+    assert len(rows) == 1
+    assert rows[0]['attempts'] == 1
+    assert 'chatwoot_not_enabled' in rows[0]['last_error']
+
+
+def test_bale_poller_routes_websocket_update_only_to_durable_queue(monkeypatch, session_factory):
+    service, _ = _service(monkeypatch, session_factory)
+    runtime = SimpleNamespace(
+        instance=SimpleNamespace(id='instance-1', is_enabled=True),
+        platform_type=SimpleNamespace(key='bale_pv_enterprise'),
+        platform_metadata={}, proxy=None,
+        runtime_state_last_update_id=None,
+        runtime_state_last_sms_sync_at=None,
+    )
+    service._instances.get_runtime_instance = lambda db, key: runtime
+    calls = []
+
+    class Connector:
+        async def connect(self, instance_key, config, proxy):
+            return None
+
+        async def get_updates(self, instance_key, *, offset, timeout):
+            calls.append('polled')
+            service._stop.set()
+            return {'ok': True, 'result': [
+                {'update_id': 42, 'message': {'chat': {'id': 7}, 'text': 'hello'}}
+            ]}
+
+    async def connect_instance(instance_key, platform_key, config):
+        return None
+
+    async def update_state(*args, **kwargs):
+        return True
+
+    async def forbidden_ingest(*args, **kwargs):
+        pytest.fail('Chatwoot delivery must be owned by the queue worker')
+
+    monkeypatch.setattr(polling_module.connector_registry, 'get', lambda key: Connector())
+    monkeypatch.setattr(polling_module.runtime_registry, 'connect_instance', connect_instance)
+    monkeypatch.setattr(polling_module, 'chatwoot_bridge', SimpleNamespace(ingest_platform_event=forbidden_ingest))
+    service._update_runtime_state_with_retry = update_state
+
+    asyncio.run(service._run_instance('inst-1'))
+
+    assert calls == ['polled']
+    assert [row['update_id'] for row in _queued_rows(session_factory)] == ['42']

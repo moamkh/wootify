@@ -14,14 +14,15 @@ Responsibilities
     - ``bale_pv_enterprise`` → ``EnterpriseBaleService``
     - ``bale_pv``            → ``ChatwootBridgeService`` via ``BalePvAdapter``
     - ``bale`` (legacy bot)  → ``BridgeService`` / ``EnterpriseBaleService``
-* Persist inbound updates that repeatedly fail Chatwoot delivery into the
-  ``inbound_event_retries`` table and redeliver them in the background
+* Persist Bale PV updates before Chatwoot delivery in the
+  ``inbound_event_retries`` table and redeliver failed updates in the background
   (survives restarts and long Chatwoot outages).
 * Detect and recover from stalled or crashed poll tasks.
 """
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import mimetypes
@@ -76,6 +77,7 @@ class BalePollingService:
         self._stop = asyncio.Event()
         self._manager_task: Optional[asyncio.Task] = None
         self._retry_task: Optional[asyncio.Task] = None
+        self._retry_wakeup = asyncio.Event()
         self._poll_tasks: dict[str, asyncio.Task] = {}
         self._last_update_ids: dict[str, str] = {}
         self._enterprise_sms_last_run: dict[str, float] = {}
@@ -202,6 +204,9 @@ class BalePollingService:
 
     async def _run_instance(self, instance_key: str) -> None:
         """Internal helper to run instance."""
+        # Retain a drained WebSocket batch if persistence fails. Do not fetch
+        # another batch until this one is safely committed to the database.
+        pending_bale_updates: list[dict[str, Any]] = []
         while not self._stop.is_set():
             self._logger.debug('poll iteration instance=%s', instance_key)
             poll_interval = settings.BALE_POLL_INTERVAL_SECONDS
@@ -257,7 +262,10 @@ class BalePollingService:
                     offset = int(last_update) + 1
 
                 self._logger.debug('poll get_updates instance=%s offset=%s timeout=%s', instance_key, offset, long_poll_timeout)
-                resp = await connector.get_updates(instance_key, offset=offset, timeout=long_poll_timeout)
+                if platform_key == 'bale_pv_enterprise' and pending_bale_updates:
+                    resp = {'ok': True, 'result': pending_bale_updates}
+                else:
+                    resp = await connector.get_updates(instance_key, offset=offset, timeout=long_poll_timeout)
                 self._logger.debug('poll get_updates_done instance=%s ok=%s result_count=%s', instance_key, resp.get('ok') if isinstance(resp, dict) else None, len(resp.get('result', [])) if isinstance(resp, dict) else None)
                 if not isinstance(resp, dict) or not resp.get('ok'):
                     await self._update_runtime_state_with_retry(
@@ -269,6 +277,22 @@ class BalePollingService:
                     continue
 
                 updates = resp.get('result') or []
+                if platform_key == 'bale_pv_enterprise':
+                    pending_bale_updates = updates
+                    if updates:
+                        self._persist_bale_updates(instance_key, platform_key, updates)
+                        pending_bale_updates = []
+                        self._retry_wakeup.set()
+                    await self._update_runtime_state_with_retry(
+                        runtime_instance_id, last_error=None, touch_sync=True,
+                    )
+                    if updates:
+                        continue
+                    try:
+                        await asyncio.wait_for(self._stop.wait(), timeout=float(poll_interval))
+                    except asyncio.TimeoutError:
+                        continue
+                    return
                 # High-water mark of updates whose processing actually succeeded.
                 # Only this value is persisted at batch end so failed updates are
                 # refetched by the next poll instead of being skipped silently.
@@ -716,6 +740,63 @@ class BalePollingService:
             self._enqueue_failed_update(instance_key, platform_key, update, update_id, exc)
         return exhausted
 
+    @staticmethod
+    def _bale_queue_update_id(update: dict[str, Any]) -> Optional[str]:
+        """Identify a Bale event without collapsing later edits into its message."""
+        message = update.get('message') if isinstance(update.get('message'), dict) else {}
+        rid = str(update.get('update_id') or message.get('message_id') or '').strip()
+        if not rid or rid == '0':
+            return None
+        if message.get('_deleted'):
+            return f'{rid}:delete'
+        if message.get('_edited'):
+            payload = json.dumps(update, sort_keys=True, default=str).encode('utf-8')
+            digest = hashlib.sha256(payload).hexdigest()[:16]
+            return f'{rid}:edit:{digest}'
+        return rid
+
+    def _persist_bale_updates(
+        self, instance_key: str, platform_key: str, updates: list[dict[str, Any]]
+    ) -> None:
+        """Commit an entire WebSocket batch before any Chatwoot delivery.
+
+        A database failure propagates to the poll loop, which retains this
+        batch in memory and retries persistence before draining another one.
+        """
+        queued = 0
+        with SessionLocal() as db:
+            created_at = self._utcnow()
+            for index, update in enumerate(updates):
+                if not isinstance(update, dict):
+                    continue
+                update_id = self._bale_queue_update_id(update)
+                payload = json.loads(json.dumps(update, default=str))
+                row = InboundEventRetry(
+                    instance_key=instance_key,
+                    platform_key=platform_key,
+                    update_id=update_id,
+                    payload_json=payload,
+                    attempts=0,
+                    created_at=created_at + timedelta(microseconds=index),
+                    next_attempt_at=created_at,
+                )
+                try:
+                    with db.begin_nested():
+                        db.add(row)
+                        db.flush()
+                    queued += 1
+                except IntegrityError:
+                    # A repeated WebSocket frame is already waiting for the
+                    # worker. The bridge's message mapping also dedupes frames
+                    # received again after their queue row has been removed.
+                    self._logger.debug(
+                        'bale_inbound_already_queued instance=%s update_id=%s',
+                        instance_key, update_id,
+                    )
+            db.commit()
+        if queued:
+            self._logger.info('bale_inbound_persisted instance=%s count=%s', instance_key, queued)
+
     def _enqueue_failed_update(
         self,
         instance_key: str,
@@ -784,16 +865,17 @@ class BalePollingService:
             except Exception as exc:
                 self._logger.exception('retry_queue drain failed: %s', exc)
             try:
-                await asyncio.wait_for(self._stop.wait(), timeout=self._RETRY_QUEUE_INTERVAL_SECONDS)
+                await asyncio.wait_for(self._retry_wakeup.wait(), timeout=self._RETRY_QUEUE_INTERVAL_SECONDS)
             except asyncio.TimeoutError:
-                continue
+                pass
+            self._retry_wakeup.clear()
 
     async def _drain_retry_queue(self) -> None:
-        """Attempt delivery of every due queued event, in order per instance.
+        """Attempt delivery of every due queued event, in order per conversation.
 
-        Rows are processed sequentially per instance in creation order and
-        processing stops at the first failure for that instance so per-chat
-        ordering is preserved (head-of-line blocking).  Rows of deleted
+        Bale PV rows are blocked only by an earlier failed row for the same
+        peer. Other platforms retain their existing per-instance ordering.
+        Rows of deleted
         instances are purged; rows of disabled instances are kept for later.
         """
         now = self._utcnow()
@@ -811,9 +893,8 @@ class BalePollingService:
                 db.commit()
                 self._logger.info('retry_queue purged %d rows of deleted instances', len(stale))
             # Snapshot primitives; the ORM rows detach when the session closes.
-            # All rows of known instances are kept (not only due ones) so a
-            # backed-off earlier row still blocks later rows of the same
-            # instance (strict per-instance ordering).
+            # Include backed-off rows so an earlier failure blocks later
+            # updates for its peer, even when those later rows are due.
             snapshots: list[dict[str, Any]] = [
                 {
                     'id': row.id,
@@ -833,9 +914,6 @@ class BalePollingService:
             by_instance.setdefault(item['instance_key'], []).append(item)
 
         for instance_key, items in by_instance.items():
-            if not items[0]['due']:
-                # Earliest row is still backing off; keep the whole instance waiting.
-                continue
             try:
                 with SessionLocal() as db:
                     runtime = self._instances.get_runtime_instance(db, instance_key)
@@ -846,13 +924,28 @@ class BalePollingService:
                     'retry_queue runtime lookup failed instance=%s error=%s', instance_key, exc
                 )
                 continue
+            blocked_streams: set[str] = set()
             for item in items:
+                stream = self._retry_stream_key(item)
+                if stream in blocked_streams:
+                    continue
                 if not item['due']:
-                    break
+                    blocked_streams.add(stream)
+                    continue
                 delivered = await self._retry_queued_event(item)
                 if not delivered:
-                    # Preserve per-instance ordering: stop at first failure.
-                    break
+                    blocked_streams.add(stream)
+
+    @staticmethod
+    def _retry_stream_key(item: dict[str, Any]) -> str:
+        """Only a failed update for the same Bale peer blocks delivery."""
+        if item['platform_key'] == 'bale_pv_enterprise':
+            message = item['payload'].get('message') if isinstance(item['payload'], dict) else None
+            chat = message.get('chat') if isinstance(message, dict) else None
+            peer_id = chat.get('id') if isinstance(chat, dict) else None
+            if peer_id is not None:
+                return f'peer:{peer_id}'
+        return 'instance'
 
     async def _retry_queued_event(self, item: dict[str, Any]) -> bool:
         """Redeliver one queued event; delete it on success, back off on failure."""
@@ -861,9 +954,9 @@ class BalePollingService:
         try:
             with SessionLocal() as db:
                 if platform_key == 'bale_enterprise':
-                    await self._enterprise.handle_platform_update(db, instance_key, item['payload'])
+                    result = await self._enterprise.handle_platform_update(db, instance_key, item['payload'])
                 elif platform_key == 'telegram_enterprise':
-                    await self._enterprise_telegram.handle_platform_update(db, instance_key, item['payload'])
+                    result = await self._enterprise_telegram.handle_platform_update(db, instance_key, item['payload'])
                 else:
                     if platform_key in _ADAPTER_CHATWOOT_PLATFORM_KEYS:
                         event = await self._normalize_with_adapter(instance_key, item['payload'])
@@ -874,9 +967,13 @@ class BalePollingService:
                         )
                     if event:
                         if platform_key in _ADAPTER_CHATWOOT_PLATFORM_KEYS:
-                            await chatwoot_bridge.ingest_platform_event(db, instance_key, event)
+                            result = await chatwoot_bridge.ingest_platform_event(db, instance_key, event)
                         else:
-                            await self._bridge.ingest_platform_event(db, instance_key, event)
+                            result = await self._bridge.ingest_platform_event(db, instance_key, event)
+                    else:
+                        result = None
+                if isinstance(result, dict) and result.get('ok') is False:
+                    raise RuntimeError(f"inbound delivery rejected: {result.get('detail') or result}")
                 row = db.query(InboundEventRetry).filter(InboundEventRetry.id == item['id']).first()
                 if row:
                     db.delete(row)
@@ -1197,7 +1294,7 @@ class BalePollingService:
         runtime = get_runtime(instance_key)
         if not runtime:
             self._logger.warning('personal_adapter_no_runtime instance=%s', instance_key)
-            return None
+            raise RuntimeError(f'personal adapter not connected for {instance_key}')
         event = runtime.adapter.normalize_incoming_update(update)
         if not event:
             self._logger.debug('personal_adapter_normalize_skipped instance=%s', instance_key)
@@ -1223,8 +1320,8 @@ class BalePollingService:
                     exc,
                     exc_info=True,
                 )
-                # Raising here routes the update through the bounded retry /
-                # dead-letter path instead of delivering a hollow message.
+                # Raising keeps Bale PV updates in the durable queue instead
+                # of delivering a hollow message.
                 raise RuntimeError(
                     f"attachment resolution failed for message {event.get('message_id')}"
                 ) from exc
@@ -1237,8 +1334,7 @@ class BalePollingService:
                 )
                 # Every attachment download failed (e.g. transient file-gw
                 # 502): refuse to post a hollow message — raise so the update
-                # is retried, then dead-lettered to inbound_event_retries
-                # where the hourly drainer redelivers it.
+                # remains queued for another delivery attempt.
                 raise RuntimeError(
                     f"all {len(original_refs)} attachment download(s) failed for "
                     f"message {event.get('message_id')}; refusing hollow delivery"
