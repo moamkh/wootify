@@ -8,14 +8,21 @@ globalThis.localStorage = {
   setItem: (key, value) => storage.set(key, value),
   removeItem: (key) => storage.delete(key),
 };
-globalThis.window = { dispatchEvent() {} };
+globalThis.window = {
+  dispatchEvent() {},
+  location: { hostname: 'wootify.example.test' },
+};
 globalThis.CustomEvent = class CustomEvent {};
-globalThis.fetch = async () => ({
-  ok: true,
-  async json() {
-    return { token: 'auth-regression-token' };
-  },
-});
+let requestedUrl = '';
+globalThis.fetch = async (url) => {
+  requestedUrl = String(url);
+  return {
+    ok: true,
+    async json() {
+      return { token: 'auth-regression-token' };
+    },
+  };
+};
 
 const bundle = await build({
   entryPoints: ['src/shared/api/auth.js'],
@@ -23,7 +30,7 @@ const bundle = await build({
   write: false,
   format: 'esm',
   define: {
-    'import.meta.env.VITE_API_BASE': JSON.stringify(''),
+    'import.meta.env.VITE_API_BASE': JSON.stringify('http://localhost:8000'),
   },
 });
 const source = bundle.outputFiles[0].text;
@@ -33,4 +40,6 @@ const auth = await import(moduleUrl);
 await auth.panelLogin('test-user', 'test-password');
 
 assert.equal(auth.getPanelToken(), 'auth-regression-token');
+assert.equal(requestedUrl, '/api/v1/panel/auth/login');
 console.log('panelLogin success path stores the returned panel token');
+console.log('remote deployment ignores a localhost API build setting');

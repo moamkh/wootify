@@ -1,5 +1,15 @@
 /** Shared API transport, URL, and panel-token primitives. */
-export const API_BASE = (import.meta.env.VITE_API_BASE || 'http://localhost:8000').replace(/\/$/, '');
+// Production builds are served by the Wootify backend. A relative base keeps
+// API calls on that same origin when VITE_API_BASE is omitted. It also protects
+// deployments accidentally built with a developer's localhost .env value:
+// localhost remains valid in local development, but is never used by a remote
+// browser session.
+const configuredApiBase = (import.meta.env.VITE_API_BASE || '').replace(/\/$/, '');
+const configuredForLoopback = /^https?:\/\/(localhost|127\.0\.0\.1)(?::|\/|$)/i.test(configuredApiBase);
+const browserIsLoopback = typeof window !== 'undefined'
+  && /^(localhost|127\.0\.0\.1)$/i.test(window.location.hostname);
+
+export const API_BASE = configuredForLoopback && !browserIsLoopback ? '' : configuredApiBase;
 
 const TOKEN_STORAGE_KEY = 'wootify_panel_token';
 

@@ -84,6 +84,11 @@ import { useEnterpriseResources } from '../features/enterprise/useEnterpriseReso
 const InstancesPage = lazy(() => import('../features/instances/InstancesPage.jsx'));
 const InstanceWorkspacePage = lazy(() => import('../features/instances/InstanceWorkspacePage.jsx'));
 
+function defaultChatwootBaseUrl() {
+  if (typeof window === 'undefined') return '';
+  return `${window.location.protocol}//${window.location.hostname}:3000`;
+}
+
 const ENTERPRISE_DEFAULTS = {
   welcome_text: 'به بازوي دستيار شركت مهندسي پزشكي نوين خوش آمديد.',
   phone_prompt_text: 'لطفا شماره موبایل خود را وارد کنید یا از دکمه زیر برای اشتراک‌گذاری شماره استفاده کنید.',
@@ -213,7 +218,7 @@ function defaultForm(features) {
     proxy_port: '',
     proxy_username: '',
     proxy_password: '',
-    chatwoot_base_url: 'http://localhost:3000',
+    chatwoot_base_url: defaultChatwootBaseUrl(),
     chatwoot_api_access_token: '',
     chatwoot_account_id: '',
     chatwoot_inbox_id: '',
@@ -542,7 +547,7 @@ export default function App() {
       proxy_port: row.proxy?.port != null ? String(row.proxy.port) : '',
       proxy_username: row.proxy?.username || '',
       proxy_password: row.proxy?.password || '',
-      chatwoot_base_url: row.chatwoot?.base_url || 'http://localhost:3000',
+      chatwoot_base_url: row.chatwoot?.base_url || defaultChatwootBaseUrl(),
       chatwoot_api_access_token: row.chatwoot?.api_access_token || '',
       chatwoot_account_id: String(row.chatwoot?.account_id ?? ''),
       chatwoot_inbox_id: String(row.chatwoot?.inbox_id ?? ''),
