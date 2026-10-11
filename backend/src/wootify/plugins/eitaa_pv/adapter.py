@@ -8,7 +8,6 @@ from collections import OrderedDict
 from typing import Any, AsyncIterator, Optional
 
 from wootify.adapters.base import BasePlatformAdapter
-from wootify.config import settings
 from wootify.plugins.eitaa_pv.connector import eitaa_pv
 
 
@@ -72,11 +71,12 @@ class EitaaPvAdapter(BasePlatformAdapter):
                 event = self.normalize_incoming_update(raw)
                 if event:
                     yield event
-            # Keep the standalone adapter path consistent with the shared
-            # polling service: Eitaa inherits Bale's Wootify default.
-            await asyncio.sleep(max(1, int(self.config.get("eitaa_pv_poll_interval") or settings.BALE_POLL_INTERVAL_SECONDS)))
+            eitaa_pv.acknowledge_updates(self.instance_key)
+            await asyncio.sleep(eitaa_pv.poll_interval(self.instance_key))
 
     def normalize_incoming_update(self, raw_update: Any) -> Optional[dict[str, Any]]:
+        if isinstance(raw_update, dict) and raw_update.get("channel_gap"):
+            raise RuntimeError(f"eitaa_channel_difference_required: {raw_update.get('chat_id')}")
         if not isinstance(raw_update, dict) or not isinstance(raw_update.get("message"), dict):
             return None
         message = raw_update["message"]
@@ -90,6 +90,8 @@ class EitaaPvAdapter(BasePlatformAdapter):
         ):
             return None
         entities = raw_update.get("entities") or {}
+        if isinstance(entities, list):
+            entities = {(item["kind"], int(item["id"])): item["entity"] for item in entities}
         chat_type = "channel" if chat_id.startswith("channel:") else "group" if chat_id.startswith("chat:") else "private"
         sender_id = self._sender_id(message)
         sender = entities.get(("user", sender_id), {}) if sender_id is not None else {}

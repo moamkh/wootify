@@ -409,8 +409,8 @@ export default function InstanceFormPanel({
                 <input value={form.eitaa_pv_phone_number} onChange={(e) => setForm((s) => ({ ...s, eitaa_pv_phone_number: e.target.value }))} placeholder="e.g. 09123456711" />
               </label>
               <label>
-                Poll Interval
-                <input value={form.eitaa_pv_poll_interval} onChange={(e) => setForm((s) => ({ ...s, eitaa_pv_poll_interval: e.target.value }))} />
+                Update Polling
+                <input value="Automatic — Eitaa Web server settings" disabled />
               </label>
             </div>
             <div className="row">

@@ -39,7 +39,7 @@ from wootify.config import settings
 from wootify.connectors.registry import connector_registry
 from wootify.infrastructure.persistence.session import SessionLocal
 from wootify import runtime_registry
-from wootify.infrastructure.persistence.models import InboundEventRetry, Instance
+from wootify.infrastructure.persistence.models import InboundEventRetry, Instance, InstanceRuntimeState, Conversation, MessageMapping
 from wootify.application.messaging.bridge import BridgeService
 from wootify.application.messaging.chatwoot_bridge import chatwoot_bridge
 from wootify.application.enterprise.bale import EnterpriseBaleService
@@ -255,6 +255,8 @@ class BalePollingService:
                         )
 
                 await connector.connect(instance_key, cfg, runtime.proxy)
+                if platform_key == 'eitaa_pv_enterprise':
+                    connector.restore_update_state(instance_key, runtime.runtime_state_last_update_id)
 
                 offset = None
                 last_update = self._merged_last_update_id(instance_key, runtime.runtime_state_last_update_id)
@@ -277,6 +279,19 @@ class BalePollingService:
                     continue
 
                 updates = resp.get('result') or []
+                if platform_key == 'eitaa_pv_enterprise':
+                    cursor = connector.pending_cursor(instance_key)
+                    self._persist_bale_updates(instance_key, platform_key, updates, cursor=cursor)
+                    connector.acknowledge_updates(instance_key)
+                    self._retry_wakeup.set()
+                    await self._update_runtime_state_with_retry(runtime_instance_id, last_error=None, touch_sync=True)
+                    if updates:
+                        continue
+                    try:
+                        await asyncio.wait_for(self._stop.wait(), timeout=connector.poll_interval(instance_key))
+                    except asyncio.TimeoutError:
+                        continue
+                    return
                 if platform_key == 'bale_pv_enterprise':
                     pending_bale_updates = updates
                     if updates:
@@ -756,7 +771,7 @@ class BalePollingService:
         return rid
 
     def _persist_bale_updates(
-        self, instance_key: str, platform_key: str, updates: list[dict[str, Any]]
+        self, instance_key: str, platform_key: str, updates: list[dict[str, Any]], *, cursor: Optional[str] = None
     ) -> None:
         """Commit an entire WebSocket batch before any Chatwoot delivery.
 
@@ -765,11 +780,15 @@ class BalePollingService:
         """
         queued = 0
         with SessionLocal() as db:
+            if db.bind.dialect.name == 'sqlite':
+                # sqlite3's legacy mode does not start an outer transaction
+                # for SAVEPOINT. Without BEGIN, releasing it commits each row.
+                db.connection().exec_driver_sql('BEGIN')
             created_at = self._utcnow()
             for index, update in enumerate(updates):
                 if not isinstance(update, dict):
                     continue
-                update_id = self._bale_queue_update_id(update)
+                update_id = str(update.get('update_id')) if platform_key == 'eitaa_pv_enterprise' and update.get('update_id') else self._bale_queue_update_id(update)
                 payload = json.loads(json.dumps(update, default=str))
                 row = InboundEventRetry(
                     instance_key=instance_key,
@@ -793,6 +812,13 @@ class BalePollingService:
                         'bale_inbound_already_queued instance=%s update_id=%s',
                         instance_key, update_id,
                     )
+            if cursor is not None:
+                instance = db.query(Instance).filter_by(instance_key=instance_key).one()
+                state = db.get(InstanceRuntimeState, instance.id)
+                if state is None:
+                    state = InstanceRuntimeState(instance_id=instance.id)
+                    db.add(state)
+                state.last_platform_update_id = cursor
             db.commit()
         if queued:
             self._logger.info('bale_inbound_persisted instance=%s count=%s', instance_key, queued)
@@ -944,6 +970,10 @@ class BalePollingService:
             chat = message.get('chat') if isinstance(message, dict) else None
             peer_id = chat.get('id') if isinstance(chat, dict) else None
             if peer_id is not None:
+                return f'peer:{peer_id}'
+        if item['platform_key'] == 'eitaa_pv_enterprise':
+            peer_id = item['payload'].get('chat_id')
+            if peer_id:
                 return f'peer:{peer_id}'
         return 'instance'
 

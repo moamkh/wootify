@@ -84,6 +84,12 @@ class EitaaPvRuntime:
     pending_read_message_ids: dict[str, int] = field(default_factory=dict)
     read_message_ids: dict[str, int] = field(default_factory=dict)
     presence_online: bool = False
+    auth_expired: bool = False
+    update_state: Optional[dict[str, Any]] = None
+    pending_update_state: Optional[dict[str, Any]] = None
+    pending_updates: Optional[list[dict[str, Any]]] = None
+    web_poll_interval: Optional[float] = None
+    peers_loaded: bool = False
 
 
 class EitaaPvConnector:
@@ -155,6 +161,14 @@ class EitaaPvConnector:
             profile_name=instance,
         )
         runtime.connected = bool(runtime.client.profile.authenticated)
+        runtime.auth_expired = False
+        runtime.seen_message_ids.clear()
+        runtime.observed_edit_dates.clear()
+        runtime.update_state = None
+        runtime.pending_update_state = None
+        runtime.pending_updates = None
+        runtime.peer_refs.clear()
+        runtime.peers_loaded = False
         return dict(result)
 
     async def get_connection_state(self, instance: str) -> dict[str, Any]:
@@ -162,9 +176,10 @@ class EitaaPvConnector:
         if runtime is None:
             return {"connected": False, "detail": "not_initialized"}
         return {
-            "connected": bool(runtime.client.profile.authenticated),
-            "detail": "authenticated" if runtime.client.profile.authenticated else "awaiting_auth_code",
+            "connected": bool(runtime.client.profile.authenticated) and not runtime.auth_expired,
+            "detail": "login_required" if runtime.auth_expired else ("authenticated" if runtime.client.profile.authenticated else "awaiting_auth_code"),
             "phone_number": runtime.phone_number,
+            "poll_interval_seconds": runtime.web_poll_interval,
         }
 
     def get_self_id(self, instance: str) -> Optional[str]:
@@ -355,11 +370,139 @@ class EitaaPvConnector:
                 downloaded_path.unlink(missing_ok=True)
 
     async def get_updates(self, instance: str, offset: Optional[int] = None, timeout: Optional[int] = None) -> dict[str, Any]:
+        """Read Eitaa Web's difference stream; acknowledge only after durable enqueue."""
+        del offset, timeout
+        runtime = self._authenticated_runtime(instance)
+        if runtime.pending_updates is not None:
+            return {"ok": True, "result": runtime.pending_updates}
+        await self._set_presence(runtime, online=True)
+        if not runtime.peers_loaded:
+            dialogs = await runtime.client.dialogs.list(limit=100)
+            self._check_response(runtime, dialogs)
+            entities = self._entity_map(dialogs)
+            for dialog in dialogs.get("dialogs") or []:
+                chat_id, peer_ref = self._peer_identity(dialog.get("peer") or {}, entities)
+                if chat_id:
+                    runtime.peer_refs[chat_id] = peer_ref
+            runtime.peers_loaded = True
+        if runtime.web_poll_interval is None:
+            config = await runtime.client.invoke("help.getConfig", {})
+            self._check_expiry(runtime, config)
+            runtime.web_poll_interval = max(1.0, float(config.get("schedule_period_foreground_ms") or 5000) / 1000)
+        if runtime.update_state is None:
+            state = await runtime.client.invoke("updates.getState", {})
+            self._check_expiry(runtime, state)
+            if state.get("_") != "updates.state":
+                raise RuntimeError(f"Unexpected Eitaa update state: {state.get('_')}")
+            # Initial login starts at the current state, not arbitrary old history.
+            runtime.pending_update_state = self._state_cursor(state)
+            runtime.pending_updates = []
+            return {"ok": True, "result": []}
+        state = runtime.update_state
+        difference = await runtime.client.invoke("updates.getDifference", {
+            "pts": state["pts"], "date": state["date"], "qts": -1,
+        })
+        self._check_expiry(runtime, difference)
+        kind = difference.get("_")
+        if kind == "updates.differenceTooLong":
+            # Never silently reset the cursor and discard unreceived messages.
+            raise RuntimeError("eitaa_difference_too_long: history recovery required")
+        if kind not in {"updates.differenceEmpty", "updates.difference", "updates.differenceSlice"}:
+            raise RuntimeError(f"Unexpected Eitaa update difference: {kind}")
+        entities = self._entity_map(difference)
+        events: list[dict[str, Any]] = []
+        deletions: list[dict[str, Any]] = []
+        messages = list(difference.get("new_messages") or [])
+        for update in difference.get("other_updates") or []:
+            update_kind = update.get("_")
+            if update_kind in {"updateNewMessage", "updateNewChannelMessage", "updateEditMessage", "updateEditChannelMessage"}:
+                messages.append(update.get("message") or {})
+            elif update_kind in {"updateDeleteMessages", "updateDeleteChannelMessages"}:
+                chat_id = f"channel:{update['channel_id']}" if update.get("channel_id") else ""
+                for mid in update.get("messages") or []:
+                    deletions.append({"deleted": True, "message_id": str(mid), "chat_id": chat_id,
+                                   "update_id": f"{chat_id}:{mid}:delete:{update.get('pts', '')}"})
+            elif update_kind == "updateChannelTooLong":
+                # Preserve this gap for explicit per-channel recovery instead
+                # of silently pretending all channel messages were received.
+                channel = f"channel:{update['channel_id']}"
+                events.append({"channel_gap": True, "chat_id": channel,
+                               "update_id": f"{channel}:gap:{update.get('pts', '')}"})
+        encoded_entities = [{"kind": key[0], "id": key[1], "entity": entity} for key, entity in entities.items()]
+        for message in messages:
+            peer = message.get("peer_id") or {}
+            chat_id, peer_ref = self._peer_identity(peer, entities)
+            if not chat_id or not message.get("id"):
+                continue
+            if peer_ref.endswith(":0") and chat_id in runtime.peer_refs:
+                peer_ref = runtime.peer_refs[chat_id]
+            runtime.peer_refs[chat_id] = peer_ref
+            if not bool(message.get("out") or (message.get("pFlags") or {}).get("out")):
+                runtime.pending_read_message_ids[chat_id] = max(runtime.pending_read_message_ids.get(chat_id, 0), int(message["id"]))
+            import json
+            edit_suffix = (
+                ":" + hashlib.sha256(json.dumps(message, sort_keys=True, default=str).encode()).hexdigest()[:16]
+                if message.get("edit_date") else ""
+            )
+            events.append({"chat_id": chat_id, "peer": peer, "peer_ref": peer_ref,
+                           "message": message, "entities": encoded_entities,
+                           "update_id": f"{chat_id}:{message['id']}:{message.get('edit_date') or 0}{edit_suffix}"})
+        events.extend(deletions)
+        # A delete in the same difference as its original needs to share its
+        # delivery stream, otherwise an attachment failure could let it overtake.
+        peer_by_message = {str(event["message"]["id"]): event["chat_id"] for event in events if event.get("message") and not event["chat_id"].startswith("channel:")}
+        for deletion in deletions:
+            if not deletion["chat_id"] and deletion["message_id"] in peer_by_message:
+                deletion["chat_id"] = peer_by_message[deletion["message_id"]]
+        next_state = difference.get("state") or difference.get("intermediate_state")
+        runtime.pending_update_state = self._state_cursor(next_state) if next_state else {**state, "date": difference.get("date", state["date"]), "seq": difference.get("seq", state.get("seq", 0))}
+        runtime.pending_updates = events
+        return {"ok": True, "result": events}
+
+    @staticmethod
+    def _state_cursor(state: dict[str, Any]) -> dict[str, Any]:
+        return {key: int(state.get(key) or 0) for key in ("pts", "date", "qts", "seq")}
+
+    def restore_update_state(self, instance: str, state: Optional[str]) -> None:
+        import json
+        runtime = self._runtime(instance)
+        if runtime.update_state is None and runtime.pending_updates is None and state:
+            try:
+                parsed = json.loads(state)
+                if isinstance(parsed, dict) and "pts" in parsed and "date" in parsed:
+                    runtime.update_state = self._state_cursor(parsed)
+            except (ValueError, TypeError):
+                pass  # Older history pollers had no usable difference cursor.
+
+    def pending_cursor(self, instance: str) -> Optional[str]:
+        import json
+        state = self._runtime(instance).pending_update_state
+        return json.dumps(state, separators=(",", ":")) if state is not None else None
+
+    def acknowledge_updates(self, instance: str) -> None:
+        runtime = self._runtime(instance)
+        if runtime.pending_update_state is not None:
+            runtime.update_state = runtime.pending_update_state
+        runtime.pending_update_state = None
+        runtime.pending_updates = None
+
+    def poll_interval(self, instance: str) -> float:
+        return self._runtime(instance).web_poll_interval or 5.0
+
+    @staticmethod
+    def _check_expiry(runtime: EitaaPvRuntime, response: dict[str, Any]) -> None:
+        if response.get("_") == "eitaa_updates_expire_token":
+            runtime.auth_expired = True
+            runtime.connected = False
+            raise RuntimeError("Eitaa session expired: login required. Request a new phone login code.")
+
+    async def _get_history_updates(self, instance: str, offset: Optional[int] = None, timeout: Optional[int] = None) -> dict[str, Any]:
         """Poll new messages from active dialogs until upstream exposes a stream API."""
         del offset, timeout
         runtime = self._authenticated_runtime(instance)
         await self._set_presence(runtime, online=True)
         dialogs = await runtime.client.dialogs.list(limit=100)
+        self._check_response(runtime, dialogs)
         entities = self._entity_map(dialogs)
         events: list[dict[str, Any]] = []
         for dialog in dialogs.get("dialogs", []):
@@ -369,6 +512,7 @@ class EitaaPvConnector:
                 continue
             runtime.peer_refs[chat_id] = peer_ref
             history = await runtime.client.messages.history(peer_ref, limit=20)
+            self._check_response(runtime, history)
             messages = list(history.get("messages") or [])
             newest = max((int(message.get("id") or 0) for message in messages), default=0)
             previous = runtime.seen_message_ids.get(chat_id)
@@ -427,9 +571,20 @@ class EitaaPvConnector:
 
     def _authenticated_runtime(self, instance: str) -> EitaaPvRuntime:
         runtime = self._runtime(instance)
+        if runtime.auth_expired:
+            raise RuntimeError("Eitaa session expired: login required. Request a new phone login code.")
         if not runtime.client.profile.authenticated:
             raise RuntimeError("Eitaa PV authentication is required")
         return runtime
+
+    @staticmethod
+    def _check_response(runtime: EitaaPvRuntime, response: dict[str, Any]) -> None:
+        if response.get("_") == "eitaa_updates_expire_token":
+            runtime.auth_expired = True
+            runtime.connected = False
+            raise RuntimeError("Eitaa session expired: login required. Request a new phone login code.")
+        if not any(key in response for key in ("dialogs", "messages")):
+            raise RuntimeError(f"Unexpected Eitaa polling response: {response.get('_', 'unknown')}")
 
     @staticmethod
     def _message_id(quoted: Optional[dict[str, Any]]) -> Optional[int]:
