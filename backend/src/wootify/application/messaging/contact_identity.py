@@ -159,6 +159,29 @@ class ContactIdentityService:
             db.commit()
             contact = await self._get(client, account_id, contact_id)
             if contact:
+                phone = ChatwootPayloadParser.normalize_bale_pv_phone(str(payload.get("phone_number") or ""))
+                current_phone = ChatwootPayloadParser.normalize_bale_pv_phone(str(contact.get("phone_number") or ""))
+                # Repair earlier phone-less duplicates only with an exact
+                # platform-supplied phone, never a name/username guess.
+                if phone and not current_phone and peer_type in ("user", "private"):
+                    preferred = await self._exact(client, account_id, f"+{phone}", "phone_number")
+                    if preferred and str(preferred["id"]) != contact_id:
+                        owner = mappings.unique_platform_id_for_chatwoot(instance_id, str(preferred["id"]), chatwoot_scope=scope)
+                        if owner and owner != peer_id:
+                            raise ContactMappingConflict("phone_contact_owned_by_other_platform_peer")
+                        # Keep the old contact usable via a verified local alias;
+                        # no Chatwoot merge, deletion or identifier mutation.
+                        if not mapped.chatwoot_scope:
+                            mapped.chatwoot_scope = scope
+                        mappings.save_verified_alias(instance_id, peer_id, contact_id,
+                            chatwoot_scope=scope, verification_method="platform_phone")
+                        mapped.chatwoot_contact_id = str(preferred["id"])
+                        anchor = db.query(ContactCreation).filter_by(instance_id=instance_id,
+                            platform_contact_id=peer_id, chatwoot_scope=scope).one_or_none()
+                        if anchor:
+                            anchor.chatwoot_contact_id = str(preferred["id"])
+                        db.flush()
+                        return self._finish(db, instance_id, peer_id, scope, preferred, peer_type), False
                 return self._finish(db, instance_id, peer_id, scope, contact, peer_type), False
             missing.add(contact_id)
             self._invalidate(db, instance_id, peer_id, contact_id)
@@ -184,13 +207,13 @@ class ContactIdentityService:
         anchor_id, anchor_inbox = str(anchor.id), int(anchor.chatwoot_inbox_id)
         anchor_contact = str(anchor.chatwoot_contact_id or "")
         db.commit()
-        recovered = await self._source(client, account_id, anchor_inbox, anchor_id)
-        if recovered:
-            return self._finish(db, instance_id, peer_id, scope, recovered, peer_type, anchor_id), False
         if anchor_contact and anchor_contact not in missing:
             recovered = await self._get(client, account_id, anchor_contact)
             if recovered:
                 return self._finish(db, instance_id, peer_id, scope, recovered, peer_type, anchor_id), False
+        recovered = await self._source(client, account_id, anchor_inbox, anchor_id)
+        if recovered:
+            return self._finish(db, instance_id, peer_id, scope, recovered, peer_type, anchor_id), False
 
         # Read-only import of historical contact identifiers; no write-back.
         for identifier in dict.fromkeys(legacy_identifiers):
@@ -216,6 +239,8 @@ class ContactIdentityService:
         if not isinstance(inbox, dict) or inbox.get("channel_type") != "Channel::Api":
             raise RuntimeError("contact_creation_requires_wootify_api_inbox")
         create_payload = {key: value for key, value in payload.items() if key != "identifier"}
+        if normalized_phone and peer_type not in ("group", "channel"):
+            create_payload["phone_number"] = f"+{normalized_phone}"
         create_payload.update(inbox_id=anchor_inbox, source_id=anchor_id)
         try:
             created = self._contact(await client.create_contact(account_id, create_payload))

@@ -563,6 +563,32 @@ class EitaaPvConnector:
             runtime.seen_message_ids[chat_id] = max(previous, newest)
         return {"ok": True, "result": events}
 
+    async def resolve_phone_to_user(self, instance: str, phone_number: str) -> dict[str, Any]:
+        """Verify an exact phone match; never use the search resolver's first hit."""
+        from wootify.application.messaging.payload_parser import ChatwootPayloadParser
+
+        runtime = self._authenticated_runtime(instance)
+        normalized = ChatwootPayloadParser.normalize_bale_pv_phone(phone_number)
+        if not normalized:
+            raise RuntimeError("eitaa_invalid_phone_number")
+        contacts = await runtime.client.invoke("contacts.getContacts", {"hash": 0})
+        dialogs = await runtime.client.dialogs.list(limit=100)
+        for response in (contacts, dialogs):
+            if response.get("_") == "eitaa_updates_expire_token":
+                self._check_response(runtime, response)
+        matches = {
+            str(user["id"]): user
+            for response in (contacts, dialogs)
+            for user in response.get("users") or []
+            if user.get("id") and user.get("access_hash") is not None
+            and ChatwootPayloadParser.normalize_bale_pv_phone(str(user.get("phone") or "")) == normalized
+        }
+        if len(matches) != 1:
+            raise RuntimeError("eitaa_phone_not_found" if not matches else "eitaa_phone_ambiguous")
+        user = next(iter(matches.values()))
+        runtime.peer_refs[str(user["id"])] = f"user:{user['id']}:{user['access_hash']}"
+        return user
+
     def _runtime(self, instance: str) -> EitaaPvRuntime:
         runtime = self._runtimes.get(instance)
         if runtime is None:
@@ -615,7 +641,14 @@ class EitaaPvConnector:
 
     @staticmethod
     def _peer_ref(runtime: EitaaPvRuntime, chat_id: str) -> str:
-        return runtime.peer_refs.get(str(chat_id), str(chat_id))
+        reference = runtime.peer_refs.get(str(chat_id))
+        if reference:
+            return reference
+        if str(chat_id).isdigit() or str(chat_id).startswith("channel:"):
+            # The upstream generic resolver chooses the first search hit for
+            # a bare numeric ID. Never use that as a routing fallback.
+            raise RuntimeError("eitaa_peer_access_hash_unavailable: refresh dialogs or resolve the contact phone")
+        return str(chat_id)
 
     async def _set_presence(self, runtime: EitaaPvRuntime, *, online: bool) -> None:
         if runtime.presence_online == online:

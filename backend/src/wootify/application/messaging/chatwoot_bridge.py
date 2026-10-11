@@ -223,10 +223,8 @@ class ChatwootBridgeService:
                     exc,
                 )
 
-        # Eitaa history contains both directions.  Older connector versions
-        # used an outgoing message's sender (the authenticated account) for
-        # the contact name.  Eitaa now supplies the dialog peer, so repair
-        # that stale name when the matching private contact is encountered.
+        # Keep meaningful shared-contact/agent names. Only replace a generated
+        # placeholder with the customer name supplied by Eitaa.
         if (
             not contact_created
             and platform_key == "eitaa_pv_enterprise"
@@ -235,9 +233,9 @@ class ChatwootBridgeService:
         ):
             try:
                 current = await client.get_contact(account_id, contact_id)
-                payload = current.get("payload") or current if isinstance(current, dict) else {}
-                current_name = str(payload.get("name") or "").strip() if isinstance(payload, dict) else ""
-                if current_name and current_name != from_name:
+                contact_payload = MessagePayloadParser.extract_contact_payload(current)
+                current_name = str(contact_payload.get("name") or "").strip()
+                if self._is_generic_contact_name(current_name) and current_name != from_name:
                     await client.update_contact(account_id, contact_id, {"name": from_name})
                     logger.info(
                         "chatwoot_bridge.renamed_eitaa_private_contact instance=%s chat_id=%s contact_id=%s old_name=%s new_name=%s",
@@ -672,6 +670,14 @@ class ChatwootBridgeService:
                             chatwoot_scope=contact_scope(client, account_id),
                         )
                     peer_id = legacy_peer_id
+            if not peer_id and runtime.platform_type == "eitaa_pv_enterprise" and phone_number:
+                user = await runtime.adapter.resolve_phone_to_user(str(phone_number))
+                peer_id = str(user["id"])
+                if chatwoot_contact_id and not ContactMappingRepository(db).get(instance.id, peer_id):
+                    ContactMappingRepository(db).save(
+                        instance.id, peer_id, str(chatwoot_contact_id),
+                        platform_contact_type="user", chatwoot_scope=contact_scope(client, account_id),
+                    )
             if peer_id:
                 mapped_peer = ContactMappingRepository(db).get(instance.id, peer_id)
                 if mapped_peer and mapped_peer.chatwoot_scope and mapped_peer.chatwoot_scope != contact_scope(client, account_id):
@@ -720,7 +726,7 @@ class ChatwootBridgeService:
                 account_id,
                 payload,
                 None,
-                RuntimeError("recipient_not_resolvable: no instance-owned mapping or Bale phone number"),
+                RuntimeError("recipient_not_resolvable: no instance-owned mapping or verified platform phone number"),
                 platform_type=runtime.platform_type,
             )
             return {"ok": False, "detail": "peer_id_not_found"}
@@ -1301,7 +1307,9 @@ class ChatwootBridgeService:
                 Conversation.instance_id == instance.id,
                 Conversation.platform_conversation_id == chat_id,
                 Conversation.is_active.is_(True),
+                Conversation.chatwoot_contact_id == str(contact_id),
             )
+            .order_by(Conversation.updated_at.desc())
             .first()
         )
 
@@ -2021,7 +2029,7 @@ class ChatwootBridgeService:
         )
         if legacy_prefix and legacy_id == str(peer_id) and parsed_identifier.get("instance_key") in (None, instance.instance_key):
             method = "legacy_identifier"
-        elif runtime.platform_type == "bale_pv_enterprise" and phone_number:
+        elif runtime.platform_type in {"bale_pv_enterprise", "eitaa_pv_enterprise"} and phone_number:
             normalized = self._normalize_bale_pv_phone(str(phone_number))
             if not normalized:
                 raise ContactMappingConflict("contact_alias_requires_identity_verification")
@@ -2031,10 +2039,11 @@ class ChatwootBridgeService:
             if not user or str(user.get("id")) != str(peer_id):
                 raise ContactMappingConflict("contact_alias_phone_resolved_to_other_peer")
             access_hash = user.get("access_hash")
-            runtime.adapter.cache_access_hash(
-                str(peer_id), int(access_hash) if access_hash is not None and str(access_hash).lstrip("-").isdigit() else None,
-            )
-            method = "bale_phone"
+            if runtime.platform_type == "bale_pv_enterprise":
+                runtime.adapter.cache_access_hash(
+                    str(peer_id), int(access_hash) if access_hash is not None and str(access_hash).lstrip("-").isdigit() else None,
+                )
+            method = "eitaa_phone" if runtime.platform_type == "eitaa_pv_enterprise" else "bale_phone"
         else:
             raise ContactMappingConflict("contact_alias_requires_identity_verification")
 

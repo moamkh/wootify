@@ -99,6 +99,10 @@ async def test_edits_with_same_timestamp_keep_distinct_queue_keys():
     assert len({event["update_id"] for event in events}) == 2
 
 
+def test_missing_numeric_peer_hash_never_uses_fuzzy_search():
+    runtime = EitaaPvRuntime("test","",Path("session.json"),None)
+    with pytest.raises(RuntimeError,match="access_hash_unavailable"):
+        EitaaPvConnector._peer_ref(runtime,"42")
 
 
 def test_channel_gap_remains_a_visible_recovery_failure():
@@ -122,6 +126,24 @@ def setup(db):
 
 
 
+@pytest.mark.anyio
+async def test_phone_less_duplicate_rebinds_local_map_without_changing_contacts(db_session):
+    i, _ = setup(db_session)
+    client = AsyncMock()
+    client.base_url = "http://chatwoot"
+    client.get_contact.return_value = {"id":5215,"name":"Dabagh"}
+    client.search_contacts.return_value = {"payload":[{"id":4004,"name":"Ali Dabbagh","phone_number":"+989904905660","identifier":"whatsapp-owned"}]}
+    mappings = ContactMappingRepository(db_session)
+    scope = contact_scope(client,3)
+    mappings.save(i.id,"42","5215",chatwoot_scope=scope)
+    db_session.commit()
+    cid, created = await ContactIdentityService().resolve(db_session,client,instance_id=i.id,account_id=3,inbox_id=57,
+        peer_id="42",payload={"name":"Dabagh","phone_number":"989904905660"},peer_type="private")
+    assert cid == 4004 and not created
+    assert mappings.get(i.id,"42").chatwoot_contact_id == "4004"
+    assert mappings.unique_platform_id_for_chatwoot(i.id,"5215",chatwoot_scope=scope) == "42"
+    client.create_contact.assert_not_awaited()
+    client.update_contact.assert_not_awaited()
 
 
 def test_queue_commits_events_and_cursor_in_one_transaction(monkeypatch):
@@ -147,3 +169,32 @@ def test_queue_commits_events_and_cursor_in_one_transaction(monkeypatch):
     with factory() as db:
         assert db.query(InboundEventRetry).count() == 1
     engine.dispose()
+
+
+
+
+
+
+
+
+@pytest.mark.anyio
+async def test_phone_match_reuses_one_contact_across_instances(db_session):
+    import httpx
+    i, _ = setup(db_session)
+    other = Instance(instance_key="other-platform",platform_type_id=i.platform_type_id,is_enabled=True,
+        platform_metadata_encrypted="",proxy_config_encrypted="",chatwoot_config_encrypted="")
+    db_session.add(other)
+    db_session.commit()
+    client = AsyncMock()
+    client.base_url = "http://chatwoot"
+    client.get_contact_by_source.side_effect = httpx.HTTPStatusError("missing",request=httpx.Request("GET","http://chatwoot"),response=httpx.Response(404))
+    client.search_contacts.return_value = {"payload":[{"id":4004,"phone_number":"+989904905660","name":"Ali","identifier":"whatsapp-owned"}]}
+    client.get_contact.return_value = client.search_contacts.return_value["payload"][0]
+    resolver = ContactIdentityService()
+    for instance, peer in [(i,"42"),(other,"different-id")]:
+        cid, created = await resolver.resolve(db_session,client,instance_id=instance.id,account_id=3,inbox_id=57,
+            peer_id=peer,payload={"name":"Alias","phone_number":"09904905660"},peer_type="user")
+        assert cid == 4004 and not created
+        assert ContactMappingRepository(db_session).get(instance.id,peer).chatwoot_contact_id == "4004"
+    client.create_contact.assert_not_awaited()
+    client.update_contact.assert_not_awaited()

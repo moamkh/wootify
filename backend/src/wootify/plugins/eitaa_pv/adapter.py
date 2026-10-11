@@ -61,6 +61,9 @@ class EitaaPvAdapter(BasePlatformAdapter):
     async def prepare_outbound(self, peer_id: str) -> None:
         await eitaa_pv.prepare_outbound(self.instance_key, peer_id)
 
+    async def resolve_phone_to_user(self, phone_number: str) -> dict[str, Any]:
+        return await eitaa_pv.resolve_phone_to_user(self.instance_key, phone_number)
+
     async def finish_outbound(self, peer_id: str) -> None:
         await eitaa_pv.finish_outbound(self.instance_key, peer_id)
 
@@ -107,11 +110,14 @@ class EitaaPvAdapter(BasePlatformAdapter):
                 except (TypeError, ValueError):
                     peer_id = None
             peer_entity = entities.get(("user", peer_id), {}) if peer_id is not None else {}
-            if peer_entity:
-                sender = peer_entity
+            sender = peer_entity  # Never substitute the logged-in account for a missing customer.
         name = " ".join(str(sender.get(key) or "").strip() for key in ("first_name", "last_name")).strip()
         if not name:
-            name = str(sender.get("username") or f"Eitaa User {sender_id or chat_id}")
+            name = str(sender.get("username") or f"Eitaa User {chat_id}")
+        if chat_type in {"group", "channel"}:
+            kind = "chat" if chat_type == "group" else "channel"
+            group_entity = entities.get((kind, int(chat_id.split(":")[-1])), {})
+            name = str(group_entity.get("title") or f"Eitaa {chat_type.title()} {chat_id.split(':')[-1]}")
         attachments = self._attachment_refs(chat_id, message)
         return {
             "chat_id": chat_id,
@@ -122,6 +128,7 @@ class EitaaPvAdapter(BasePlatformAdapter):
             "platform_message_id": str(message.get("id") or ""),
             "sender_id": str(sender_id) if sender_id is not None else None,
             "sender_username": str(sender.get("username") or "") or None,
+            "contact": {"phone_number": str(peer_entity["phone"])} if chat_type == "private" and peer_entity.get("phone") else {},
             "attachments": attachments,
             "reply_to": {"message_id": str(message.get("reply_to_msg_id"))} if message.get("reply_to_msg_id") else None,
             "outgoing": bool(message.get("out") or (message.get("pFlags") or {}).get("out")),
@@ -162,7 +169,7 @@ class EitaaPvAdapter(BasePlatformAdapter):
     @staticmethod
     def _sender_id(message: dict[str, Any]) -> Optional[int]:
         sender = message.get("from_id") or {}
-        value = sender.get("user_id") if isinstance(sender, dict) else None
+        value = sender.get("user_id") if isinstance(sender, dict) else sender
         return int(value) if value is not None else None
 
     @staticmethod
