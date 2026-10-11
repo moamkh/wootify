@@ -81,6 +81,10 @@ class EitaaPvAdapter(BasePlatformAdapter):
     def normalize_incoming_update(self, raw_update: Any) -> Optional[dict[str, Any]]:
         if isinstance(raw_update, dict) and raw_update.get("channel_gap"):
             raise RuntimeError(f"eitaa_channel_difference_required: {raw_update.get('chat_id')}")
+        if isinstance(raw_update, dict) and raw_update.get("deleted"):
+            return {"chat_id": str(raw_update.get("chat_id") or ""),
+                    "message_id": str(raw_update.get("message_id") or ""), "deleted": True,
+                    "eitaa_global_delete": not bool(raw_update.get("chat_id")), "raw": raw_update}
         if not isinstance(raw_update, dict) or not isinstance(raw_update.get("message"), dict):
             return None
         message = raw_update["message"]

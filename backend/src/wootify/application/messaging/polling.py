@@ -952,6 +952,8 @@ class BalePollingService:
                 continue
             blocked_streams: set[str] = set()
             for item in items:
+                if item['platform_key'] == 'eitaa_pv_enterprise' and item['payload'].get('deleted') and not item['payload'].get('chat_id') and blocked_streams:
+                    break  # Unknown-peer deletes must not overtake failed originals.
                 stream = self._retry_stream_key(item)
                 if stream in blocked_streams:
                     continue
@@ -1329,6 +1331,23 @@ class BalePollingService:
         if not event:
             self._logger.debug('personal_adapter_normalize_skipped instance=%s', instance_key)
             return None
+        if event.get('eitaa_global_delete'):
+            # Private/group IDs are account-wide. Channel IDs are scoped and
+            # must never be selected for a global delete notification.
+            with SessionLocal() as db:
+                candidates = db.query(Conversation.platform_conversation_id).join(
+                    MessageMapping, MessageMapping.conversation_id == Conversation.id,
+                ).join(Instance, Instance.id == Conversation.instance_id).filter(
+                    Instance.instance_key == instance_key,
+                    MessageMapping.platform_message_id == str(event['message_id']),
+                    ~Conversation.platform_conversation_id.startswith('channel:'),
+                ).all()
+            peers = {str(row[0]) for row in candidates}
+            if len(peers) > 1:
+                raise RuntimeError('eitaa_delete_peer_ambiguous')
+            if not peers:
+                return None  # The original message was never bridged.
+            event['chat_id'] = peers.pop()
 
         original_refs = event.get("attachments") or []
         if original_refs:

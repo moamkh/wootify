@@ -182,6 +182,18 @@ def test_queue_commits_events_and_cursor_in_one_transaction(monkeypatch):
     engine.dispose()
 
 
+@pytest.mark.anyio
+async def test_eitaa_delete_updates_original_chatwoot_row_not_new_message(db_session):
+    i, conv = setup(db_session)
+    db_session.add(MessageMapping(conversation_id=conv.id,direction=MessageDirection.platform_to_chatwoot,
+        message_kind=MessageKind.text,status=MessageStatus.sent,platform_message_id="7",chatwoot_message_id="100",platform_payload_json={}))
+    db_session.commit()
+    client = AsyncMock()
+    result = await ChatwootBridgeService()._handle_platform_message_deleted(db=db_session,instance=i,instance_key=i.instance_key,
+        client=client,account_id=3,event={"chat_id":"42","message_id":"7","deleted":True})
+    assert result["status"] == "delete_propagated"
+    client.delete_message.assert_awaited_once_with(account_id=3,conversation_id=2836,message_id=100)
+    client.post_message.assert_not_awaited()
 
 
 
