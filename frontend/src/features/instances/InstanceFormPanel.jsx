@@ -402,6 +402,10 @@ export default function InstanceFormPanel({
         {form.platform_type_key === 'eitaa_pv_enterprise' ? (
           <>
             <h3>Eitaa PV (Personal Account)</h3>
+            <label>
+              <input type="checkbox" checked={Boolean(form.eitaa_pv_status_conversation)} onChange={(e) => setForm((s) => ({ ...s, eitaa_pv_status_conversation: e.target.checked }))} />
+              Show Eitaa Connector status conversation in Chatwoot (read-only; no replies sent to Eitaa)
+            </label>
             <p className="muted">Uses Eitaa Web's TL-over-HTTPS session protocol. Save the instance, then use the Eitaa authentication controls in the instance workspace.</p>
             <div className="row">
               <label>

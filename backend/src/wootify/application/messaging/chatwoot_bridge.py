@@ -515,6 +515,17 @@ class ChatwootBridgeService:
         account_id = int(chatwoot_cfg["account_id"])
 
         event = str(payload.get("event") or "").strip().lower()
+        # Guard all outbound operations, including after reporting is disabled.
+        from wootify.application.messaging.connector_status import STATUS_PEER
+        status_conversation_id = MessagePayloadParser.extract_conversation_id(payload)
+        status_route = db.query(Conversation).filter(
+            Conversation.instance_id == instance.id,
+            Conversation.platform_conversation_id == STATUS_PEER,
+            Conversation.chatwoot_conversation_id == str(status_conversation_id),
+        ).first()
+        attrs = (payload.get("conversation") or {}).get("additional_attributes") or {}
+        if status_route or attrs.get("wootify_connector_status") == instance_key:
+            return {"ok": True, "ignored": True, "reason": "connector_status_read_only"}
 
         # Mark local conversations inactive when Chatwoot resolves/closes them,
         # so the next inbound message creates a new conversation instead of

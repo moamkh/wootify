@@ -33,6 +33,7 @@ export function createPayload(form, { patch = false } = {}) {
     platformMetadata.eitaa_pv_phone_number = form.eitaa_pv_phone_number?.trim() || undefined;
     platformMetadata.eitaa_pv_session_dir = form.eitaa_pv_session_dir?.trim() || undefined;
     platformMetadata.eitaa_pv_poll_interval = Number(form.eitaa_pv_poll_interval) > 0 ? Number(form.eitaa_pv_poll_interval) : undefined;
+    platformMetadata.eitaa_pv_status_conversation = Boolean(form.eitaa_pv_status_conversation);
     platformMetadata.eitaa_pv_display_name = form.eitaa_pv_display_name?.trim() || undefined;
     platformMetadata.eitaa_pv_department = form.eitaa_pv_department?.trim() || undefined;
     platformMetadata.eitaa_pv_endpoint = form.eitaa_pv_endpoint?.trim() || undefined;

@@ -112,6 +112,7 @@ EITAA_PV_ENTERPRISE_METADATA_SCHEMA: dict[str, Any] = {
         'eitaa_pv_phone_number': {'type': 'string'},
         'eitaa_pv_session_dir': {'type': 'string'},
         'eitaa_pv_poll_interval': {'type': 'integer'},
+        'eitaa_pv_status_conversation': {'type': 'boolean', 'default': False},
         'eitaa_pv_display_name': {'type': 'string'},
         'eitaa_pv_department': {'type': 'string'},
         'eitaa_pv_endpoint': {'type': 'string'},

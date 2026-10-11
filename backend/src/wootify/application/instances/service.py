@@ -608,6 +608,7 @@ class InstanceService:
                 'eitaa_pv_phone_number': str(data.get('eitaa_pv_phone_number') or '').strip(),
                 'eitaa_pv_session_dir': str(data.get('eitaa_pv_session_dir') or '').strip() or None,
                 'eitaa_pv_poll_interval': int(data.get('eitaa_pv_poll_interval') or settings.BALE_POLL_INTERVAL_SECONDS),
+                'eitaa_pv_status_conversation': bool(data.get('eitaa_pv_status_conversation', False)),
                 'eitaa_pv_display_name': str(data.get('eitaa_pv_display_name') or '').strip() or None,
                 'eitaa_pv_department': str(data.get('eitaa_pv_department') or '').strip() or None,
                 'eitaa_pv_endpoint': str(data.get('eitaa_pv_endpoint') or '').strip() or None,

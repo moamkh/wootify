@@ -94,6 +94,14 @@ class BalePollingService:
         self._enterprise = EnterpriseBaleService()
         self._enterprise_telegram = EnterpriseTelegramService()
 
+    async def _report_eitaa_status(self, instance_key: str, status: str) -> None:
+        from wootify.application.messaging.connector_status import publish_eitaa_status
+        try:
+            with SessionLocal() as db:
+                await publish_eitaa_status(db, instance_key, status)
+        except Exception as exc:
+            self._logger.warning('connector_status_publish_failed instance=%s error=%s', instance_key, exc)
+
     async def start(self) -> None:
         """Start."""
         if self._manager_task and not self._manager_task.done():
@@ -279,6 +287,8 @@ class BalePollingService:
                     continue
 
                 updates = resp.get('result') or []
+                if platform_key == 'eitaa_pv_enterprise' and cfg.get('eitaa_pv_status_conversation'):
+                    await self._report_eitaa_status(instance_key, "Connected — update polling is working.")
                 if platform_key == 'eitaa_pv_enterprise':
                     cursor = connector.pending_cursor(instance_key)
                     self._persist_bale_updates(instance_key, platform_key, updates, cursor=cursor)
@@ -452,6 +462,8 @@ class BalePollingService:
                 continue
             except Exception as exc:
                 self._logger.exception('poll error instance=%s error=%s', instance_key, exc)
+                if 'platform_key' in locals() and platform_key == 'eitaa_pv_enterprise' and cfg.get('eitaa_pv_status_conversation'):
+                    await self._report_eitaa_status(instance_key, str(exc))
                 if not runtime_instance_id:
                     with SessionLocal() as db:
                         runtime = self._instances.get_runtime_instance(db, instance_key)
