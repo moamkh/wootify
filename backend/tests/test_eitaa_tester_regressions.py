@@ -31,6 +31,9 @@ def raw(message):
             "entities":[{"kind":"user","id":42,"entity":{"id":42,"first_name":"Customer","phone":"989904905660"}}]}
 
 
+def test_nested_eitaa_reply_is_normalized():
+    event = EitaaPvAdapter("test", {}).normalize_incoming_update(raw({"message":"Reply", "reply_to":{"_":"messageReplyHeader","reply_to_msg_id":6}}))
+    assert event["reply_to"] == {"message_id":"6"}
 
 
 

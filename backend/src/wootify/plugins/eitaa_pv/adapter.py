@@ -130,7 +130,7 @@ class EitaaPvAdapter(BasePlatformAdapter):
             "sender_username": str(sender.get("username") or "") or None,
             "contact": {"phone_number": str(peer_entity["phone"])} if chat_type == "private" and peer_entity.get("phone") else {},
             "attachments": attachments,
-            "reply_to": {"message_id": str(message.get("reply_to_msg_id"))} if message.get("reply_to_msg_id") else None,
+            "reply_to": self._reply_reference(message),
             "outgoing": bool(message.get("out") or (message.get("pFlags") or {}).get("out")),
             "edited": bool(message.get("edit_date")),
             "raw": raw_update,
@@ -165,6 +165,12 @@ class EitaaPvAdapter(BasePlatformAdapter):
                 # retry instead of creating a hollow Chatwoot message.
                 continue
         return resolved
+
+    @staticmethod
+    def _reply_reference(message: dict[str, Any]) -> Optional[dict[str, str]]:
+        header = message.get("reply_to") if isinstance(message.get("reply_to"), dict) else {}
+        mid = header.get("reply_to_msg_id") or message.get("reply_to_msg_id")
+        return {"message_id": str(mid)} if mid else None
 
     @staticmethod
     def _sender_id(message: dict[str, Any]) -> Optional[int]:

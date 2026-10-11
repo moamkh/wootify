@@ -417,9 +417,12 @@ class ChatwootBridgeService:
         )
         chatwoot_parent_id: Optional[str] = None
         if platform_parent_id:
-            parent_mapping = MessageMappingRepository(db).get_by_platform_message_id(
-                str(conversation.id), platform_parent_id
-            )
+            parent_mapping = db.query(MessageMapping).join(Conversation).filter(
+                Conversation.instance_id == instance.id,
+                Conversation.chatwoot_conversation_id == str(conversation_id),
+                Conversation.platform_conversation_id == str(chat_id),
+                MessageMapping.platform_message_id == platform_parent_id,
+            ).order_by(MessageMapping.created_at.desc()).first()
             if parent_mapping and str(parent_mapping.chatwoot_message_id or "").isdigit():
                 chatwoot_parent_id = str(parent_mapping.chatwoot_message_id)
                 post_data["content_attributes"] = {"in_reply_to": int(chatwoot_parent_id)}
@@ -1579,6 +1582,7 @@ class ChatwootBridgeService:
                 Conversation.platform_conversation_id == peer_id,
                 Conversation.is_active.is_(True),
             )
+            .filter(Conversation.chatwoot_conversation_id == str(MessagePayloadParser.extract_conversation_id(payload)))
             .order_by(Conversation.id.desc())
             .first()
         )
@@ -1642,6 +1646,7 @@ class ChatwootBridgeService:
         sent: List[Dict[str, Any]],
         text: str,
         message_kind: MessageKind,
+        chatwoot_conversation_id: Optional[str] = None,
     ) -> None:
         """Persist MessageMapping rows for Chatwoot-originated outbound sends.
 
@@ -1656,8 +1661,11 @@ class ChatwootBridgeService:
         """
         if not chatwoot_message_id:
             return
+        query = db.query(Conversation)
+        if chatwoot_conversation_id:
+            query = query.filter(Conversation.chatwoot_conversation_id == str(chatwoot_conversation_id))
         conversation = (
-            db.query(Conversation)
+            query
             .filter(
                 Conversation.instance_id == instance.id,
                 Conversation.platform_conversation_id == str(peer_id),
