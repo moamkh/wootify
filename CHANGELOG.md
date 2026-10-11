@@ -1,5 +1,39 @@
 # Changelog
 
+## 7.1.1 — 2026-10-11
+
+- Correct Bale PV forwarded-message parsing so forwarded files are delivered
+  to Chatwoot rather than discarded as empty service notices. Include a
+  Forwarded label and source when available, without confusing forwards with replies.
+- Extend Eitaa outbound routing with exact-phone verification and instance-owned
+  mappings. Reuse contacts across instances by normalized phone, repair verified
+  phone-less duplicates through local aliases, and preserve WhatsApp identifiers
+  and meaningful existing contact names. Ambiguous identity matches fail closed.
+- Replace Eitaa's limited dialog-history scanning with updates.getDifference.
+  Atomically persist events and their cursor in the existing database queue,
+  acknowledge only after commit, and retry delivery with per-peer ordering.
+  Detect expired sessions and update gaps instead of silently losing messages.
+- Follow Eitaa Web's server-provided foreground polling interval and show
+  automatic polling in the instance form.
+- Send Eitaa attachments individually before the separate caption/text message.
+  Checkpoint each acknowledged part and use stable protocol random IDs so
+  retries resume remaining parts instead of resending the whole attachment batch.
+- Reject unacknowledged sends, expose failures through Chatwoot's failed/red
+  message status and private notes, and restore sent status after a successful retry.
+- Normalize nested Eitaa reply headers and scope parent/outbound mapping lookups
+  to the correct instance, platform peer, and Chatwoot conversation.
+- Apply explicit Eitaa deletion events to the original Chatwoot message, with
+  ordering protection and fail-closed resolution of ambiguous global deletions.
+- Render Eitaa locations/venues as Google Maps coordinate links and contact
+  cards as text instead of attempting invalid attachment downloads.
+- Add an optional read-only Eitaa Connector status conversation, configured in
+  the instance UI, reporting polling/authentication failures and blocking replies.
+- Include the previously committed frontend safeguard against remote builds
+  using a localhost backend URL. Add focused regression coverage for these fixes.
+- No database schema migration or dependency upgrade is introduced. Existing
+  history is not automatically backfilled, and channel-gap recovery still requires
+  a dedicated recovery path. See docs/releases/v7.1.1.md for release details.
+
 ## 7.1.0 — 2026-10-04
 
 - Persist every Bale PV WebSocket update in the existing inbound-event queue
