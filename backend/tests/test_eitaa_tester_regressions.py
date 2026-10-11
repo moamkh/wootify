@@ -231,8 +231,35 @@ async def test_eitaa_delete_updates_original_chatwoot_row_not_new_message(db_ses
     client.post_message.assert_not_awaited()
 
 
+@pytest.mark.anyio
+async def test_failed_eitaa_send_marks_red_and_retry_marks_sent(committed_db, monkeypatch):
+    db_session = committed_db
+    import wootify.application.messaging.chatwoot_bridge as module
+    i, _ = setup(db_session)
+    client = AsyncMock()
+    client.base_url = "http://chatwoot"
+    ContactMappingRepository(db_session).save(i.id,"42","4004",chatwoot_scope=contact_scope(client,3))
+    db_session.commit()
+    adapter = SimpleNamespace(send_text=AsyncMock(side_effect=[RuntimeError("network unavailable"),{"ok":True,"result":{"message_id":"8"}}]))
+    runtime = SimpleNamespace(status="open",platform_type="eitaa_pv_enterprise",adapter=adapter)
+    monkeypatch.setattr(module,"get_runtime",lambda _:runtime)
+    service = ChatwootBridgeService()
+    monkeypatch.setattr(service,"_chatwoot_client_for_instance",lambda *_:(i,{"account_id":3},client))
+    payload = {"event":"message_created","id":9001,"message_type":"outgoing","content":"hello",
+               "conversation":{"id":2836,"inbox_id":57,"meta":{"sender":{"id":4004}},"messages":[]}}
+    assert (await service.handle_chatwoot_webhook(db_session,"tester",payload))["ok"] is False
+    assert client.update_message_status.await_args.kwargs["status"] == "failed"
+    assert "network unavailable" in client.update_message_status.await_args.kwargs["external_error"]
+    assert client.post_message.await_args.args[2]["private"] is True
+    assert (await service.handle_chatwoot_webhook(db_session,"tester",payload))["ok"] is True
+    assert client.update_message_status.await_args.kwargs["status"] == "sent"
+    assert adapter.send_text.await_args_list[0].kwargs["idempotency_key"] == adapter.send_text.await_args_list[1].kwargs["idempotency_key"]
 
 
+@pytest.mark.parametrize("response", [{"_":"boolFalse"},{"_":"eitaa_updates_expire_token"},{"_":"updates","updates":[]}])
+def test_unacknowledged_send_is_never_reported_successful(response):
+    with pytest.raises(RuntimeError,match="not_acknowledged"):
+        EitaaPvAdapter("test",{})._sent_result("42",response,mirror_echo=False)
 
 
 @pytest.mark.anyio

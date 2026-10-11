@@ -1015,6 +1015,12 @@ class ChatwootBridgeService:
                 "detail": f"{type(exc).__name__}: {exc}"[:300],
             }
 
+        source_message_id = self._extract_id(payload) or self._extract_id(message_obj)
+        if runtime.platform_type == "eitaa_pv_enterprise" and source_message_id and chatwoot_conversation_id:
+            try:
+                await client.update_message_status(account_id, int(chatwoot_conversation_id), int(source_message_id), status="sent", external_error="")
+            except Exception:
+                logger.warning("chatwoot_bridge.sent_status_update_failed instance=%s message_id=%s", instance_key, source_message_id, exc_info=True)
         return {"ok": True, "peer_id": peer_id, "sent": sent}
 
     async def _send_eitaa_attachment_batch(

@@ -1674,6 +1674,17 @@ async def _deliver_chatwoot_webhook_guarded(
                     resolved_instance_key,
                     route_key,
                 )
+                if platform_key == 'eitaa_pv_enterprise':
+                    try:
+                        with SessionLocal() as notification_db:
+                            instance, cfg, client = chatwoot_bridge._chatwoot_client_for_instance(notification_db, resolved_instance_key)
+                            await chatwoot_bridge._notify_delivery_failure(
+                                client, int(cfg['account_id']), payload, None,
+                                RuntimeError('delivery_timeout: Eitaa did not acknowledge the send'),
+                                platform_type=platform_key,
+                            )
+                    except Exception:
+                        logger.exception('eitaa_delivery_timeout_notification_failed instance=%s', resolved_instance_key)
                 await asyncio.to_thread(
                     _fail_chatwoot_delivery,
                     delivery_id,

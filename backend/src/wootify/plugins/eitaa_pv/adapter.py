@@ -41,6 +41,8 @@ class EitaaPvAdapter(BasePlatformAdapter):
                 break
             if update.get("_") in {"updateNewMessage", "updateNewChannelMessage"}:
                 message_id = (update.get("message") or {}).get("id")
+        if message_id is None:
+            raise RuntimeError(f"eitaa_send_not_acknowledged: {result.get('_', 'unknown response')}")
         if message_id is not None:
             result["message_id"] = str(message_id)
             if not mirror_echo:
