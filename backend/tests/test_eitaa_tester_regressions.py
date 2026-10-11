@@ -36,8 +36,16 @@ def test_nested_eitaa_reply_is_normalized():
     assert event["reply_to"] == {"message_id":"6"}
 
 
+@pytest.mark.parametrize("kind", ["messageMediaGeo", "messageMediaGeoLive", "messageMediaVenue"])
+def test_locations_are_links_not_broken_attachments(kind):
+    event = EitaaPvAdapter("test", {}).normalize_incoming_update(raw({"media":{"_":kind,"geo":{"lat":35.7,"long":51.4},"title":"Office"}}))
+    assert "https://www.google.com/maps/search/?api=1&query=35.7,51.4" in event["text"]
+    assert event["attachments"] == []
 
 
+def test_contact_card_is_text_not_download_reference():
+    event = EitaaPvAdapter("test", {}).normalize_incoming_update(raw({"media":{"_":"messageMediaContact","first_name":"Example","phone_number":"123"}}))
+    assert event["text"] == "Contact: Example\n123" and not event["attachments"]
 
 
 def make_connector(responses):

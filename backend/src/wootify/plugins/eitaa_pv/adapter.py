@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import mimetypes
+import math
 from collections import OrderedDict
 from typing import Any, AsyncIterator, Optional
 
@@ -123,7 +124,7 @@ class EitaaPvAdapter(BasePlatformAdapter):
             "chat_id": chat_id,
             "chat_type": chat_type,
             "from_name": name,
-            "text": str(message.get("message") or "").strip(),
+            "text": self._message_text(message),
             "message_id": str(message.get("id") or ""),
             "platform_message_id": str(message.get("id") or ""),
             "sender_id": str(sender_id) if sender_id is not None else None,
@@ -173,6 +174,27 @@ class EitaaPvAdapter(BasePlatformAdapter):
         return {"message_id": str(mid)} if mid else None
 
     @staticmethod
+    def _message_text(message: dict[str, Any]) -> str:
+        text = str(message.get("message") or "").strip()
+        media = message.get("media") or {}
+        kind = media.get("_") if isinstance(media, dict) else None
+        if kind in {"messageMediaGeo", "messageMediaGeoLive", "messageMediaVenue"}:
+            geo = media.get("geo") or {}
+            try:
+                lat, lon = float(geo["lat"]), float(geo["long"])
+                if not math.isfinite(lat) or not math.isfinite(lon) or not (-90 <= lat <= 90 and -180 <= lon <= 180):
+                    raise ValueError("invalid coordinates")
+            except (KeyError, TypeError, ValueError):
+                return text or "Location unavailable (invalid coordinates)"
+            label = "\n".join(str(media.get(key) or "").strip() for key in ("title", "address")).strip()
+            location = f"Location: https://www.google.com/maps/search/?api=1&query={lat},{lon}"
+            return "\n".join(value for value in (text, label, location) if value)
+        if kind == "messageMediaContact":
+            name = " ".join(str(media.get(key) or "").strip() for key in ("first_name", "last_name")).strip()
+            return "\n".join(value for value in (text, f"Contact: {name}", str(media.get("phone_number") or "")) if value)
+        return text
+
+    @staticmethod
     def _sender_id(message: dict[str, Any]) -> Optional[int]:
         sender = message.get("from_id") or {}
         value = sender.get("user_id") if isinstance(sender, dict) else sender
@@ -184,7 +206,7 @@ class EitaaPvAdapter(BasePlatformAdapter):
         if not isinstance(media, dict) or not media:
             return []
         media_kind = str(media.get("_") or "media").lower()
-        if media_kind in {"messagemediaempty", "messagemediawebpage"}:
+        if media_kind not in {"messagemediaphoto", "messagemediadocument"}:
             return []
         document = media.get("document") if isinstance(media.get("document"), dict) else {}
         attributes = document.get("attributes") if isinstance(document.get("attributes"), list) else []
