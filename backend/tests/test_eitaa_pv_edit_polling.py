@@ -16,7 +16,7 @@ def _dialogs() -> dict:
 
 
 @pytest.mark.anyio
-async def test_expired_token_is_failure_and_connection_requires_login():
+async def test_expiry_marker_is_recoverable_and_does_not_latch_logout():
     client = SimpleNamespace(
         profile=SimpleNamespace(authenticated=True),
         dialogs=SimpleNamespace(list=AsyncMock(return_value={"_": "eitaa_updates_expire_token"})),
@@ -24,14 +24,14 @@ async def test_expired_token_is_failure_and_connection_requires_login():
     connector = EitaaPvConnector()
     connector._runtimes["test"] = EitaaPvRuntime("test", "", Path("session.json"), client)
     connector._set_presence = AsyncMock()
-    with pytest.raises(RuntimeError, match="login required"):
+    with pytest.raises(RuntimeError, match="renewal pending"):
         await connector._get_history_updates("test")
     state = await connector.get_connection_state("test")
-    assert state["connected"] is False
-    assert state["detail"] == "login_required"
-    with pytest.raises(RuntimeError, match="login required"):
+    assert state["connected"] is True
+    assert state["detail"] == "authenticated"
+    with pytest.raises(RuntimeError, match="renewal pending"):
         await connector._get_history_updates("test")
-    assert client.dialogs.list.await_count == 1
+    assert client.dialogs.list.await_count == 2
 
 
 def test_unexpected_poll_response_is_not_successful_empty_history():

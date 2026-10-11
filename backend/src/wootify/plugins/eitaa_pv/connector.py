@@ -18,6 +18,7 @@ from typing import Any, Optional
 import httpx
 
 from wootify.paths import legacy_or_var, resolve_project_path
+from wootify.plugins.eitaa_pv.session_client import EitaaLoginRequired, EitaaRefreshPending, SessionAwareEitaaClient
 
 logger = logging.getLogger("wootify.plugins.eitaa_pv")
 DEFAULT_EITAA_PV_SESSION_DIR = legacy_or_var("data/eitaa_pv_sessions", "sessions/eitaa_pv")
@@ -84,7 +85,6 @@ class EitaaPvRuntime:
     pending_read_message_ids: dict[str, int] = field(default_factory=dict)
     read_message_ids: dict[str, int] = field(default_factory=dict)
     presence_online: bool = False
-    auth_expired: bool = False
     update_state: Optional[dict[str, Any]] = None
     pending_update_state: Optional[dict[str, Any]] = None
     pending_updates: Optional[list[dict[str, Any]]] = None
@@ -111,7 +111,6 @@ class EitaaPvConnector:
                 return
             if runtime is not None:
                 await runtime.client.close()
-            from eitaa_cli import EitaaClient
             from eitaa_cli.config import EitaaSettings
 
             session_dir = self._session_dir(params)
@@ -121,7 +120,7 @@ class EitaaPvConnector:
                 session_file=session_file,
                 endpoint=str(params.get("eitaa_pv_endpoint") or "").strip() or None,
             )
-            client = await EitaaClient.create(
+            client = await SessionAwareEitaaClient.create(
                 settings,
                 profile=instance,
                 require_auth=False,
@@ -154,14 +153,17 @@ class EitaaPvConnector:
         runtime = self._runtime(instance)
         if runtime.challenge is None:
             raise RuntimeError("Request an Eitaa login code before validating it")
+        await runtime.client.prepare_reauthentication()
         result = await runtime.client.auth.sign_in(
             runtime.challenge.phone_number,
             runtime.challenge.phone_code_hash,
             str(code).strip(),
             profile_name=instance,
         )
+        if result.get("_") != "auth.authorization":
+            return dict(result)
+        runtime.client.reset_session_recovery()
         runtime.connected = bool(runtime.client.profile.authenticated)
-        runtime.auth_expired = False
         runtime.seen_message_ids.clear()
         runtime.observed_edit_dates.clear()
         runtime.update_state = None
@@ -176,8 +178,8 @@ class EitaaPvConnector:
         if runtime is None:
             return {"connected": False, "detail": "not_initialized"}
         return {
-            "connected": bool(runtime.client.profile.authenticated) and not runtime.auth_expired,
-            "detail": "login_required" if runtime.auth_expired else ("authenticated" if runtime.client.profile.authenticated else "awaiting_auth_code"),
+            "connected": bool(runtime.client.profile.authenticated) and not getattr(runtime.client, "login_required", False) and not getattr(runtime.client, "refresh_pending", False),
+            "detail": "login_required" if getattr(runtime.client, "login_required", False) else ("token_refresh_pending" if getattr(runtime.client, "refresh_pending", False) else ("authenticated" if runtime.client.profile.authenticated else "awaiting_auth_code")),
             "phone_number": runtime.phone_number,
             "poll_interval_seconds": runtime.web_poll_interval,
         }
@@ -504,10 +506,10 @@ class EitaaPvConnector:
 
     @staticmethod
     def _check_expiry(runtime: EitaaPvRuntime, response: dict[str, Any]) -> None:
-        if response.get("_") == "eitaa_updates_expire_token":
-            runtime.auth_expired = True
-            runtime.connected = False
-            raise RuntimeError("Eitaa session expired: login required. Request a new phone login code.")
+        if response.get("_") in {"eitaa_updates_expire_token", "eitaa_token_updating"}:
+            # The session-aware client normally intercepts this. Never turn a
+            # recoverable rotation notification into a permanent logout latch.
+            raise EitaaRefreshPending("Eitaa token renewal pending; retrying later.")
 
     async def _get_history_updates(self, instance: str, offset: Optional[int] = None, timeout: Optional[int] = None) -> dict[str, Any]:
         """Poll new messages from active dialogs until upstream exposes a stream API."""
@@ -610,18 +612,15 @@ class EitaaPvConnector:
 
     def _authenticated_runtime(self, instance: str) -> EitaaPvRuntime:
         runtime = self._runtime(instance)
-        if runtime.auth_expired:
-            raise RuntimeError("Eitaa session expired: login required. Request a new phone login code.")
+        if getattr(runtime.client, "login_required", False) is True:
+            raise EitaaLoginRequired("Eitaa login required: server rejected session renewal. Request a new phone login code.")
         if not runtime.client.profile.authenticated:
             raise RuntimeError("Eitaa PV authentication is required")
         return runtime
 
     @staticmethod
     def _check_response(runtime: EitaaPvRuntime, response: dict[str, Any]) -> None:
-        if response.get("_") == "eitaa_updates_expire_token":
-            runtime.auth_expired = True
-            runtime.connected = False
-            raise RuntimeError("Eitaa session expired: login required. Request a new phone login code.")
+        EitaaPvConnector._check_expiry(runtime, response)
         if not any(key in response for key in ("dialogs", "messages")):
             raise RuntimeError(f"Unexpected Eitaa polling response: {response.get('_', 'unknown')}")
 

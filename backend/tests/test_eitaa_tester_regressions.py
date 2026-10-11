@@ -85,7 +85,7 @@ async def test_difference_cursor_waits_for_durable_ack_and_restarts():
 
 
 @pytest.mark.anyio
-@pytest.mark.parametrize("response,error", [({"_":"eitaa_updates_expire_token"},"login required"), ({"_":"updates.differenceTooLong","pts":500},"history recovery required")])
+@pytest.mark.parametrize("response,error", [({"_":"eitaa_updates_expire_token"},"renewal pending"), ({"_":"updates.differenceTooLong","pts":500},"history recovery required")])
 async def test_difference_errors_do_not_advance_cursor(response, error):
     c = make_connector([response])
     r = c._runtimes["test"]
