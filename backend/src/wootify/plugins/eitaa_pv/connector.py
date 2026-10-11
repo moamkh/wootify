@@ -191,14 +191,21 @@ class EitaaPvConnector:
         value = getattr(profile, "user_id", None) or getattr(profile, "id", None)
         return str(value) if value is not None else None
 
-    async def send_text(self, instance: str, chat_id: str, text: str, quoted: Optional[dict[str, Any]] = None, reply_markup: Any = None) -> dict[str, Any]:
+    async def send_text(self, instance: str, chat_id: str, text: str, quoted: Optional[dict[str, Any]] = None, reply_markup: Any = None, *, idempotency_key: Optional[str] = None) -> dict[str, Any]:
         del reply_markup
         runtime = self._authenticated_runtime(instance)
         reply_to = self._message_id(quoted)
-        result = await runtime.client.messages.send_text(self._peer_ref(runtime, chat_id), text, reply_to=reply_to)
+        if idempotency_key:
+            peer = await runtime.client.peers.resolve(self._peer_ref(runtime, chat_id))
+            params = {"peer": peer, "message": text, "random_id": self._send_random_id(idempotency_key)}
+            if reply_to is not None:
+                params["reply_to_msg_id"] = reply_to
+            result = await runtime.client.invoke("messages.sendMessage", params)
+        else:
+            result = await runtime.client.messages.send_text(self._peer_ref(runtime, chat_id), text, reply_to=reply_to)
         return dict(result)
 
-    async def send_media(self, instance: str, chat_id: str, media_url_or_bytes: Any, filename: str, caption: Optional[str] = None, quoted: Optional[dict[str, Any]] = None, reply_markup: Any = None) -> dict[str, Any]:
+    async def send_media(self, instance: str, chat_id: str, media_url_or_bytes: Any, filename: str, caption: Optional[str] = None, quoted: Optional[dict[str, Any]] = None, reply_markup: Any = None, *, idempotency_key: Optional[str] = None) -> dict[str, Any]:
         del reply_markup
         runtime = self._authenticated_runtime(instance)
         payload = await self._media_path(media_url_or_bytes, filename)
@@ -214,6 +221,7 @@ class EitaaPvConnector:
                 content_type=content_type,
                 caption=caption or "",
                 reply_to=self._message_id(quoted),
+                random_id=self._send_random_id(idempotency_key) if idempotency_key else None,
             )
             return dict(result)
         finally:
@@ -230,6 +238,7 @@ class EitaaPvConnector:
         content_type: str,
         caption: str,
         reply_to: Optional[int],
+        random_id: Optional[int] = None,
     ) -> dict[str, Any]:
         """Upload and send media with an MD5 checksum for small input files."""
         from eitaa_cli.services.peers import input_peer_to_peer
@@ -299,11 +308,15 @@ class EitaaPvConnector:
             "peer": peer,
             "media": media,
             "message": caption,
-            "random_id": secrets.randbits(63) or 1,
+            "random_id": random_id or secrets.randbits(63) or 1,
         }
         if reply_to is not None:
             params["reply_to_msg_id"] = reply_to
         return dict(await runtime.client.invoke("messages.sendMedia", params, kind="upload"))
+
+    @staticmethod
+    def _send_random_id(key: str) -> int:
+        return (int.from_bytes(hashlib.sha256(key.encode()).digest()[:8], "big") & ((1 << 63) - 1)) or 1
 
     @staticmethod
     def _md5_file(path: Path) -> str:

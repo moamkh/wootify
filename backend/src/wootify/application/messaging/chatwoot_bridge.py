@@ -880,7 +880,12 @@ class ChatwootBridgeService:
                     peer_type = get_peer_type(str(peer_id)) or peer_type
 
             sent: List[Dict[str, Any]] = []
-            if attachments and isinstance(attachments, list):
+            if attachments and runtime.platform_type == "eitaa_pv_enterprise":
+                sent = await self._send_eitaa_attachment_batch(
+                    db, instance, runtime, peer_id, payload, attachments,
+                    content=content, reply_to=reply_to, chatwoot_cfg=chatwoot_cfg,
+                )
+            elif attachments and isinstance(attachments, list):
                 for att in attachments:
                     data_url = att.get("data_url") if isinstance(att, dict) else None
                     if not data_url:
@@ -921,6 +926,8 @@ class ChatwootBridgeService:
                         content,
                         reply_to=reply_to,
                         mirror_echo=False,
+                        **({"idempotency_key": f"{instance_key}:{peer_id}:{MessagePayloadParser.extract_message_id(payload)}:text"}
+                           if runtime.platform_type == "eitaa_pv_enterprise" else {}),
                     )
                 finally:
                     await self._finish_adapter_outbound(runtime.adapter, peer_id)
@@ -947,15 +954,17 @@ class ChatwootBridgeService:
             # resolve agent messages to Bale rids.
             try:
                 outbound_message_id = self._extract_id(payload) or self._extract_id(message_obj)
-                self._persist_outbound_mappings(
-                    db,
-                    instance=instance,
-                    peer_id=peer_id,
-                    chatwoot_message_id=outbound_message_id,
-                    sent=sent,
-                    text=("" if attachments and runtime.platform_type == "eitaa_pv_enterprise" else content),
-                    message_kind=MessageKind.media if attachments else MessageKind.text,
-                )
+                if not (attachments and runtime.platform_type == "eitaa_pv_enterprise"):
+                    self._persist_outbound_mappings(
+                        db,
+                        instance=instance,
+                        peer_id=peer_id,
+                        chatwoot_message_id=outbound_message_id,
+                        chatwoot_conversation_id=str(chatwoot_conversation_id) if chatwoot_conversation_id else None,
+                        sent=sent,
+                        text=content,
+                        message_kind=MessageKind.media if attachments else MessageKind.text,
+                    )
             except Exception as exc:
                 logger.warning(
                     "chatwoot_bridge.outbound_message_mapping_failed instance=%s peer_id=%s error=%s",
@@ -963,6 +972,8 @@ class ChatwootBridgeService:
                     peer_id,
                     exc,
                 )
+                if runtime.platform_type == "eitaa_pv_enterprise":
+                    raise
         except Exception as exc:
             # A failed flush/lock wait leaves the SQLAlchemy session unusable
             # until rollback.  Release every lock before awaiting Chatwoot.
@@ -1005,6 +1016,67 @@ class ChatwootBridgeService:
             }
 
         return {"ok": True, "peer_id": peer_id, "sent": sent}
+
+    async def _send_eitaa_attachment_batch(
+        self, db: Session, instance: Instance, runtime: Any, peer_id: str,
+        payload: Dict[str, Any], attachments: list[dict[str, Any]], *,
+        content: str, reply_to: Optional[str], chatwoot_cfg: Dict[str, Any],
+    ) -> List[Dict[str, Any]]:
+        """Send files first, then text once; checkpoint each ACK for safe retries."""
+        message_id = str(MessagePayloadParser.extract_message_id(payload) or "")
+        conversation_id = str(MessagePayloadParser.extract_conversation_id(payload) or "")
+        conversation = db.query(Conversation).filter_by(instance_id=instance.id, chatwoot_conversation_id=conversation_id).one()
+        rows = db.query(MessageMapping).filter_by(conversation_id=conversation.id, direction=MessageDirection.chatwoot_to_platform).all()
+        completed = {(row.platform_payload_json or {}).get("batch_part"): row for row in rows
+                     if (row.platform_payload_json or {}).get("batch_message_id") == message_id}
+        plan = [(f"media:{att.get('id') or index}", att) for index, att in enumerate(attachments)]
+        if content:
+            plan.append(("text", None))
+        sent = []
+        for part, att in plan:
+            if part in completed:
+                sent.append({"ok": True, "result": {"message_id": completed[part].platform_message_id}})
+                continue
+            await self._prepare_adapter_outbound(runtime.adapter, peer_id)
+            try:
+                if att is None:
+                    result = await runtime.adapter.send_text(peer_id, content, reply_to=reply_to, mirror_echo=False,
+                        idempotency_key=f"{instance.instance_key}:{peer_id}:{message_id}:{part}")
+                else:
+                    url = att.get("data_url") or att.get("file_url")
+                    if not url:
+                        raise RuntimeError("eitaa_attachment_missing_download_url")
+                    if isinstance(url, str) and url.startswith("/"):
+                        url = f"{str(chatwoot_cfg.get('base_url') or '').rstrip('/')}{url}"
+                    result = await runtime.adapter.send_media(peer_id, url, filename=self._attachment_filename(att, url),
+                        caption=None, reply_to=reply_to, mirror_echo=False,
+                        idempotency_key=f"{instance.instance_key}:{peer_id}:{message_id}:{part}")
+                rid = self._extract_platform_rid(result)
+                if not rid or result.get("ok") is False:
+                    raise RuntimeError("eitaa_send_not_acknowledged")
+                row = self._persist_mapping(db, instance=instance, conversation_id=str(conversation.id),
+                    direction=MessageDirection.chatwoot_to_platform,
+                    message_kind=MessageKind.text if att is None else MessageKind.media,
+                    chatwoot_message_id=message_id if not completed else None,
+                    platform_message_id=rid,
+                    platform_payload_json={"text": content if att is None else "", "batch_message_id":message_id,
+                                           "batch_part":part, "delivery_complete":False})
+                completed[part] = row
+                sent.append(result)
+            finally:
+                await self._finish_adapter_outbound(runtime.adapter, peer_id)
+        if "text" in completed:
+            # Caption edits/replies must address the separate text message,
+            # not accidentally edit the first uploaded photo/document.
+            for row in completed.values():
+                if row is not completed["text"] and row.chatwoot_message_id == message_id:
+                    row.chatwoot_message_id = None
+            db.flush()
+            completed["text"].chatwoot_message_id = message_id
+        for row in completed.values():
+            row.platform_payload_json = {**(row.platform_payload_json or {}), "delivery_complete":True}
+        db.commit()
+        return sent
 
     @staticmethod
     async def _persist_outbound_conversation_mapping(
@@ -1596,9 +1668,10 @@ class ChatwootBridgeService:
 
         message_obj = payload.get("message") if isinstance(payload.get("message"), dict) else {}
         chatwoot_message_id = self._extract_id(payload) or self._extract_id(message_obj)
-        if chatwoot_message_id and outbound.filter(
+        already_sent = outbound.filter(
             MessageMapping.chatwoot_message_id == str(chatwoot_message_id)
-        ).first():
+        ).first() if chatwoot_message_id else None
+        if already_sent and (already_sent.platform_payload_json or {}).get("delivery_complete", True):
             return "chatwoot_message_already_delivered"
 
         if not is_template_or_bot or not content.strip():
@@ -1613,6 +1686,8 @@ class ChatwootBridgeService:
             .all()
         )
         for row in recent:
+            if (row.platform_payload_json or {}).get("delivery_complete") is False:
+                continue
             if str((row.platform_payload_json or {}).get("text") or "").strip() == content.strip():
                 return "template_content_recently_delivered"
         return None

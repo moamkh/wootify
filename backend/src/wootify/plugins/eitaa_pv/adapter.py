@@ -21,12 +21,12 @@ class EitaaPvAdapter(BasePlatformAdapter):
     async def disconnect(self) -> None:
         await eitaa_pv.disconnect(self.instance_key)
 
-    async def send_text(self, peer_id: str, text: str, *, reply_to: Optional[str] = None, mirror_echo: bool = True) -> dict[str, Any]:
-        result = await eitaa_pv.send_text(self.instance_key, peer_id, text, {"message_id": reply_to} if reply_to else None)
+    async def send_text(self, peer_id: str, text: str, *, reply_to: Optional[str] = None, mirror_echo: bool = True, idempotency_key: Optional[str] = None) -> dict[str, Any]:
+        result = await eitaa_pv.send_text(self.instance_key, peer_id, text, {"message_id": reply_to} if reply_to else None, idempotency_key=idempotency_key)
         return self._sent_result(peer_id, result, mirror_echo=mirror_echo)
 
-    async def send_media(self, peer_id: str, media: Any, *, filename: Optional[str] = None, caption: Optional[str] = None, reply_to: Optional[str] = None, mirror_echo: bool = True) -> dict[str, Any]:
-        result = await eitaa_pv.send_media(self.instance_key, peer_id, media, filename or "file", caption, {"message_id": reply_to} if reply_to else None)
+    async def send_media(self, peer_id: str, media: Any, *, filename: Optional[str] = None, caption: Optional[str] = None, reply_to: Optional[str] = None, mirror_echo: bool = True, idempotency_key: Optional[str] = None) -> dict[str, Any]:
+        result = await eitaa_pv.send_media(self.instance_key, peer_id, media, filename or "file", caption, {"message_id": reply_to} if reply_to else None, idempotency_key=idempotency_key)
         return self._sent_result(peer_id, result, mirror_echo=mirror_echo)
 
     def _sent_result(self, peer_id: str, response: dict[str, Any], *, mirror_echo: bool) -> dict[str, Any]:

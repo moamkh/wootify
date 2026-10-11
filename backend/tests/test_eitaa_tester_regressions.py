@@ -135,6 +135,41 @@ def setup(db):
     return i, conv
 
 
+@pytest.mark.anyio
+async def test_media_batch_retry_sends_only_remaining_caption(db_session):
+    i, conv = setup(db_session)
+    order = []
+    async def media(*args, **kwargs):
+        order.append(kwargs["filename"])
+        assert kwargs["caption"] is None
+        return {"ok":True,"result":{"message_id":str(len(order))}}
+    async def text(*args, **kwargs):
+        order.append("text")
+        if order.count("text") == 1:
+            raise RuntimeError("temporary failure")
+        return {"ok":True,"result":{"message_id":"3"}}
+    adapter = SimpleNamespace(send_media=AsyncMock(side_effect=media),send_text=AsyncMock(side_effect=text))
+    runtime = SimpleNamespace(adapter=adapter)
+    service = ChatwootBridgeService()
+    payload = {"id":9001,"conversation":{"id":2836}}
+    attachments = [{"id":1,"data_url":"http://files/1.jpg"},{"id":2,"data_url":"http://files/2.pdf"}]
+    async def send():
+        return await service._send_eitaa_attachment_batch(db_session,i,runtime,"42",payload,attachments,
+            content="caption",reply_to="6",chatwoot_cfg={})
+    with pytest.raises(RuntimeError,match="temporary failure"):
+        await send()
+    assert order == ["file.jpg","file.pdf","text"]
+    assert service._is_duplicate_outbound_delivery(db_session,instance=i,peer_id="42",payload=payload,content="caption",is_template_or_bot=False) is None
+    await send()
+    assert order == ["file.jpg","file.pdf","text","text"]
+    assert adapter.send_media.await_count == 2
+    assert adapter.send_text.await_args_list[0].kwargs["idempotency_key"] == adapter.send_text.await_args_list[1].kwargs["idempotency_key"]
+    assert service._is_duplicate_outbound_delivery(db_session,instance=i,peer_id="42",payload=payload,content="caption",is_template_or_bot=False)
+    mappings = db_session.query(MessageMapping).all()
+    assert len(mappings) == 3
+    assert all(m.platform_payload_json["delivery_complete"] for m in mappings)
+    assert [m.platform_payload_json["text"] for m in mappings] == ["","","caption"]
+    assert next(m for m in mappings if m.chatwoot_message_id == "9001").platform_payload_json["batch_part"] == "text"
 
 
 @pytest.mark.anyio
