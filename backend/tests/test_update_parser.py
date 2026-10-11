@@ -263,6 +263,43 @@ def test_parse_forwarded_document_frame() -> None:
     assert "reply_to_msg_id" not in parsed
 
 
+
+def test_modern_forwarded_pdf_is_not_a_reply() -> None:
+    """Reproduce conversation 2690's observed wire layout (2026-10-07)."""
+    reference = ProtobufMessage()
+    reference.add_int64(1, 7204090966910679320)
+    header = ProtobufMessage()
+    header.add_bytes(1, reference.serialize())
+    header.add_int32(3, 794687355)
+    header.add_int64(4, 1789549649799)
+    header.add_bytes(5, _build_document_message(
+        file_id=5953415564071018243, access_hash=794687355,
+        filename="resume.pdf", mime_type="application/pdf", caption="",
+    ))
+    header.add_bytes(6, _build_peer(1, 1079353694))
+    frame = _build_update_frame(BaleUpdateType.NEW_MESSAGE, _build_update_message(
+        peer_type=1, peer_id=794687355, sender_uid=794687355,
+        rid=2158827465100704772, forward_header=header.serialize(),
+    ))
+    parsed = parse_ws_update(frame)
+    assert parsed["media"]["file_name"] == "resume.pdf"
+    assert parsed["forward_from"] == {
+        "from_id": 794687355, "forward_message_id": 7204090966910679320,
+        "forward_date": 1789549649799,
+    }
+    assert "reply_to_msg_id" not in parsed
+    from wootify.plugins.bale_pv.connector import BalePvConnector
+    from wootify.plugins.bale_pv.adapter import BalePvAdapter
+    normalized = BalePvConnector._parse_raw_update(
+        {"_bale_parsed_update": parsed}, user_cache={794687355: "Original sender"},
+        self_user_id=1079353694,
+    )
+    assert not normalized["message"].get("_service_notice")
+    event = BalePvAdapter("test", {}).normalize_incoming_update(normalized)
+    assert event["attachments"][0]["filename"] == "resume.pdf"
+    assert event["text"] == "Forwarded Original sender"
+
+
 def test_parse_status_heartbeat_frame() -> None:
     frame = _build_status_heartbeat_frame(peer_type=2, peer_id=100500)
     parsed = parse_ws_update(frame)

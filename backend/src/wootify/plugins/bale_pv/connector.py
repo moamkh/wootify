@@ -1854,6 +1854,13 @@ class BalePvConnector:
             chat_title = f"Chat {chat_id}"
 
         text = parsed.get("text") or ""
+        forward_from = parsed.get("forward_from")
+        if isinstance(forward_from, dict):
+            forward_from = dict(forward_from)
+            source_id = forward_from.get("from_id")
+            source_name = (user_cache or {}).get(source_id) if isinstance(source_id, int) else None
+            if source_name:
+                forward_from["source_name"] = str(source_name)
 
         # For group/channel messages, prefix with sender name so members are distinguishable.
         # If the sender is not in the cache yet, label them generically instead of a raw ID.
@@ -1870,7 +1877,7 @@ class BalePvConnector:
         # Chatwoot contact but skip creating a conversation/message — otherwise
         # the empty conversation fires inbox automations (greeting/auto-message)
         # toward the user.
-        service_notice = not is_deleted and not text and not media
+        service_notice = not is_deleted and not text and not media and not forward_from
         # Bale security notices are text-bearing messages from its own reserved
         # direct peer.  Keep this distinct from generic service notices: the
         # bridge must not create even a contact for a platform system message.
@@ -1903,6 +1910,8 @@ class BalePvConnector:
         }
         if isinstance(sender_access_hash, int):
             message["_sender_access_hash"] = sender_access_hash
+        if isinstance(forward_from, dict):
+            message["forward_from"] = forward_from
         if service_notice:
             message["_service_notice"] = True
         if system_notice:

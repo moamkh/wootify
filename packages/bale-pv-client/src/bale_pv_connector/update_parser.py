@@ -555,6 +555,14 @@ def _parse_reply_header(data: bytes) -> Optional[int]:
     """
     try:
         fields = ProtobufParser(data).parse()
+        # Modern forwards also have a nested RID and quoted content. Field 6
+        # contains a full source peer (type + ID), while observed replies only
+        # contain flags {1: 1}. Do not misclassify quoted replies as forwards.
+        source_bytes = fields.get(6, [None])[0]
+        if isinstance(source_bytes, bytes):
+            source = _parse_peer(source_bytes)
+            if source and source.get("id") is not None:
+                return None
         reference_bytes = fields.get(1, [None])[0]
         if not isinstance(reference_bytes, bytes):
             return None
@@ -588,6 +596,21 @@ def _parse_forward_header(data: bytes) -> Optional[Dict[str, Any]]:
         message_content: Optional[Dict[str, Any]] = None
         if isinstance(msg_bytes, bytes) and msg_bytes:
             message_content = _parse_message_content(msg_bytes)
+
+        # Current Web Bale forward: 1={1: original RID}, 3=sender UID,
+        # 4=original timestamp, 5=content, 6=source chat peer.
+        source_peer_bytes = fields.get(6, [None])[0]
+        source_peer = _parse_peer(source_peer_bytes) if isinstance(source_peer_bytes, bytes) else None
+        if source_peer and message_content is not None:
+            reference_bytes = fields.get(1, [None])[0]
+            reference = ProtobufParser(reference_bytes).parse() if isinstance(reference_bytes, bytes) else {}
+            return {
+                "from_id": fields.get(3, [None])[0],
+                "from_peer": source_peer,
+                "forward_date": fields.get(4, [None])[0],
+                "forward_message_id": reference.get(1, [None])[0],
+                "message": message_content,
+            }
 
         # Try to extract original sender/chat peer info.
         # Field 2 normally carries the original sender; field 1 the original chat.
@@ -1122,7 +1145,7 @@ def parse_ws_update(data: bytes) -> Optional[Dict[str, Any]]:
             if peer_info:
                 result["peer_info"] = peer_info
 
-            if forward_info and forward_info.get("from_id") is not None:
+            if forward_info and (forward_info.get("message") or forward_info.get("from_id") is not None):
                 result["forward_from"] = {
                     "from_id": forward_info.get("from_id"),
                     "forward_message_id": forward_info.get("forward_message_id"),

@@ -40,6 +40,26 @@ def test_adapter_normalize_private_message():
     assert event["outgoing"] is False
 
 
+@pytest.mark.parametrize("source,text,media,expected", [
+    ({"source_name": "Sara", "from_id": 42}, "hello", False, "Forwarded Sara: hello"),
+    ({"from_id": 42}, "", True, "Forwarded 42"),
+    ({}, "caption", True, "Forwarded\ncaption"),
+    ({}, "hello", False, "Forwarded: hello"),
+])
+def test_adapter_labels_forwarded_content(source, text, media, expected):
+    adapter = BalePvAdapter("test", {})
+    message = {
+        "message_id": "123", "chat": {"id": "456", "type": "private"},
+        "from": {"id": 456, "first_name": "Sender"}, "text": text,
+        "forward_from": source,
+    }
+    if media:
+        message["document"] = {"file_id": "file", "file_name": "resume.pdf", "mime_type": "application/pdf"}
+    event = adapter.normalize_incoming_update({"message": message})
+    assert event["text"] == expected
+    assert bool(event["attachments"]) == media
+
+
 def test_adapter_preserves_bale_reply_reference():
     adapter = BalePvAdapter("test", {"bale_pv_phone_number": "989136421196"})
     event = adapter.normalize_incoming_update({

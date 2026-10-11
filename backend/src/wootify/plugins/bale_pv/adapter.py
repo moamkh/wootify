@@ -334,6 +334,15 @@ class BalePvAdapter(BasePlatformAdapter):
 
         # Extract attachments as file_id references (downloaded later in poll_events).
         attachments = self._extract_attachment_refs(message)
+        forward_from = message.get("forward_from")
+        if isinstance(forward_from, dict):
+            source = str(forward_from.get("source_name") or "").strip()
+            if not source and forward_from.get("from_id") is not None:
+                source = str(forward_from["from_id"])
+            label = f"Forwarded {source}" if source else "Forwarded"
+            text = f"{label}\n{text}" if attachments and text else (
+                label if not text else f"{label}: {text}"
+            )
         if attachments:
             logger.info(
                 "bale_pv_adapter_extracted_refs instance=%s message_id=%s refs=%s",
