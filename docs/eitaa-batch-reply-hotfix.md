@@ -43,5 +43,22 @@ reply encoding and outbound caption-retry tests are also run.
 Verification completed: 123 tests passed across Eitaa tester regressions,
 multipart content attributes, Eitaa echo handling and Bale PV adapter tests.
 
-This is a local source fix. Production/demo deployment and historical message
-repair are separate operations; no running server code was changed by this fix.
+## Production hotfix deployment
+
+Deployed source commit a17469d to production 192.168.20.76 on 2026-10-12
+at approximately 16:00 Tehran / 12:30 UTC, retaining version 7.1.1. Only the
+bridge source file and this documentation were installed. Eitaa renewal code,
+frontend, instance configuration, sessions and other applications were preserved.
+
+Backup: /opt/wootify-backups/eitaa-batch-reply-20261012T123015Z, containing the
+previous source, configuration, deployment marker and verified database dump.
+Backend import, service startup, HTTP health and version checks passed. Counts
+before/after were identical: 8 instances, 1449 conversations, 29356 message
+mappings and 420 contact mappings. Migration remained f7a0c02d21b3. No schema
+migration, historical message replay or customer-message send was performed.
+
+Installed source SHA256:
+2aa8f78bff8ea440e3fe0b89671b9ff6e466da654cafb874773e524763c0adb4.
+The server deployment marker records the hotfix commit. Demo was not updated
+by this request. Historical message repair is separate; the existing `b`
+message was not modified. No release tag was moved.
