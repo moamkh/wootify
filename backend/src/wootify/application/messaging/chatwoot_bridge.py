@@ -423,6 +423,22 @@ class ChatwootBridgeService:
                 Conversation.platform_conversation_id == str(chat_id),
                 MessageMapping.platform_message_id == platform_parent_id,
             ).order_by(MessageMapping.created_at.desc()).first()
+            if (
+                parent_mapping
+                and not parent_mapping.chatwoot_message_id
+                and platform_key == "eitaa_pv_enterprise"
+                and parent_mapping.direction == MessageDirection.chatwoot_to_platform
+            ):
+                # Files and a separate caption share one Chatwoot message. The
+                # caption owns its direct mapping for edits; media receipts
+                # retain batch_message_id so replies to any file can quote it.
+                batch_id = str((parent_mapping.platform_payload_json or {}).get("batch_message_id") or "")
+                if batch_id.isdigit():
+                    parent_mapping = db.query(MessageMapping).filter(
+                        MessageMapping.conversation_id == parent_mapping.conversation_id,
+                        MessageMapping.direction == MessageDirection.chatwoot_to_platform,
+                        MessageMapping.chatwoot_message_id == batch_id,
+                    ).first()
             if parent_mapping and str(parent_mapping.chatwoot_message_id or "").isdigit():
                 chatwoot_parent_id = str(parent_mapping.chatwoot_message_id)
                 post_data["content_attributes"] = {"in_reply_to": int(chatwoot_parent_id)}

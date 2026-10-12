@@ -136,6 +136,104 @@ def setup(db):
 
 
 @pytest.mark.anyio
+@pytest.mark.parametrize("media_kind", [None, "messageMediaGeo", "messageMediaContact"])
+async def test_customer_reply_to_operator_preserves_chatwoot_parent(db_session, monkeypatch, media_kind):
+    """Reply metadata must survive normalization even for location/contact replies."""
+    i, conv = setup(db_session)
+    db_session.add(MessageMapping(
+        conversation_id=conv.id, direction=MessageDirection.chatwoot_to_platform,
+        message_kind=MessageKind.text, status=MessageStatus.sent,
+        platform_message_id="110", chatwoot_message_id="85993",
+    ))
+    db_session.commit()
+    message = {"id":111, "message":"customer reply",
+               "reply_to":{"_":"messageReplyHeader","reply_to_msg_id":110}}
+    if media_kind == "messageMediaGeo":
+        message["media"] = {"_":media_kind,"geo":{"lat":35.7,"long":51.4}}
+    elif media_kind == "messageMediaContact":
+        message["media"] = {"_":media_kind,"first_name":"Example","phone_number":"123"}
+    event = EitaaPvAdapter("tester", {}).normalize_incoming_update(raw(message))
+    client = AsyncMock()
+    client.get_contact.return_value = {"id":4004,"name":"Customer"}
+    client.post_message.return_value = {"id":86000}
+    service = ChatwootBridgeService()
+    monkeypatch.setattr(service, "_chatwoot_client_for_instance",
+                        lambda *args: (i, {"account_id":3,"inbox_id":57}, client))
+    monkeypatch.setattr(service, "_get_or_create_contact", AsyncMock(return_value=(4004,False)))
+    result = await service.ingest_platform_event(db_session, "tester", event)
+    assert result["ok"]
+    assert client.post_message.await_args.args[2]["content_attributes"] == {"in_reply_to":85993}
+    mapping = db_session.query(MessageMapping).filter_by(platform_message_id="111").one()
+    assert mapping.platform_parent_message_id == "110"
+    assert mapping.chatwoot_parent_message_id == "85993"
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("part", ["media:1", "media:2", "text"])
+async def test_reply_to_each_eitaa_batch_part_targets_original_chatwoot_message(db_session, monkeypatch, part):
+    i, conv = setup(db_session)
+    ids = {"media:1":"92", "media:2":"93", "text":"94"}
+    for name, mid in ids.items():
+        db_session.add(MessageMapping(
+            conversation_id=conv.id, direction=MessageDirection.chatwoot_to_platform,
+            message_kind=MessageKind.text if name == "text" else MessageKind.media,
+            status=MessageStatus.sent, platform_message_id=mid,
+            chatwoot_message_id="85888" if name == "text" else None,
+            platform_payload_json={"batch_message_id":"85888","batch_part":name,"delivery_complete":True},
+        ))
+    db_session.commit()
+    event = EitaaPvAdapter("tester",{}).normalize_incoming_update(raw({
+        "id":95,"message":"b","reply_to":{"reply_to_msg_id":int(ids[part])},
+    }))
+    client = AsyncMock()
+    client.get_contact.return_value = {"id":4004,"name":"Customer"}
+    client.post_message.return_value = {"id":85899}
+    service = ChatwootBridgeService()
+    monkeypatch.setattr(service,"_chatwoot_client_for_instance",
+                        lambda *args: (i,{"account_id":3,"inbox_id":57},client))
+    monkeypatch.setattr(service,"_get_or_create_contact",AsyncMock(return_value=(4004,False)))
+    await service.ingest_platform_event(db_session,"tester",event)
+    assert client.post_message.await_args.args[2].get("content_attributes") == {"in_reply_to":85888}
+    reply = db_session.query(MessageMapping).filter_by(platform_message_id="95").one()
+    assert reply.chatwoot_parent_message_id == "85888"
+    assert reply.platform_parent_message_id == ids[part]
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("canonical_scope", ["missing", "another_conversation"])
+async def test_batch_reply_never_borrows_parent_from_another_conversation(db_session, monkeypatch, canonical_scope):
+    i, conv = setup(db_session)
+    db_session.add(MessageMapping(
+        conversation_id=conv.id, direction=MessageDirection.chatwoot_to_platform,
+        message_kind=MessageKind.media, status=MessageStatus.sent,
+        platform_message_id="92", chatwoot_message_id=None,
+        platform_payload_json={"batch_message_id":"85888","batch_part":"media:1"},
+    ))
+    if canonical_scope == "another_conversation":
+        other = Conversation(instance_id=i.id,platform_conversation_id="43",chatwoot_conversation_id="2837")
+        db_session.add(other)
+        db_session.flush()
+        db_session.add(MessageMapping(
+            conversation_id=other.id,direction=MessageDirection.chatwoot_to_platform,
+            message_kind=MessageKind.text,status=MessageStatus.sent,
+            platform_message_id="93",chatwoot_message_id="85888",
+        ))
+    db_session.commit()
+    event = EitaaPvAdapter("tester",{}).normalize_incoming_update(raw({
+        "id":95,"message":"b","reply_to":{"reply_to_msg_id":92},
+    }))
+    client = AsyncMock()
+    client.get_contact.return_value = {"id":4004,"name":"Customer"}
+    client.post_message.return_value = {"id":85899}
+    service = ChatwootBridgeService()
+    monkeypatch.setattr(service,"_chatwoot_client_for_instance",
+                        lambda *args: (i,{"account_id":3,"inbox_id":57},client))
+    monkeypatch.setattr(service,"_get_or_create_contact",AsyncMock(return_value=(4004,False)))
+    await service.ingest_platform_event(db_session,"tester",event)
+    assert "content_attributes" not in client.post_message.await_args.args[2]
+
+
+@pytest.mark.anyio
 async def test_media_batch_retry_sends_only_remaining_caption(db_session):
     i, conv = setup(db_session)
     order = []
