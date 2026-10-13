@@ -221,6 +221,14 @@ class InstanceService:
                         if val is not None and not (isinstance(val, str) and not val.strip())
                     }
                 )
+                if 'reopen_conversation_by_inbox' in payload.chatwoot:
+                    overrides = payload.chatwoot['reopen_conversation_by_inbox']
+                    if not isinstance(overrides, dict):
+                        raise ValueError('chatwoot.reopen_conversation_by_inbox must be an object')
+                    merged_chatwoot['reopen_conversation_by_inbox'] = {
+                        **(chatwoot.get('reopen_conversation_by_inbox') or {}),
+                        **overrides,
+                    }
                 chatwoot = self._normalize_chatwoot_config(merged_chatwoot)
                 row.chatwoot_config_encrypted = encryptor.encrypt_json(chatwoot)
 
@@ -743,6 +751,16 @@ class InstanceService:
         reopen_conversation = data.get('reopen_conversation')
         if reopen_conversation is None:
             reopen_conversation = data.get('reopenConversation')
+        overrides = data.get('reopen_conversation_by_inbox', {})
+        if not isinstance(overrides, dict):
+            raise ValueError('chatwoot.reopen_conversation_by_inbox must be an object')
+        normalized_overrides = {}
+        for key, enabled in overrides.items():
+            if not str(key).isdigit() or int(key) <= 0:
+                raise ValueError('reopen conversation overrides require positive inbox IDs')
+            if not isinstance(enabled, bool):
+                raise ValueError('reopen conversation inbox overrides must be booleans')
+            normalized_overrides[str(int(key))] = enabled
 
         return {
             'base_url': str(data.get('base_url') or settings.CHATWOOT_BASE_URL).strip(),
@@ -751,6 +769,7 @@ class InstanceService:
             'inbox_id': int(inbox_id) if inbox_id is not None and str(inbox_id).strip() else None,
             'auto_create': bool(data.get('auto_create', False)),
             'reopen_conversation': self._coerce_bool(reopen_conversation, default=False),
+            'reopen_conversation_by_inbox': normalized_overrides,
             'inbox_name': (str(data.get('inbox_name') or '').strip() or None),
         }
 

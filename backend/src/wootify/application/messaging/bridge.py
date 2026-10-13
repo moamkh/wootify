@@ -35,6 +35,7 @@ from wootify.infrastructure.persistence.repositories.contact_mapping_repository 
 from wootify.infrastructure.persistence.repositories.conversation_runtime_state_repository import ConversationRuntimeStateRepository
 from wootify.application.messaging.chatwoot_database import ChatwootDatabaseService
 from wootify.application.messaging.conversation_mapping import ConversationMappingService
+from wootify.application.messaging.conversation_policy import reopen_enabled, select_conversation
 from wootify.application.instances.service import InstanceService
 from wootify.application.messaging.message_mapping import MessageMappingService
 from wootify.application.shared.cache import TTLCache
@@ -616,13 +617,7 @@ class BridgeService:
 
         account_id = int(runtime.chatwoot['account_id'])
         inbox_id = int(runtime.chatwoot['inbox_id'])
-        # For Bale PV (personal account), default to reopening conversations
-        # because it's 1:1 messaging — not ticket-based support.
-        raw_reopen = runtime.chatwoot.get('reopen_conversation')
-        if raw_reopen is None and platform_key == 'bale_pv_enterprise':
-            reopen_conversation = True
-        else:
-            reopen_conversation = bool(raw_reopen)
+        reopen_conversation = reopen_enabled(runtime.chatwoot, inbox_id)
         client = self._get_chatwoot_client(runtime.chatwoot)
         event_contact = event.get('contact') if isinstance(event.get('contact'), dict) else {}
         event_text = str(event.get('text') or '').strip()
@@ -853,7 +848,8 @@ class BridgeService:
                         )
                         selected_remote_conversation = None
                 else:
-                    selected_remote_conversation = mapped_remote_conversation or self._select_reusable_contact_conversation(
+                    selected_remote_conversation = mapped_remote_conversation if mapped_remote_status != 'resolved' else None
+                    selected_remote_conversation = selected_remote_conversation or self._select_reusable_contact_conversation(
                         remote_contact_conversations,
                         inbox_id=inbox_id,
                         reopen_conversation=reopen_conversation,
@@ -1030,13 +1026,7 @@ class BridgeService:
         ]
         if not inbox_rows:
             return None
-        if reopen_conversation:
-            return inbox_rows[0]
-
-        for item in inbox_rows:
-            if self._normalize_chatwoot_status(item.get('status')) != 'resolved':
-                return item
-        return None
+        return select_conversation(inbox_rows, inbox_id, reopen_conversation)
 
     def _find_contact_conversation_by_id(
         self,
@@ -1089,6 +1079,9 @@ class BridgeService:
                 account_id,
                 conversation_id,
             )
+            # Let the durable inbound worker retry instead of delivering into
+            # a resolved conversation after a failed reopen request.
+            raise
 
     async def _post_platform_message_to_chatwoot(
         self,

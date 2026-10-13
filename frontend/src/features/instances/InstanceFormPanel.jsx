@@ -1,4 +1,5 @@
 import React from 'react';
+import ConversationSettings from './ConversationSettings.jsx';
 
 function DynamicRoutesEditor({ form, setForm, busy, selectedKey, onCreateEnterpriseInbox, copyTextToClipboard }) {
   const routes = form.enterprise_routes || [];
@@ -821,7 +822,7 @@ export default function InstanceFormPanel({
           Account ID
           <input value={form.chatwoot_account_id} onChange={(e) => setForm((s) => ({ ...s, chatwoot_account_id: e.target.value }))} />
         </label>
-        {isStandardBalePlatform || isBalePvPlatform || form.platform_type_key === 'eitaa_pv_enterprise' || isInstagramPvPlatform ? (
+        {isStandardBalePlatform || isBalePvPlatform || form.platform_type_key === 'eitaa_pv_enterprise' || isInstagramPvPlatform || (isTelegramPlatform && !isEnterpriseTelegramPlatform) ? (
           <>
             <div className="row">
               <label>
@@ -837,10 +838,6 @@ export default function InstanceFormPanel({
               <input type="checkbox" checked={form.chatwoot_auto_create} onChange={(e) => setForm((s) => ({ ...s, chatwoot_auto_create: e.target.checked }))} />
               Auto create Chatwoot inbox
             </label>
-            <label className="checkbox">
-              <input type="checkbox" checked={form.chatwoot_reopen_conversation} onChange={(e) => setForm((s) => ({ ...s, chatwoot_reopen_conversation: e.target.checked }))} />
-              Reopen resolved Chatwoot conversation on inbound reply
-            </label>
             {(isBalePvPlatform || form.platform_type_key === 'eitaa_pv_enterprise' || isInstagramPvPlatform) && selectedKey ? (
               <button type="button" className="btn" disabled={busy || !selectedKey} onClick={() => onCreateInbox(selectedKey)}>
                 Create or Link Inbox
@@ -848,6 +845,7 @@ export default function InstanceFormPanel({
             ) : null}
           </>
         ) : null}
+        <ConversationSettings form={form} setForm={setForm} busy={busy} />
         {isBalePlatform || form.platform_type_key === 'eitaa_pv_enterprise' || isInstagramPvPlatform || isTelegramPlatform ? (
           <div className="form-section-block">
             {isBalePvPlatform ? <h3>Bale PV deletion sync</h3> : null}

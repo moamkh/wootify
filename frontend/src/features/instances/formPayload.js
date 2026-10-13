@@ -103,10 +103,11 @@ export function createPayload(form, { patch = false } = {}) {
     chatwoot: {
       base_url: form.chatwoot_base_url?.trim() || undefined,
       account_id: Number(form.chatwoot_account_id) > 0 ? Number(form.chatwoot_account_id) : undefined,
-      inbox_id: form.platform_type_key === PLATFORM_BALE && Number(form.chatwoot_inbox_id) > 0 ? Number(form.chatwoot_inbox_id) : undefined,
-      inbox_name: form.platform_type_key === PLATFORM_BALE ? form.chatwoot_inbox_name?.trim() || undefined : undefined,
-      auto_create: form.platform_type_key === PLATFORM_BALE ? Boolean(form.chatwoot_auto_create) : false,
-      reopen_conversation: form.platform_type_key === PLATFORM_BALE ? Boolean(form.chatwoot_reopen_conversation) : false,
+      inbox_id: [PLATFORM_BALE, PLATFORM_TELEGRAM].includes(form.platform_type_key) && Number(form.chatwoot_inbox_id) > 0 ? Number(form.chatwoot_inbox_id) : undefined,
+      inbox_name: [PLATFORM_BALE, PLATFORM_TELEGRAM].includes(form.platform_type_key) ? form.chatwoot_inbox_name?.trim() || undefined : undefined,
+      auto_create: [PLATFORM_BALE, PLATFORM_TELEGRAM].includes(form.platform_type_key) ? Boolean(form.chatwoot_auto_create) : false,
+      reopen_conversation: Boolean(form.chatwoot_reopen_conversation),
+      reopen_conversation_by_inbox: { ...form.chatwoot_reopen_conversation_by_inbox },
     },
     proxy: {
       enabled: Boolean(form.proxy_enabled), protocol: form.proxy_protocol?.trim() || undefined,

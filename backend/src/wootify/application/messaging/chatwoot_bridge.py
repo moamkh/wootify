@@ -19,6 +19,7 @@ from typing import Any, Dict, List, Optional
 
 import httpx
 from sqlalchemy.exc import IntegrityError
+from sqlalchemy import or_
 from sqlalchemy.orm import Session
 
 from wootify.application.messaging.media_normalizer import MediaNormalizer
@@ -48,6 +49,7 @@ from wootify.infrastructure.persistence.repositories.message_mapping_repository 
 )
 from wootify.runtime_registry import get_runtime
 from wootify.application.messaging.conversation_mapping import ConversationMappingService
+from wootify.application.messaging.conversation_policy import reopen_enabled, select_conversation
 from wootify.application.shared.cache import TTLCache
 from wootify.infrastructure.security.crypto import encryptor
 from wootify.infrastructure.persistence.session import SessionLocal
@@ -131,6 +133,29 @@ class ChatwootBridgeService:
                 account_id=account_id,
                 event=event,
             )
+
+        # Retries/edits belong to the original ticket even after it was resolved.
+        # Check historical mappings before choosing or reopening a conversation.
+        platform_message_id = str(event.get("platform_message_id") or event.get("message_id") or "")
+        if platform_message_id and not event.get("service_notice"):
+            original = (db.query(MessageMapping).join(Conversation)
+                        .filter(Conversation.instance_id == instance.id,
+                                Conversation.platform_conversation_id == chat_id,
+                                or_(Conversation.chatwoot_inbox_id == str(inbox_id), Conversation.chatwoot_inbox_id.is_(None)),
+                                MessageMapping.platform_message_id == platform_message_id,
+                                MessageMapping.status == MessageStatus.sent).first())
+            if original:
+                original_conversation = db.get(Conversation, original.conversation_id)
+                original_id = int(original_conversation.chatwoot_conversation_id)
+                if str((original.platform_payload_json or {}).get("text") or "") != str(event.get("text") or "").strip():
+                    return await self._handle_platform_message_edit_as_reply(
+                        db=db, instance=instance, instance_key=instance_key, client=client,
+                        account_id=account_id, conversation_id=original_id,
+                        existing_mapping=original, new_text=str(event.get("text") or "").strip(),
+                        event=event, source_id=connector_registry.prefixed_source_id(platform_key, platform_message_id),
+                    )
+                return {"ok": True, "duplicate": True, "chatwoot_conversation_id": original_id,
+                        "chatwoot_message_id": original.chatwoot_message_id}
 
         # Proactively resolve group/channel titles if the name still looks generic.
         # This handles cases where the connector's title cache missed and the
@@ -340,6 +365,7 @@ class ChatwootBridgeService:
             inbox_id=inbox_id,
             contact_id=contact_id,
             chat_id=chat_id,
+            chatwoot_config=chatwoot_cfg,
         )
         try:
             conversation_id = int(conversation.chatwoot_conversation_id) if conversation.chatwoot_conversation_id else 0
@@ -1403,12 +1429,11 @@ class ChatwootBridgeService:
         inbox_id: int,
         contact_id: int,
         chat_id: str,
+        chatwoot_config: Optional[Dict[str, Any]] = None,
     ) -> Conversation:
-        """Find or create a Chatwoot conversation and mirror it locally.
-
-        Avoids reusing resolved/closed remote conversations; a resolved
-        conversation must trigger a new one so agent assignment starts fresh.
-        """
+        """Apply the latest inbox policy and preserve historical message mappings."""
+        config = chatwoot_config if chatwoot_config is not None else encryptor.decrypt_json(instance.chatwoot_config_encrypted)
+        reopen = reopen_enabled(config, inbox_id)
         existing = (
             db.query(Conversation)
             .filter(
@@ -1416,32 +1441,40 @@ class ChatwootBridgeService:
                 Conversation.platform_conversation_id == chat_id,
                 Conversation.is_active.is_(True),
                 Conversation.chatwoot_contact_id == str(contact_id),
+                or_(Conversation.chatwoot_inbox_id == str(inbox_id), Conversation.chatwoot_inbox_id.is_(None)),
             )
             .order_by(Conversation.updated_at.desc())
             .first()
         )
 
-        # Fast path: trust the local mapping and skip the remote conversations
-        # list call. Resolved/closed conversations are already marked inactive
-        # locally by the conversation_status_changed webhook handler, and a
-        # deleted remote conversation surfaces as a 404 when posting, which
-        # triggers the recreate path that refreshes this mapping.
-        if existing and existing.chatwoot_conversation_id:
-            return existing
-
-        # Try remote contact conversations in this inbox, skipping resolved/closed.
+        # Read remote status too: a missed resolution webhook must not silently
+        # reopen a ticket when the operator selected "new conversation".
         try:
             remote_convs = await client.list_contact_conversations(account_id, contact_id)
-            for item in self._extract_conversation_list(remote_convs):
-                if str(item.get("inbox_id")) == str(inbox_id):
-                    remote_status = str(item.get("status") or "").strip().lower()
-                    if remote_status in ("resolved", "closed"):
-                        continue
-                    conv_id = self._extract_id(item)
-                    if conv_id:
-                        return self._ensure_local_conversation(db, instance, chat_id, conv_id, contact_id, inbox_id)
-        except Exception:
-            pass
+        except httpx.HTTPStatusError as exc:
+            if existing and exc.response is not None and exc.response.status_code == 404:
+                return existing  # Posting invokes the existing deleted-contact recovery.
+            raise
+        rows = self._extract_conversation_list(remote_convs)
+        mapped = None
+        if existing:
+            mapped = next((row for row in rows if str(row.get("inbox_id")) == str(inbox_id)
+                           and str(row.get("id")) == str(existing.chatwoot_conversation_id)), None)
+        # Retain the previous 404-on-post recovery when a remote listing cannot
+        # identify the active mapping; it will recreate a truly deleted ticket.
+        if existing and not mapped:
+            return existing
+        selected = mapped
+        if not mapped or str(mapped.get("status")).strip().lower() in {"resolved", "closed", "1"}:
+            selected = select_conversation(rows, inbox_id, reopen)
+        if selected:
+            conv_id = self._extract_id(selected)
+            if conv_id:
+                if str(selected.get("status")).strip().lower() in {"resolved", "closed", "1"}:
+                    # Explicitly set open (not an implicit flip). On failure the
+                    # inbound delivery queue retries without posting the message.
+                    await client.toggle_conversation_status(account_id, int(conv_id), "open")
+                return self._ensure_local_conversation(db, instance, chat_id, conv_id, contact_id, inbox_id)
 
         created = await client.create_conversation(
             account_id,
@@ -1488,29 +1521,11 @@ class ChatwootBridgeService:
         chatwoot_contact_id: Any,
         chatwoot_inbox_id: Any,
     ) -> Conversation:
-        existing = (
-            db.query(Conversation)
-            .filter(
-                Conversation.instance_id == instance.id,
-                Conversation.platform_conversation_id == chat_id,
-            )
-            .first()
+        existing = ConversationMappingService().upsert(
+            db, instance_id=instance.id, platform_conversation_id=chat_id,
+            chatwoot_conversation_id=str(chatwoot_conversation_id),
+            chatwoot_contact_id=str(chatwoot_contact_id), chatwoot_inbox_id=str(chatwoot_inbox_id),
         )
-        if existing:
-            existing.is_active = True
-            existing.chatwoot_conversation_id = str(chatwoot_conversation_id)
-            existing.chatwoot_contact_id = str(chatwoot_contact_id)
-            existing.chatwoot_inbox_id = str(chatwoot_inbox_id)
-        else:
-            existing = Conversation(
-                instance_id=instance.id,
-                platform_conversation_id=chat_id,
-                chatwoot_conversation_id=str(chatwoot_conversation_id),
-                chatwoot_contact_id=str(chatwoot_contact_id),
-                chatwoot_inbox_id=str(chatwoot_inbox_id),
-                is_active=True,
-            )
-            db.add(existing)
         db.commit()
         db.refresh(existing)
         return existing

@@ -225,7 +225,8 @@ function defaultForm(features) {
     chatwoot_inbox_id: '',
     chatwoot_inbox_name: 'wootify-inbox',
     chatwoot_auto_create: false,
-    chatwoot_reopen_conversation: true,
+    chatwoot_reopen_conversation: false,
+    chatwoot_reopen_conversation_by_inbox: {},
     chatwoot_webhook_url: '',
     feature_overrides: featureMap,
   };
@@ -556,6 +557,7 @@ export default function App() {
       chatwoot_inbox_name: row.chatwoot?.inbox_name || 'wootify-inbox',
       chatwoot_auto_create: Boolean(row.chatwoot?.auto_create),
       chatwoot_reopen_conversation: Boolean(row.chatwoot?.reopen_conversation),
+      chatwoot_reopen_conversation_by_inbox: { ...row.chatwoot?.reopen_conversation_by_inbox },
       chatwoot_webhook_url: row.chatwoot?.webhook_url || '',
       feature_overrides: featureMap,
     });

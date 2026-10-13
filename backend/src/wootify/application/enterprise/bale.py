@@ -33,6 +33,7 @@ from wootify.application.enterprise import (
 )
 from wootify.infrastructure.chatwoot.client import ChatwootClient
 from wootify.application.messaging.contact_identity import contact_identity
+from wootify.application.messaging.conversation_policy import reopen_enabled
 from wootify.plugins.bale.novin_sms_client import NovinSmsClient
 from wootify.config import settings
 from wootify.connectors.registry import connector_registry
@@ -663,7 +664,7 @@ class EnterpriseBaleService:
         attachments = await self._extract_attachments(instance_key, message)
 
         command = self._normalize_command(text)
-        live_session = self._active_live_session_for_state(db, user)
+        live_session = self._active_live_session_for_state(db, user, runtime=runtime)
         if live_session:
             self._mark_user_present(db, live_session)
             handled = await self._handle_live_session_menu_input(
@@ -1836,6 +1837,10 @@ class EnterpriseBaleService:
         """Get the current unresolved session for a route or create a new one."""
         inbox_id = await self._ensure_route_inbox(db, runtime, route_key)
         session = self._sessions(db).get_unresolved_for_user_route(user.id, route_key)
+        if not session and reopen_enabled(runtime.chatwoot, inbox_id):
+            session = self._sessions(db).get_latest_for_user_route(user.id, route_key)
+        if session and str(session.chatwoot_inbox_id or "").strip() != str(inbox_id):
+            session = None
         if session:
             session = await self._resolve_reusable_route_session(db, runtime, session)
         if session and str(session.chatwoot_inbox_id or "").strip() == str(inbox_id):
@@ -1889,7 +1894,10 @@ class EnterpriseBaleService:
         session: EnterpriseBaleSession,
     ) -> EnterpriseBaleSession:
         """Resolve a usable route session before sending a customer message."""
-        reusable = await self._resolve_reusable_route_session(db, runtime, session)
+        inbox_id = await self._ensure_route_inbox(db, runtime, str(session.route_key or '').strip())
+        reusable = None
+        if str(session.chatwoot_inbox_id or '').strip() == str(inbox_id):
+            reusable = await self._resolve_reusable_route_session(db, runtime, session)
         if reusable is not None:
             return reusable
         replacement, _created_new = await self._get_or_open_route_session(
@@ -1906,14 +1914,27 @@ class EnterpriseBaleService:
         runtime: Any,
         session: EnterpriseBaleSession,
     ) -> Optional[EnterpriseBaleSession]:
-        """Return the session only if Chatwoot still reports it unresolved."""
-        if session.status == EnterpriseSessionStatus.resolved:
+        """Reuse an unresolved session, or reopen it under the current inbox policy."""
+        reopen = reopen_enabled(runtime.chatwoot, session.chatwoot_inbox_id)
+        if session.status == EnterpriseSessionStatus.resolved and not reopen:
             return None
 
         remote_status = await self._get_remote_route_session_status(runtime, session)
         if remote_status is None:
+            if session.status == EnterpriseSessionStatus.resolved:
+                raise RuntimeError('Cannot verify resolved Chatwoot conversation for reopening')
             return session
-        if remote_status != "resolved":
+        if remote_status not in {"resolved", "missing"}:
+            if session.status == EnterpriseSessionStatus.resolved:
+                session.status = EnterpriseSessionStatus.open
+                self._sessions(db).save(session)
+            return session
+        if remote_status == "resolved" and reopen:
+            client = self._get_chatwoot_client(runtime.chatwoot)
+            await client.toggle_conversation_status(int(runtime.chatwoot['account_id']), int(session.chatwoot_conversation_id), 'open')
+            session.status = EnterpriseSessionStatus.open
+            session.user_present = True
+            self._sessions(db).save(session)
             return session
 
         logger.info(
@@ -1946,7 +1967,7 @@ class EnterpriseBaleService:
             )
         except httpx.HTTPStatusError as exc:
             # A missing contact means Chatwoot no longer recognizes the stored
-            # route session. Returning "resolved" lets the existing recreation
+            # route session. Returning "missing" lets the existing recreation
             # path build a fresh contact/conversation pair on the next send.
             if self._is_missing_chatwoot_contact(exc.response):
                 logger.info(
@@ -1958,7 +1979,7 @@ class EnterpriseBaleService:
                     session.chatwoot_conversation_id,
                     session.route_key,
                 )
-                return "resolved"
+                return "missing"
             logger.exception(
                 "failed to list enterprise contact conversations instance=%s account_id=%s contact_id=%s",
                 runtime.instance.instance_key,
@@ -1985,7 +2006,7 @@ class EnterpriseBaleService:
             inbox_id=str(session.chatwoot_inbox_id or "").strip() or None,
         )
         if matched is None:
-            return "resolved"
+            return "missing"
         return self._normalize_chatwoot_status(matched.get("status")) or "open"
 
     def _find_remote_route_conversation(
@@ -2218,10 +2239,20 @@ class EnterpriseBaleService:
         _BALE_SESSION_POLICY.close_session(self._sessions, db, session)
 
     def _active_live_session_for_state(
-        self, db: Session, user: EnterpriseBaleUser
+        self, db: Session, user: EnterpriseBaleUser, *, runtime: Any = None
     ) -> Optional[EnterpriseBaleSession]:
         """Resolve the live session matching the user's current state."""
-        return _BALE_SESSION_POLICY.active_session(self._sessions, db, user)
+        session = _BALE_SESSION_POLICY.active_session(self._sessions, db, user)
+        if session or runtime is None:
+            return session
+        route_key = _BALE_SESSION_POLICY.route_by_state.get(user.current_state)
+        if route_key:
+            previous = self._sessions(db).get_latest_for_user_route(user.id, route_key)
+            if previous and previous.status == EnterpriseSessionStatus.resolved:
+                # The forwarding path either reopens or replaces this ticket;
+                # do not lose the customer's first message after resolution.
+                return previous
+        return None
 
     def _mark_user_present(self, db: Session, session: EnterpriseBaleSession) -> None:
         """Mark the user as present in a live session."""

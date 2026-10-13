@@ -94,6 +94,15 @@ For `telegram_enterprise` instances, `platform_metadata` includes:
 
 When `chatwoot.reopen_conversation` is `true`, inbound platform messages will reopen the mapped Chatwoot conversation if Chatwoot currently reports it as `resolved`.
 
+For independently configurable inboxes, set
+`chatwoot.reopen_conversation_by_inbox`, for example `{"57": true, "58": false}`.
+These overrides take precedence over `reopen_conversation`. They are editable
+anytime through `PATCH /instances/{instance_key}` and the instance editor's
+Conversation behavior section; no inbox recreation or migration is needed.
+The default is false (create a new ticket after resolution). Partial patches
+merge inbox settings instead of clearing other inboxes. See
+[the behavior and implementation details](features/inbox-conversation-reopen.md).
+
 ### `GET /instances/{instance_key}`
 
 Get a single instance by key.

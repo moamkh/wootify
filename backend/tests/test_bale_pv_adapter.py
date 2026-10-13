@@ -1610,10 +1610,10 @@ async def test_ingest_recovers_from_missing_conversation(db_session):
     assert client.create_conversation.await_count == 1
     assert client.post_message.await_count == 2
 
-    # The local mapping row should be updated to the new conversation id and remain active.
+    # The new ticket is active; retain the historical mapping for old replies/deletes.
     conv = (
         db_session.query(Conversation)
-        .filter_by(instance_id=instance.id, platform_conversation_id="770408072")
+        .filter_by(instance_id=instance.id, platform_conversation_id="770408072", is_active=True)
         .first()
     )
     assert conv is not None
@@ -3197,8 +3197,10 @@ async def test_ingest_recovers_when_remote_contact_deleted(db_session):
     client.create_contact.assert_awaited_once()
     assert client.create_conversation.await_count == 2
     assert client.post_message.await_count == 2
-    # The same local row is re-pointed at the fresh remote objects.
+    # Preserve the old mapping and activate a separate row for the new ticket.
     db_session.refresh(conversation)
-    assert conversation.is_active is True
-    assert conversation.chatwoot_conversation_id == "71"
-    assert conversation.chatwoot_contact_id == "99"
+    assert conversation.is_active is False
+    assert conversation.chatwoot_conversation_id == "70"
+    replacement = db_session.query(Conversation).filter_by(instance_id=instance.id, is_active=True).one()
+    assert replacement.chatwoot_conversation_id == "71"
+    assert replacement.chatwoot_contact_id == "99"
