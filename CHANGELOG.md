@@ -1,5 +1,29 @@
 # Changelog
 
+## 7.1.2 — 2026-10-14
+
+- Add an editable per-inbox **Reopen resolved conversation** setting. Apply
+  saved changes to the next incoming message without recreating the inbox,
+  restarting the connector, or logging in again. Default to creating a new
+  conversation; respect existing saved legacy settings.
+- Honor the policy in Bale PV, Eitaa PV, Instagram PV, standard Bale/Telegram
+  bot bridges, and separate enterprise Bale/Telegram route inboxes. Fix the
+  adapter path that previously ignored the reopen setting, and the Telegram
+  editor payload that discarded inbox fields/settings.
+- Preserve historical conversation/message mappings when starting a new ticket,
+  instead of moving old messages to the replacement. Delayed duplicate events
+  and edits target the original ticket and cannot reopen/create another one.
+- Verify remote status even if a resolution webhook was missed. Reopen explicitly
+  as `open`; retain delivery retry behavior when that request fails. Distinguish
+  missing enterprise tickets from resolved tickets and protect relinked routes.
+- Include the committed 7.1.1 Eitaa hotfixes: renew expired authentication tokens
+  when possible without a new phone login, and map replies to any file/image in
+  an outgoing attachment batch back to its original Chatwoot message.
+- Preserve Chatwoot/WhatsApp contact identifiers, credentials, sessions, and
+  inbox configurations. No schema migration or dependency change is introduced.
+- Verify 479 backend/protocol tests, frontend conversation-setting checks,
+  authentication/API-origin checks, and per-server frontend builds.
+
 ## 7.1.1 — 2026-10-11
 
 - Correct Bale PV forwarded-message parsing so forwarded files are delivered
