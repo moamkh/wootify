@@ -2,7 +2,7 @@
 
 Covers:
 - messaging_client: send_message/send_document await the SendMessage ack
-  (send_request) and degrade gracefully on ack timeout.
+  (send_request) and reject unconfirmed delivery on ack timeout.
 - dialog_parser.parse_send_message_response: tolerant rid/date extraction.
 - BalePvConnector: send_text/send_media return the rid and enqueue a
   synthetic outgoing echo into runtime.message_queue when mirror_echo=True.
@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import asyncio
 import json
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import ANY, AsyncMock, MagicMock, patch
 
 import pytest
 from sqlalchemy import create_engine
@@ -23,6 +23,7 @@ from sqlalchemy.pool import StaticPool
 
 from bale_pv_connector.dialog_parser import parse_send_message_response
 from bale_pv_connector.messaging_client import BaleMessagingClient
+from bale_pv_connector.exceptions import BaleRequestUnconfirmedError
 from bale_pv_connector.protobuf_wire import ProtobufMessage
 
 from wootify.adapters.bale_pv import BalePvAdapter
@@ -160,11 +161,11 @@ async def test_send_message_awaits_ack():
 
 
 @pytest.mark.anyio
-async def test_send_message_ack_timeout_returns_none():
+async def test_send_message_ack_timeout_is_unconfirmed():
     client = BaleMessagingClient(jwt_token="t")
     client.ws = _FakeWs(error=TimeoutError("timeout"))
-    result = await client.send_message(peer_id=12345, text="hi")
-    assert result is None
+    with pytest.raises(BaleRequestUnconfirmedError):
+        await client.send_message(peer_id=12345, text="hi")
 
 
 @pytest.mark.anyio
@@ -270,18 +271,15 @@ async def test_connector_send_text_mirror_disabled():
 
 
 @pytest.mark.anyio
-async def test_connector_send_text_ack_timeout_still_mirrors_with_fallback_rid():
+async def test_connector_send_text_missing_ack_does_not_fabricate_echo():
     connector = BalePvConnector()
     runtime = _make_runtime("echo-fallback")
     runtime.client = _FakeMessagingClient(ack=None)  # server never answered
     connector._instances["echo-fallback"] = runtime
 
-    result = await connector.send_text("echo-fallback", "12345", "salam")
-    rid = result["result"]["rid"]
-    assert isinstance(rid, int) and rid > 0  # random fallback
-    update = runtime.message_queue.get_nowait()
-    assert update["update_id"] == rid
-    assert update["message"]["_outgoing"] is True
+    with pytest.raises(BaleRequestUnconfirmedError):
+        await connector.send_text("echo-fallback", "12345", "salam")
+    assert runtime.message_queue.empty()
 
 
 def test_enqueue_outgoing_echo_voice_media_shape():
@@ -399,6 +397,16 @@ def _make_conversation(db, instance, peer_id="12345", cw_conv="77", cw_contact="
     return conv
 
 
+def _confirmed_send(rid: int):
+    """Model the adapter contract, including its durable pre-dispatch hook."""
+    async def send(_peer_id, _content, *, before_dispatch, **_options):
+        await before_dispatch(rid)
+        return {"ok": True, "confirmed": True, "result": {
+            "ok": True, "result": {"rid": rid, "date": 1, "delivery_confirmed": True}
+        }}
+    return send
+
+
 @pytest.mark.anyio
 async def test_webhook_send_persists_outbound_mapping(db):
     """A webhook-originated send must link the Chatwoot message id to the
@@ -408,8 +416,10 @@ async def test_webhook_send_persists_outbound_mapping(db):
     rid = 2**62 + 100
     adapter = MagicMock()
     adapter.send_text = AsyncMock(
-        return_value={"ok": True, "result": {"ok": True, "result": {"rid": rid, "date": 1}}}
+        side_effect=_confirmed_send(rid)
     )
+    adapter.prepare_outbound = AsyncMock()
+    adapter.finish_outbound = AsyncMock()
     runtime = MagicMock()
     runtime.platform_type = "bale_pv_enterprise"
     runtime.status = "open"
@@ -439,7 +449,11 @@ async def test_webhook_send_persists_outbound_mapping(db):
             result = await chatwoot_bridge.handle_chatwoot_webhook(db, "bale-pv-outmap", payload)
 
     assert result["ok"] is True
-    adapter.send_text.assert_awaited_once_with("12345", "Hello", reply_to=None, mirror_echo=False)
+    adapter.send_text.assert_awaited_once_with(
+        "12345", "Hello", reply_to=None, mirror_echo=False,
+        idempotency_key="bale-pv-outmap:77:900:text", before_dispatch=ANY,
+    )
+    assert callable(adapter.send_text.await_args.kwargs["before_dispatch"])
 
     mapping = (
         db.query(MessageMapping)
@@ -451,6 +465,10 @@ async def test_webhook_send_persists_outbound_mapping(db):
     assert mapping.direction == MessageDirection.chatwoot_to_platform
     assert mapping.status == MessageStatus.sent
     assert (mapping.platform_payload_json or {}).get("text") == "Hello"
+    delivery = mapping.platform_payload_json["bale_delivery"]
+    assert delivery["receipts"] == {"text": str(rid)}
+    assert delivery["inflight"] == {}
+    assert delivery["complete"] is True
 
 
 @pytest.mark.anyio
@@ -460,8 +478,10 @@ async def test_webhook_media_delivery_is_deduplicated_and_deletable(db):
     rid = 2**62 + 102
     adapter = MagicMock()
     adapter.send_media = AsyncMock(
-        return_value={"ok": True, "result": {"ok": True, "result": {"rid": rid}}}
+        side_effect=_confirmed_send(rid)
     )
+    adapter.prepare_outbound = AsyncMock()
+    adapter.finish_outbound = AsyncMock()
     adapter.delete_message = AsyncMock(return_value={"ok": True})
     runtime = MagicMock()
     runtime.platform_type = "bale_pv_enterprise"
@@ -509,7 +529,12 @@ async def test_webhook_media_delivery_is_deduplicated_and_deletable(db):
                 },
             )
 
-    adapter.send_media.assert_awaited_once()
+    adapter.send_media.assert_awaited_once_with(
+        "12345", "https://chatvand.test/files/44", filename="voice.ogg",
+        caption=None, reply_to=None, mirror_echo=False,
+        idempotency_key="bale-pv-media-map:78:901:media:44", before_dispatch=ANY,
+    )
+    assert callable(adapter.send_media.await_args.kwargs["before_dispatch"])
     assert duplicate["reason"] == "duplicate_delivery"
     assert deleted["status"] == "delete_propagated"
     adapter.delete_message.assert_awaited_once_with(peer_id="12345", message_id=str(rid))
@@ -529,7 +554,7 @@ async def test_outbound_mapping_makes_echo_dedup(db):
         instance=instance,
         peer_id="12345",
         chatwoot_message_id=900,
-        sent=[{"ok": True, "result": {"ok": True, "result": {"rid": rid}}}],
+        sent=[{"ok": True, "confirmed": True, "result": {"ok": True, "result": {"rid": rid, "delivery_confirmed": True}}}],
         text="hello",
         message_kind=MessageKind.text,
     )

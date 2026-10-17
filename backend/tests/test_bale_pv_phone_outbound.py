@@ -55,11 +55,17 @@ class _FakeAdapter:
         self.resolved_phones.append(phone)
         return {'id': 555000111, 'access_hash': '998877', 'name': 'Ali Test'}
 
-    async def send_text(self, peer_id, content, reply_to=None, mirror_echo=True):
+    async def send_text(
+        self, peer_id, content, reply_to=None, mirror_echo=True,
+        *, idempotency_key=None, before_dispatch=None,
+    ):
         if self.send_error is not None:
             raise self.send_error
+        rid = 2**62 + len(self.sent_texts) + 1
+        if before_dispatch is not None:
+            await before_dispatch(rid)
         self.sent_texts.append({'peer_id': peer_id, 'content': content, 'reply_to': reply_to})
-        return {'ok': True}
+        return {'ok': True, 'confirmed': True, 'result': {'rid': rid}}
 
 
 class _FakeClient:
@@ -67,6 +73,14 @@ class _FakeClient:
         self.base_url = 'http://chatwoot'
         self.posted_messages = []
         self.updated_contacts = []
+        self.message_statuses = []
+
+    async def update_message_status(self, account_id, conversation_id, message_id, **data):
+        self.message_statuses.append({
+            'account_id': account_id, 'conversation_id': conversation_id,
+            'message_id': message_id, **data,
+        })
+        return {'id': message_id}
 
     async def post_message(self, account_id, conversation_id, data):
         self.posted_messages.append(
@@ -96,6 +110,7 @@ def _service(monkeypatch, db, adapter, client, instance):
 def _payload(phone='09123456789'):
     return {
         'event': 'message_created',
+        'id': 9010,
         'message_type': 'outgoing',
         'content': 'hello there',
         'conversation': {

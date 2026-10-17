@@ -234,40 +234,124 @@ async def test_batch_reply_never_borrows_parent_from_another_conversation(db_ses
 
 
 @pytest.mark.anyio
-async def test_media_batch_retry_sends_only_remaining_caption(db_session):
+@pytest.mark.parametrize("media_count", [1, 2, 5])
+async def test_media_batch_retry_sends_only_remaining_caption(committed_db, media_count):
+    db_session = committed_db
     i, conv = setup(db_session)
     order = []
     async def media(*args, **kwargs):
         order.append(kwargs["filename"])
         assert kwargs["caption"] is None
-        return {"ok":True,"result":{"message_id":str(len(order))}}
+        random_id = EitaaPvConnector._send_random_id(kwargs["idempotency_key"])
+        if kwargs.get("before_dispatch") is not None:
+            await kwargs["before_dispatch"](random_id)
+        return {"ok":True,"confirmed":True,"result":{"message_id":str(len(order)),"random_id":random_id}}
     async def text(*args, **kwargs):
         order.append("text")
         if order.count("text") == 1:
             raise RuntimeError("temporary failure")
-        return {"ok":True,"result":{"message_id":"3"}}
+        random_id = EitaaPvConnector._send_random_id(kwargs["idempotency_key"])
+        if kwargs.get("before_dispatch") is not None:
+            await kwargs["before_dispatch"](random_id)
+        return {"ok":True,"confirmed":True,"result":{"message_id":str(media_count + 1),"random_id":random_id}}
     adapter = SimpleNamespace(send_media=AsyncMock(side_effect=media),send_text=AsyncMock(side_effect=text))
-    runtime = SimpleNamespace(adapter=adapter)
+    runtime = SimpleNamespace(platform_type="eitaa_pv_enterprise",adapter=adapter)
     service = ChatwootBridgeService()
+    client = AsyncMock()
     payload = {"id":9001,"conversation":{"id":2836}}
-    attachments = [{"id":1,"data_url":"http://files/1.jpg"},{"id":2,"data_url":"http://files/2.pdf"}]
+    extensions = ["jpg", "pdf", "ogg", "mp4", "docx"][:media_count]
+    attachments = [{"id":index + 1,"data_url":f"http://files/{index + 1}.{extension}"}
+                   for index, extension in enumerate(extensions)]
+    filenames = [f"file.{extension}" for extension in extensions]
     async def send():
-        return await service._send_eitaa_attachment_batch(db_session,i,runtime,"42",payload,attachments,
-            content="caption",reply_to="6",chatwoot_cfg={})
+        return await service._confirmed_outbound.deliver(
+            db_session,i,runtime,client,{"account_id":3,"inbox_id":57,"base_url":"http://chatwoot"},"42",payload,
+            content="caption",attachments=attachments,reply_to="6")
     with pytest.raises(RuntimeError,match="temporary failure"):
         await send()
-    assert order == ["file.jpg","file.pdf","text"]
+    assert order == [*filenames,"text"]
     assert service._is_duplicate_outbound_delivery(db_session,instance=i,peer_id="42",payload=payload,content="caption",is_template_or_bot=False) is None
     await send()
-    assert order == ["file.jpg","file.pdf","text","text"]
-    assert adapter.send_media.await_count == 2
+    assert order == [*filenames,"text","text"]
+    assert adapter.send_media.await_count == media_count
     assert adapter.send_text.await_args_list[0].kwargs["idempotency_key"] == adapter.send_text.await_args_list[1].kwargs["idempotency_key"]
     assert service._is_duplicate_outbound_delivery(db_session,instance=i,peer_id="42",payload=payload,content="caption",is_template_or_bot=False)
     mappings = db_session.query(MessageMapping).all()
-    assert len(mappings) == 3
+    assert len(mappings) == media_count + 1
     assert all(m.platform_payload_json["delivery_complete"] for m in mappings)
-    assert [m.platform_payload_json["text"] for m in mappings] == ["","","caption"]
-    assert next(m for m in mappings if m.chatwoot_message_id == "9001").platform_payload_json["batch_part"] == "text"
+    parts = {m.platform_payload_json["batch_part"]:m for m in mappings}
+    assert set(parts) == {"text", *(f"media:{index + 1}" for index in range(media_count))}
+    assert parts["text"].platform_payload_json["text"] == "caption"
+    assert parts["text"].chatwoot_message_id == "9001"
+    assert parts["text"].platform_message_id == str(media_count + 1)
+    assert all(parts[f"media:{index + 1}"].chatwoot_message_id is None for index in range(media_count))
+    assert all(parts[f"media:{index + 1}"].platform_payload_json["text"] == "" for index in range(media_count))
+    assert client.update_message_status.await_args.kwargs["status"] == "sent"
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("caption_already_sent", [False, True])
+async def test_legacy_eitaa_batch_upgrade_keeps_receipts_and_caption_parent(
+    committed_db, monkeypatch, caption_already_sent,
+):
+    """An upgrade imports old per-part ACKs without uploading files again."""
+    import wootify.application.messaging.chatwoot_bridge as module
+
+    db_session = committed_db
+    i, conv = setup(db_session)
+    for part, message_id in [("media:1", "92"), ("media:2", "93")]:
+        db_session.add(MessageMapping(
+            conversation_id=conv.id,direction=MessageDirection.chatwoot_to_platform,
+            message_kind=MessageKind.media,status=MessageStatus.sent,
+            platform_message_id=message_id,
+            chatwoot_message_id="9001" if part == "media:1" and not caption_already_sent else None,
+            platform_payload_json={"text":"","batch_message_id":"9001","batch_part":part,
+                                   "delivery_complete":caption_already_sent},
+        ))
+    if caption_already_sent:
+        db_session.add(MessageMapping(
+            conversation_id=conv.id,direction=MessageDirection.chatwoot_to_platform,
+            message_kind=MessageKind.text,status=MessageStatus.sent,
+            platform_message_id="94",chatwoot_message_id="9001",
+            platform_payload_json={"text":"caption","batch_message_id":"9001","batch_part":"text",
+                                   "delivery_complete":True},
+        ))
+    db_session.commit()
+    client = AsyncMock()
+    client.base_url = "http://chatwoot"
+
+    async def send_text(peer_id, content, **options):
+        assert peer_id == "42" and content == "caption"
+        assert options["idempotency_key"] == "tester:42:9001:text"
+        random_id = EitaaPvConnector._send_random_id(options["idempotency_key"])
+        await options["before_dispatch"](random_id)
+        return {"ok":True,"confirmed":True,"result":{"message_id":"94","random_id":random_id}}
+
+    adapter = SimpleNamespace(send_text=AsyncMock(side_effect=send_text),send_media=AsyncMock())
+    runtime = SimpleNamespace(status="open",platform_type="eitaa_pv_enterprise",adapter=adapter)
+    service = ChatwootBridgeService()
+    monkeypatch.setattr(module,"get_runtime",lambda _:runtime)
+    monkeypatch.setattr(service,"_chatwoot_client_for_instance",
+                        lambda *_:(i,{"account_id":3,"inbox_id":57,"base_url":"http://chatwoot"},client))
+    payload = {"event":"message_created","id":9001,"message_type":"outgoing","content":"caption",
+               "attachments":[{"id":1,"data_url":"http://files/1.jpg"},
+                              {"id":2,"data_url":"http://files/2.pdf"}],
+               "conversation":{"id":2836,"inbox_id":57,"meta":{"sender":{"id":4004}},"messages":[]}}
+
+    result = await service.handle_chatwoot_webhook(db_session,"tester",payload)
+
+    assert result["ok"] is True
+    adapter.send_media.assert_not_awaited()
+    assert adapter.send_text.await_count == (0 if caption_already_sent else 1)
+    mappings = db_session.query(MessageMapping).all()
+    assert len(mappings) == 3
+    canonical = next(row for row in mappings if row.chatwoot_message_id == "9001")
+    assert canonical.platform_message_id == "94"
+    assert canonical.platform_payload_json["batch_part"] == "text"
+    state = service._confirmed_outbound.state(canonical)
+    assert state["complete"] is True
+    assert state["receipts"] == {"media:1":"92","media:2":"93","text":"94"}
+    assert client.update_message_status.await_args.kwargs["status"] == "sent"
 
 
 @pytest.mark.anyio
@@ -338,7 +422,14 @@ async def test_failed_eitaa_send_marks_red_and_retry_marks_sent(committed_db, mo
     client.base_url = "http://chatwoot"
     ContactMappingRepository(db_session).save(i.id,"42","4004",chatwoot_scope=contact_scope(client,3))
     db_session.commit()
-    adapter = SimpleNamespace(send_text=AsyncMock(side_effect=[RuntimeError("network unavailable"),{"ok":True,"result":{"message_id":"8"}}]))
+    async def send_text(peer_id, content, **options):
+        if adapter.send_text.await_count == 1:
+            raise RuntimeError("network unavailable")
+        random_id = EitaaPvConnector._send_random_id(options["idempotency_key"])
+        if options.get("before_dispatch") is not None:
+            await options["before_dispatch"](random_id)
+        return {"ok":True,"confirmed":True,"result":{"message_id":"8","random_id":random_id}}
+    adapter = SimpleNamespace(send_text=AsyncMock(side_effect=send_text))
     runtime = SimpleNamespace(status="open",platform_type="eitaa_pv_enterprise",adapter=adapter)
     monkeypatch.setattr(module,"get_runtime",lambda _:runtime)
     service = ChatwootBridgeService()

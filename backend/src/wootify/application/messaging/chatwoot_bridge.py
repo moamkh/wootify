@@ -33,6 +33,7 @@ from wootify.infrastructure.chatwoot.client import ChatwootClient
 from wootify.connectors.registry import connector_registry
 from wootify.infrastructure.persistence.models import (
     BalePvPhoneResolvedUser,
+    ChatwootWebhookDelivery,
     Conversation,
     Instance,
     MessageDirection,
@@ -50,6 +51,10 @@ from wootify.infrastructure.persistence.repositories.message_mapping_repository 
 from wootify.runtime_registry import get_runtime
 from wootify.application.messaging.conversation_mapping import ConversationMappingService
 from wootify.application.messaging.conversation_policy import reopen_enabled, select_conversation
+from wootify.application.messaging.confirmed_outbound_delivery import (
+    ConfirmedOutboundDelivery, CONFIRMED_DELIVERY_PLATFORMS, DeliveryStatusSyncError,
+    FailureNoteScanPending, definitely_not_accepted, delivery_retry_after, safe_delivery_retry,
+)
 from wootify.application.shared.cache import TTLCache
 from wootify.infrastructure.security.crypto import encryptor
 from wootify.infrastructure.persistence.session import SessionLocal
@@ -69,6 +74,8 @@ class ChatwootBridgeService:
         # outgoing message. Successful sends are covered by their persisted
         # mapping; failures need this guard to avoid duplicate private notes.
         self._delivery_failure_notes: TTLCache[bool] = TTLCache(maxsize=5000, ttl=3600)
+        self._confirmed_outbound = ConfirmedOutboundDelivery(self)
+        self._bale_outbound = self._confirmed_outbound  # compatibility for existing callers/tests
 
     async def ingest_platform_event(
         self,
@@ -93,6 +100,8 @@ class ChatwootBridgeService:
         if not inbox_id:
             return {"ok": False, "detail": "chatwoot_inbox_id_missing"}
 
+        if event.get('delivery_confirmation') and str(getattr(instance.platform_type, 'key', '')) == 'eitaa_pv_enterprise':
+            return await self._confirmed_outbound.reconcile_eitaa_confirmation(db, instance, client, chatwoot_cfg, event)
         chat_id = str(event["chat_id"])
         chat_type = str(event.get("chat_type") or "private").lower()
         from_name = str(event.get("from_name") or "").strip() or chat_id
@@ -133,6 +142,11 @@ class ChatwootBridgeService:
                 account_id=account_id,
                 event=event,
             )
+
+        if platform_key == 'bale_pv_enterprise' and event.get('outgoing'):
+            reconciled = await self._bale_outbound.reconcile_echo(db, instance, client, chatwoot_cfg, event)
+            if reconciled is not None:
+                return reconciled
 
         # Retries/edits belong to the original ticket even after it was resolved.
         # Check historical mappings before choosing or reopening a conversation.
@@ -557,6 +571,25 @@ class ChatwootBridgeService:
         account_id = int(chatwoot_cfg["account_id"])
 
         event = str(payload.get("event") or "").strip().lower()
+        # Cleanup broadcasts for private failure notes are not platform edits.
+        if payload.get('private') is True:
+            return {'ok': True, 'ignored': True, 'reason': 'private_message', 'detail': 'private_message'}
+        if str(getattr(instance.platform_type, 'key', '') or '') in CONFIRMED_DELIVERY_PLATFORMS:
+            payload = {**payload, '_wootify_instance_key': instance_key}
+            receipt = self._bale_outbound.mapping(db, instance, payload)
+            if event == 'message_created' and receipt and self._bale_outbound.state(receipt).get('cancelled'):
+                return {'ok': True, 'ignored': True, 'reason': 'outgoing_delivery_cancelled'}
+            # A failed status/note HTTP request is bookkeeping, not permission
+            # to repeat a permanent or potentially dispatched platform send.
+            failure = payload.get('_wootify_terminal_failure')
+            if event == 'message_created' and isinstance(failure, dict):
+                async def report_terminal_failure() -> None:
+                    await self._notify_delivery_failure(client, account_id, payload, failure.get('peer_id'),
+                        RuntimeError(str(failure.get('error') or 'Platform delivery failed')),
+                        platform_type=instance.platform_type, db=db)
+                if await self._bale_outbound.report_failure_or_confirm(db, instance, client, chatwoot_cfg, payload, report_terminal_failure):
+                    return {'ok': True, 'confirmation_reconciled': True}
+                return {'ok': False, 'detail': failure.get('error'), 'retryable': False}
         # Guard all outbound operations, including after reporting is disabled.
         from wootify.application.messaging.connector_status import STATUS_PEER
         status_conversation_id = MessagePayloadParser.extract_conversation_id(payload)
@@ -640,6 +673,8 @@ class ChatwootBridgeService:
         attachments = self._unique_chatwoot_attachments(
             self._extract_chatwoot_attachments(payload)
         )
+        if str(getattr(instance.platform_type, 'key', '') or '') == 'eitaa_pv_enterprise':
+            self._confirmed_outbound.import_eitaa_legacy(db, instance, payload, content, attachments)
         if not content and not attachments:
             error = RuntimeError(
                 "empty_outgoing_message: Chatwoot supplied neither text nor attachments"
@@ -657,8 +692,16 @@ class ChatwootBridgeService:
                 None,
                 error,
                 platform_type=getattr(instance, "platform_type", None),
+                db=db,
             )
             return {"ok": False, "detail": "empty_outgoing_message"}
+
+        if str(getattr(instance.platform_type, 'key', '') or '') in CONFIRMED_DELIVERY_PLATFORMS:
+            receipt = self._bale_outbound.mapping(db, instance, payload)
+            if receipt and self._bale_outbound.state(receipt).get('complete') is True:
+                # Status/note synchronization does not need a live Bale socket.
+                await self._bale_outbound.finalize(db, instance, client, chatwoot_cfg, payload, receipt)
+                return {'ok': True, 'ignored': True, 'reason': 'duplicate_delivery', 'detail': 'chatwoot_message_already_delivered'}
 
         runtime = get_runtime(instance_key)
         if not runtime or runtime.status != "open":
@@ -669,8 +712,11 @@ class ChatwootBridgeService:
                 None,
                 RuntimeError("instance_not_connected"),
                 platform_type=getattr(instance, "platform_type", None),
+                db=db,
+                retryable=True,
             )
-            return {"ok": False, "detail": "instance_not_connected"}
+            return {"ok": False, "detail": "instance_not_connected", "retryable":
+                    str(getattr(instance.platform_type, 'key', '') or '') in CONFIRMED_DELIVERY_PLATFORMS}
 
         sender = self._extract_chatwoot_sender(payload)
         identifier = sender.get("identifier")
@@ -773,7 +819,7 @@ class ChatwootBridgeService:
             db.commit()
         except Exception as exc:
             db.rollback()
-            await self._notify_delivery_failure(client, account_id, payload, peer_id, exc, platform_type=runtime.platform_type)
+            await self._notify_delivery_failure(client, account_id, payload, peer_id, exc, platform_type=runtime.platform_type, db=db)
             return {"ok": False, "detail": "contact_mapping_conflict"}
 
         if not peer_id:
@@ -784,6 +830,7 @@ class ChatwootBridgeService:
                 None,
                 RuntimeError("recipient_not_resolvable: no instance-owned mapping or verified platform phone number"),
                 platform_type=runtime.platform_type,
+                db=db,
             )
             return {"ok": False, "detail": "peer_id_not_found"}
 
@@ -884,6 +931,12 @@ class ChatwootBridgeService:
                     instance_key,
                     dup_reason,
                 )
+                if runtime.platform_type in CONFIRMED_DELIVERY_PLATFORMS:
+                    receipt = self._bale_outbound.mapping(db, instance, payload)
+                    if receipt and self._bale_outbound.state(receipt).get('complete') is True:
+                        await self._bale_outbound.finalize(db, instance, client, chatwoot_cfg, payload, receipt)
+                    elif payload.get('wootify_retry') is True:
+                        raise RuntimeError('legacy_send_confirmation_missing: verify the existing platform message before resending')
                 return {
                     "ok": True,
                     "ignored": True,
@@ -933,11 +986,9 @@ class ChatwootBridgeService:
                     peer_type = get_peer_type(str(peer_id)) or peer_type
 
             sent: List[Dict[str, Any]] = []
-            if attachments and runtime.platform_type == "eitaa_pv_enterprise":
-                sent = await self._send_eitaa_attachment_batch(
-                    db, instance, runtime, peer_id, payload, attachments,
-                    content=content, reply_to=reply_to, chatwoot_cfg=chatwoot_cfg,
-                )
+            if runtime.platform_type in CONFIRMED_DELIVERY_PLATFORMS:
+                sent = await self._bale_outbound.deliver(db, instance, runtime, client, chatwoot_cfg, peer_id, payload,
+                    content=content, attachments=attachments, reply_to=reply_to)
             elif attachments and isinstance(attachments, list):
                 for att in attachments:
                     data_url = att.get("data_url") if isinstance(att, dict) else None
@@ -1007,7 +1058,7 @@ class ChatwootBridgeService:
             # resolve agent messages to Bale rids.
             try:
                 outbound_message_id = self._extract_id(payload) or self._extract_id(message_obj)
-                if not (attachments and runtime.platform_type == "eitaa_pv_enterprise"):
+                if runtime.platform_type not in CONFIRMED_DELIVERY_PLATFORMS:
                     self._persist_outbound_mappings(
                         db,
                         instance=instance,
@@ -1037,6 +1088,7 @@ class ChatwootBridgeService:
                     "chatwoot_bridge.outbound_delivery_rollback_failed instance=%s",
                     instance_key,
                 )
+            retryable = safe_delivery_retry(exc)
             # Delivery runs in a background task (the webhook was already
             # acked), so surface the failure to agents as a private note on
             # the conversation instead of failing silently.
@@ -1054,88 +1106,30 @@ class ChatwootBridgeService:
                     sendability="denied",
                     restriction_reason="PermissionDenied",
                 )
-            await self._notify_delivery_failure(
-                client,
-                account_id,
-                payload,
-                peer_id,
-                exc,
-                platform_type=runtime.platform_type,
-            )
+            async def report_failure() -> None:
+                if runtime.platform_type in CONFIRMED_DELIVERY_PLATFORMS and definitely_not_accepted(exc):
+                    receipt = self._bale_outbound.mapping(db, instance, payload)
+                    if receipt is not None:
+                        checkpoint = self._bale_outbound.state(receipt)
+                        checkpoint['inflight'] = {}
+                        self._bale_outbound.save(db, receipt, checkpoint)
+                await self._notify_delivery_failure(client, account_id, payload, peer_id, exc,
+                    platform_type=runtime.platform_type, db=db, retryable=retryable)
+
+            if runtime.platform_type in CONFIRMED_DELIVERY_PLATFORMS:
+                if await self._bale_outbound.report_failure_or_confirm(db, instance, client, chatwoot_cfg, payload, report_failure):
+                    return {'ok': True, 'peer_id': peer_id, 'confirmation_reconciled': True}
+            else:
+                await report_failure()
             return {
                 "ok": False,
                 "message": "delivery_failed",
                 "detail": f"{type(exc).__name__}: {exc}"[:300],
+                "retryable": retryable,
+                'retry_after_seconds': delivery_retry_after(exc) if retryable else None,
             }
 
-        source_message_id = self._extract_id(payload) or self._extract_id(message_obj)
-        if runtime.platform_type == "eitaa_pv_enterprise" and source_message_id and chatwoot_conversation_id:
-            try:
-                await client.update_message_status(account_id, int(chatwoot_conversation_id), int(source_message_id), status="sent", external_error="")
-            except Exception:
-                logger.warning("chatwoot_bridge.sent_status_update_failed instance=%s message_id=%s", instance_key, source_message_id, exc_info=True)
         return {"ok": True, "peer_id": peer_id, "sent": sent}
-
-    async def _send_eitaa_attachment_batch(
-        self, db: Session, instance: Instance, runtime: Any, peer_id: str,
-        payload: Dict[str, Any], attachments: list[dict[str, Any]], *,
-        content: str, reply_to: Optional[str], chatwoot_cfg: Dict[str, Any],
-    ) -> List[Dict[str, Any]]:
-        """Send files first, then text once; checkpoint each ACK for safe retries."""
-        message_id = str(MessagePayloadParser.extract_message_id(payload) or "")
-        conversation_id = str(MessagePayloadParser.extract_conversation_id(payload) or "")
-        conversation = db.query(Conversation).filter_by(instance_id=instance.id, chatwoot_conversation_id=conversation_id).one()
-        rows = db.query(MessageMapping).filter_by(conversation_id=conversation.id, direction=MessageDirection.chatwoot_to_platform).all()
-        completed = {(row.platform_payload_json or {}).get("batch_part"): row for row in rows
-                     if (row.platform_payload_json or {}).get("batch_message_id") == message_id}
-        plan = [(f"media:{att.get('id') or index}", att) for index, att in enumerate(attachments)]
-        if content:
-            plan.append(("text", None))
-        sent = []
-        for part, att in plan:
-            if part in completed:
-                sent.append({"ok": True, "result": {"message_id": completed[part].platform_message_id}})
-                continue
-            await self._prepare_adapter_outbound(runtime.adapter, peer_id)
-            try:
-                if att is None:
-                    result = await runtime.adapter.send_text(peer_id, content, reply_to=reply_to, mirror_echo=False,
-                        idempotency_key=f"{instance.instance_key}:{peer_id}:{message_id}:{part}")
-                else:
-                    url = att.get("data_url") or att.get("file_url")
-                    if not url:
-                        raise RuntimeError("eitaa_attachment_missing_download_url")
-                    if isinstance(url, str) and url.startswith("/"):
-                        url = f"{str(chatwoot_cfg.get('base_url') or '').rstrip('/')}{url}"
-                    result = await runtime.adapter.send_media(peer_id, url, filename=self._attachment_filename(att, url),
-                        caption=None, reply_to=reply_to, mirror_echo=False,
-                        idempotency_key=f"{instance.instance_key}:{peer_id}:{message_id}:{part}")
-                rid = self._extract_platform_rid(result)
-                if not rid or result.get("ok") is False:
-                    raise RuntimeError("eitaa_send_not_acknowledged")
-                row = self._persist_mapping(db, instance=instance, conversation_id=str(conversation.id),
-                    direction=MessageDirection.chatwoot_to_platform,
-                    message_kind=MessageKind.text if att is None else MessageKind.media,
-                    chatwoot_message_id=message_id if not completed else None,
-                    platform_message_id=rid,
-                    platform_payload_json={"text": content if att is None else "", "batch_message_id":message_id,
-                                           "batch_part":part, "delivery_complete":False})
-                completed[part] = row
-                sent.append(result)
-            finally:
-                await self._finish_adapter_outbound(runtime.adapter, peer_id)
-        if "text" in completed:
-            # Caption edits/replies must address the separate text message,
-            # not accidentally edit the first uploaded photo/document.
-            for row in completed.values():
-                if row is not completed["text"] and row.chatwoot_message_id == message_id:
-                    row.chatwoot_message_id = None
-            db.flush()
-            completed["text"].chatwoot_message_id = message_id
-        for row in completed.values():
-            row.platform_payload_json = {**(row.platform_payload_json or {}), "delivery_complete":True}
-        db.commit()
-        return sent
 
     @staticmethod
     async def _persist_outbound_conversation_mapping(
@@ -1937,7 +1931,7 @@ class ChatwootBridgeService:
 
         # Refresh the original mapping snapshot so later comparisons use the
         # latest text and we do not create duplicate edit-replies on retries.
-        existing_mapping.platform_payload_json = {"text": new_text}
+        existing_mapping.platform_payload_json = {**(existing_mapping.platform_payload_json or {}), "text": new_text}
         db.commit()
 
         logger.info(
@@ -1997,6 +1991,80 @@ class ChatwootBridgeService:
         """Return True if the Chatwoot contact name is a generated placeholder."""
         return ChatwootPayloadParser.is_generic_contact_name(value)
 
+    def _delivery_rows(self, db: Session, instance_key: str, payload: Dict[str, Any]) -> list[ChatwootWebhookDelivery]:
+        message_id = str(MessagePayloadParser.extract_message_id(payload) or '')
+        conversation_id = str(MessagePayloadParser.extract_conversation_id(payload) or '')
+        return [row for row in db.query(ChatwootWebhookDelivery).filter_by(instance_key=instance_key).all()
+                if str(MessagePayloadParser.extract_message_id(row.payload_json or {})) == message_id
+                and str(MessagePayloadParser.extract_conversation_id(row.payload_json or {})) == conversation_id]
+
+    def _remember_failure_note(self, db: Session, instance_key: str, payload: Dict[str, Any], note_id: int) -> None:
+        for row in self._delivery_rows(db, instance_key, payload):
+            stored = dict(row.payload_json or {})
+            ids = set(stored.get('_wootify_failure_note_ids') or [])
+            ids.add(int(note_id))
+            stored['_wootify_failure_note_ids'] = sorted(ids)
+            row.payload_json = stored
+        db.commit()
+
+    async def _find_tagged_failure_notes(self, client: ChatwootClient, account_id: int, conversation_id: int,
+                                          instance_key: str, message_id: str, *, before: Optional[int] = None) -> list[int]:
+        found: set[int] = set()
+        # Stored IDs are primary; bounded metadata scanning recovers an accepted
+        # note whose HTTP response was lost, without matching arbitrary note text.
+        for _ in range(5):
+            response = await client.list_conversation_messages(account_id, conversation_id, **({'before': before} if before else {}))
+            rows = response.get('payload') if isinstance(response, dict) else response
+            if not isinstance(rows, list) or not rows:
+                break
+            valid_ids = []
+            for note in rows:
+                if not isinstance(note, dict) or not str(note.get('id') or '').isdigit():
+                    continue
+                valid_ids.append(int(note['id']))
+                marker = (note.get('content_attributes') or {}).get('wootify_delivery_failure') or {}
+                if note.get('private') is True and marker.get('instance_key') == instance_key and str(marker.get('message_id')) == message_id:
+                    found.add(int(note['id']))
+            if not valid_ids or min(valid_ids) == before or (message_id.isdigit() and min(valid_ids) <= int(message_id)):
+                break
+            before = min(valid_ids)
+        else:
+            raise FailureNoteScanPending(sorted(found), before)
+        return sorted(found)
+
+    async def _remove_delivery_failure_notes(self, db: Session, instance: Instance, client: ChatwootClient,
+                                              config: Dict[str, Any], payload: Dict[str, Any]) -> None:
+        message_id = str(MessagePayloadParser.extract_message_id(payload) or '')
+        conversation_id = int(MessagePayloadParser.extract_conversation_id(payload))
+        rows = self._delivery_rows(db, instance.instance_key, payload)
+        note_ids = {int(note_id) for row in rows for note_id in (row.payload_json or {}).get('_wootify_failure_note_ids', [])}
+        # No scan on ordinary success. A recorded failure/sync retry needs the
+        # recovery scan too, to clean up notes after ambiguous POST responses.
+        scan_rows = [row for row in rows if (row.payload_json or {}).get('_wootify_failure_note_scan_before')
+                     or ((row.payload_json or {}).get('_wootify_failure_note_attempted') and not (row.payload_json or {}).get('_wootify_failure_note_ids'))]
+        if scan_rows:
+            cursor = min([int(row.payload_json['_wootify_failure_note_scan_before']) for row in scan_rows
+                          if row.payload_json.get('_wootify_failure_note_scan_before')] or [0]) or None
+            try:
+                note_ids.update(await self._find_tagged_failure_notes(client, int(config['account_id']), conversation_id,
+                    instance.instance_key, message_id, before=cursor))
+            except FailureNoteScanPending as pending:
+                note_ids.update(pending.note_ids)
+                for row in rows:
+                    row.payload_json = {**(row.payload_json or {}), '_wootify_failure_note_ids': sorted(note_ids),
+                                        '_wootify_failure_note_scan_before': pending.before}
+                db.commit()
+                raise
+        for note_id in sorted(note_ids):
+            await client.delete_delivery_failure_note(int(config['account_id']), conversation_id, note_id)
+        for row in rows:
+            stored = dict(row.payload_json or {})
+            stored['_wootify_failure_note_ids'] = []
+            stored.pop('_wootify_failure_note_attempted', None)
+            stored.pop('_wootify_failure_note_scan_before', None)
+            row.payload_json = stored
+        db.commit()
+
     async def _notify_delivery_failure(
         self,
         client: ChatwootClient,
@@ -2006,6 +2074,8 @@ class ChatwootBridgeService:
         exc: Exception,
         *,
         platform_type: Any = None,
+        db: Optional[Session] = None,
+        retryable: bool = False,
     ) -> None:
         """Post a private note to the Chatwoot conversation when delivery fails.
 
@@ -2013,7 +2083,8 @@ class ChatwootBridgeService:
         (background task), so without this note an agent would never see that
         their message was not delivered.  Private notes do not retrigger the
         webhook loop (private messages are skipped by handle_chatwoot_webhook).
-        Best-effort: note failures are logged, never raised.
+        Bale/Eitaa persist reporting failures for bookkeeping-only queue retries.
+        Other platforms retain their existing best-effort notification policy.
         """
         try:
             conversation = payload.get("conversation") if isinstance(payload, dict) else None
@@ -2033,6 +2104,14 @@ class ChatwootBridgeService:
             }.get(platform_key, "platform")
             message_obj = payload.get("message") if isinstance(payload.get("message"), dict) else {}
             source_message_id = self._extract_id(payload) or self._extract_id(message_obj) or "unknown"
+            instance_key = str(payload.get('_wootify_instance_key') or '')
+            status_error = None
+            managed_bale = db is not None and platform_key in CONFIRMED_DELIVERY_PLATFORMS and bool(instance_key)
+            if managed_bale and not retryable:
+                for row in self._delivery_rows(db, instance_key, payload):
+                    row.payload_json = {**(row.payload_json or {}), '_wootify_terminal_failure': {
+                        'error': str(exc)[:1000], 'peer_id': peer_id}}
+                db.commit()
 
             # Use Chatwoot's native external-delivery failure state in
             # addition to the human-visible private note. This makes the
@@ -2059,6 +2138,7 @@ class ChatwootBridgeService:
                         source_message_id,
                     )
                 except Exception as status_exc:
+                    status_error = status_exc
                     logger.warning(
                         "chatwoot_bridge.delivery_status_update_failed account_id=%s conversation_id=%s message_id=%s error=%s",
                         account_id,
@@ -2076,6 +2156,29 @@ class ChatwootBridgeService:
                     str(exc)[:160],
                 )
             )
+            if managed_bale:
+                known = [note_id for row in self._delivery_rows(db, instance_key, payload)
+                         for note_id in (row.payload_json or {}).get('_wootify_failure_note_ids', [])]
+                if known:
+                    if status_error and managed_bale:
+                        raise DeliveryStatusSyncError('Cannot mark the failed platform message red in Chatwoot') from status_error
+                    return
+                cursor = min([int(row.payload_json['_wootify_failure_note_scan_before']) for row in self._delivery_rows(db, instance_key, payload)
+                              if row.payload_json.get('_wootify_failure_note_scan_before')] or [0]) or None
+                try:
+                    found = await self._find_tagged_failure_notes(client, account_id, int(conversation_id), instance_key, str(source_message_id), before=cursor)
+                except FailureNoteScanPending as pending:
+                    for row in self._delivery_rows(db, instance_key, payload):
+                        row.payload_json = {**(row.payload_json or {}), '_wootify_failure_note_ids': pending.note_ids,
+                                            '_wootify_failure_note_scan_before': pending.before}
+                    db.commit()
+                    raise
+                if found:
+                    for note_id in found:
+                        self._remember_failure_note(db, instance_key, payload, note_id)
+                    if status_error and managed_bale:
+                        raise DeliveryStatusSyncError('Cannot mark the failed platform message red in Chatwoot') from status_error
+                    return
             if self._delivery_failure_notes.get(note_key):
                 logger.info(
                     "chatwoot_bridge.delivery_failure_note_duplicate_skipped account_id=%s conversation_id=%s message_id=%s",
@@ -2083,6 +2186,8 @@ class ChatwootBridgeService:
                     conversation_id,
                     source_message_id,
                 )
+                if status_error and managed_bale:
+                    raise DeliveryStatusSyncError('Cannot mark the failed platform message red in Chatwoot') from status_error
                 return
             self._delivery_failure_notes.set(note_key, True)
             note = (
@@ -2090,11 +2195,22 @@ class ChatwootBridgeService:
                 f"{type(exc).__name__}: {exc}"
             )[:900]
             try:
-                await client.post_message(
+                note_payload = {"content": note, "private": True, "message_type": "outgoing"}
+                if platform_key in CONFIRMED_DELIVERY_PLATFORMS and instance_key:
+                    note_payload['content_attributes'] = {'wootify_delivery_failure': {
+                        'instance_key': instance_key, 'message_id': str(source_message_id)}}
+                    if db is not None:
+                        for row in self._delivery_rows(db, instance_key, payload):
+                            row.payload_json = {**(row.payload_json or {}), '_wootify_failure_note_attempted': True}
+                        db.commit()
+                result = await client.post_message(
                     account_id,
                     int(conversation_id),
-                    {"content": note, "private": True, "message_type": "outgoing"},
+                    note_payload,
                 )
+                note_id = self._extract_id(result)
+                if db is not None and instance_key and str(note_id or '').isdigit():
+                    self._remember_failure_note(db, instance_key, payload, int(note_id))
             except Exception:
                 # If Chatwoot rejects the note, allow a later retry to notify
                 # the agent instead of permanently suppressing the failure.
@@ -2106,11 +2222,17 @@ class ChatwootBridgeService:
                 conversation_id,
                 recipient,
             )
-        except Exception:
+            if status_error and managed_bale:
+                raise DeliveryStatusSyncError('Cannot mark the failed platform message red in Chatwoot') from status_error
+        except DeliveryStatusSyncError:
+            raise
+        except Exception as notification_error:
             logger.warning(
                 "chatwoot_bridge.delivery_failure_note_failed",
                 exc_info=True,
             )
+            if db is not None and str(getattr(platform_type, 'key', platform_type) or '') in CONFIRMED_DELIVERY_PLATFORMS and payload.get('_wootify_instance_key'):
+                raise DeliveryStatusSyncError('Cannot report the platform delivery failure in Chatwoot; retry bookkeeping only') from notification_error
 
     @staticmethod
     def _is_phone_number_destination(value: Optional[str]) -> bool:
@@ -2665,7 +2787,7 @@ class ChatwootBridgeService:
             )
             return {"ok": False, "detail": f"edit_failed: {exc}"}
 
-        mapping.platform_payload_json = {"text": content}
+        mapping.platform_payload_json = {**(mapping.platform_payload_json or {}), "text": content}
         db.commit()
 
         logger.info(
@@ -2700,6 +2822,20 @@ class ChatwootBridgeService:
             return {"ok": True, "ignored": True, "reason": "no_message_id", "detail": "no_message_id"}
 
         mapping, conversation = self._mapped_chatwoot_message(db, instance, payload)
+        if str(getattr(instance.platform_type, 'key', '') or '') in CONFIRMED_DELIVERY_PLATFORMS:
+            # Cancel even offline jobs with no platform ID or mapping yet.
+            for delivery in self._delivery_rows(db, instance.instance_key, payload):
+                if (delivery.payload_json or {}).get('event') == 'message_created':
+                    delivery.payload_json = {**(delivery.payload_json or {}), '_wootify_cancelled': True}
+                    delivery.status = 'failed'
+                    delivery.next_attempt_at = None
+                    delivery.last_error = 'cancelled_by_chatwoot_delete'
+            if mapping and mapping.direction == MessageDirection.chatwoot_to_platform:
+                state = self._bale_outbound.state(mapping)
+                if state:
+                    state['cancelled'] = True
+                    self._bale_outbound.save(db, mapping, state)
+            db.commit()
         if not mapping:
             return {"ok": True, "ignored": True, "reason": "no_mapping", "detail": "no_mapping"}
 

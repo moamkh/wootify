@@ -679,6 +679,23 @@ class ChatwootClient:
             retry_on_read_errors=False,
         )
 
+    async def list_conversation_messages(self, account_id: int, conversation_id: int, *, before: Optional[int] = None) -> Any:
+        """Read message metadata to recover tagged notes after a lost POST response."""
+        path = f'/api/v1/accounts/{account_id}/conversations/{conversation_id}/messages'
+        if before is not None:
+            path += f'?before={int(before)}'
+        return await self._request('GET', path)
+
+    async def delete_delivery_failure_note(self, account_id: int, conversation_id: int, note_id: int) -> Any:
+        """Ask Chatvand to purge only a marked private Wootify failure note."""
+        try:
+            return await self._request('DELETE',
+                f'/api/v1/accounts/{account_id}/conversations/{conversation_id}/messages/{note_id}?wootify_delivery_failure_cleanup=true')
+        except httpx.HTTPStatusError as exc:
+            if exc.response.status_code == 404:
+                return {'ok': True, 'already_removed': True}
+            raise
+
     async def delete_message(
         self,
         account_id: int,

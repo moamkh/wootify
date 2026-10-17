@@ -268,11 +268,28 @@ def _payload(identifier: str, *, message_id: int = 9001, conversation_id: int = 
     }
 
 
+def _confirmed_sender(rid):
+    async def send(*args, **options):
+        await options['before_dispatch'](rid)
+        return {'ok': True, 'confirmed': True, 'result': {'result': {'rid': rid}}}
+    return send
+
+
+def _assert_send(adapter, peer, content, key, *, reply_to=None):
+    adapter.send_text.assert_awaited_once()
+    call = adapter.send_text.await_args
+    assert call.args == (peer, content)
+    assert call.kwargs['reply_to'] == reply_to
+    assert call.kwargs['mirror_echo'] is False
+    assert call.kwargs['idempotency_key'] == key
+    assert callable(call.kwargs['before_dispatch'])
+
+
 @pytest.mark.anyio
 async def test_bale_pv_routes_enterprise_composite_identifier(db_session, monkeypatch):
     instance = _instance(db_session)
     adapter = AsyncMock()
-    adapter.send_text.return_value = {"ok": True, "result": {"result": {"rid": 1234}}}
+    adapter.send_text.side_effect = _confirmed_sender(1234)
     runtime = SimpleNamespace(status="open", platform_type="bale_pv_enterprise", adapter=adapter)
     client = AsyncMock()
     client.base_url = "http://chatwoot"
@@ -292,9 +309,7 @@ async def test_bale_pv_routes_enterprise_composite_identifier(db_session, monkey
 
     assert result["ok"] is True
     assert result["peer_id"] == "703074518"
-    adapter.send_text.assert_awaited_once_with(
-        "703074518", "sample reply", reply_to=None, mirror_echo=False
-    )
+    _assert_send(adapter, '703074518', 'sample reply', 'routed-bale:77:9001:text')
 
 
 @pytest.mark.anyio
@@ -312,7 +327,7 @@ async def test_instance_conversation_mapping_wins_over_contact_identifier(db_ses
     )
     db_session.commit()
     adapter = AsyncMock()
-    adapter.send_text.return_value = {"ok": True, "result": {"result": {"rid": 1235}}}
+    adapter.send_text.side_effect = _confirmed_sender(1235)
     runtime = SimpleNamespace(status="open", platform_type="bale_pv_enterprise", adapter=adapter)
     client = AsyncMock()
     client.base_url = "http://chatwoot"
@@ -327,9 +342,7 @@ async def test_instance_conversation_mapping_wins_over_contact_identifier(db_ses
     )
 
     assert result["peer_id"] == "888"
-    adapter.send_text.assert_awaited_once_with(
-        "888", "sample reply", reply_to=None, mirror_echo=False
-    )
+    _assert_send(adapter, '888', 'sample reply', 'mapped-bale:78:9002:text')
 
 
 @pytest.mark.anyio
@@ -357,7 +370,7 @@ async def test_operator_reply_uses_explicit_chatwoot_parent_not_conversation_pre
     db_session.commit()
 
     adapter = AsyncMock()
-    adapter.send_text.return_value = {"ok": True, "result": {"result": {"rid": 999}}}
+    adapter.send_text.side_effect = _confirmed_sender(999)
     runtime = SimpleNamespace(status="open", platform_type="bale_pv_enterprise", adapter=adapter)
     client = AsyncMock()
     client.base_url = "http://chatwoot"
@@ -372,9 +385,7 @@ async def test_operator_reply_uses_explicit_chatwoot_parent_not_conversation_pre
     result = await service.handle_chatwoot_webhook(db_session, instance.instance_key, payload)
 
     assert result["ok"] is True
-    adapter.send_text.assert_awaited_once_with(
-        "888", "5555555", reply_to="4574299872747724413", mirror_echo=False
-    )
+    _assert_send(adapter, '888', '5555555', 'threaded-bale:2181:70495:text', reply_to='4574299872747724413')
 
 
 @pytest.mark.anyio
@@ -423,7 +434,7 @@ async def test_disconnected_instance_marks_outgoing_message_failed(db_session, m
         _payload("BALE_PV:USER:123", message_id=9011, conversation_id=80),
     )
 
-    assert result == {"ok": False, "detail": "instance_not_connected"}
+    assert result == {"ok": False, "detail": "instance_not_connected", 'retryable': True}
     client.update_message_status.assert_awaited_once_with(
         1,
         80,
@@ -532,12 +543,14 @@ def test_chatwoot_webhook_is_durable_and_failed_retry_rearms(tmp_path, monkeypat
         assert failed is not None
         assert failed.status == "failed"
 
+        # Ordinary redeliveries do not replay terminal failures. Native Retry
+        # carries an explicit marker and a stable per-click request UUID.
         rearmed_id = webhook_controller._persist_chatwoot_delivery(
             session,
             instance_key="durable-bale",
             platform_key="bale_pv_enterprise",
             route_key=None,
-            payload=payload,
+            payload={**payload, 'wootify_retry': True, 'retry_request_id': 'retry-9911'},
         )
         session.expire_all()
         assert rearmed_id == delivery_id

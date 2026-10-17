@@ -33,10 +33,17 @@ def setup(db, monkeypatch, *, resolved_ids=(12345,)):
     db.flush()
     client = AsyncMock()
     client.base_url = "http://chatwoot"
+
+    async def confirmed_send(peer_id, content, **options):
+        rid = 2**62 + adapter.send_text.await_count
+        if options.get("before_dispatch") is not None:
+            await options["before_dispatch"](rid)
+        return {"ok": True, "confirmed": True, "result": {"rid": rid}}
+
     adapter = SimpleNamespace(
         resolve_phone_to_user=AsyncMock(side_effect=[{"id": peer, "access_hash": "99", "name": "Kamal"} for peer in resolved_ids]),
         cache_access_hash=MagicMock(),
-        send_text=AsyncMock(return_value={"ok": True}),
+        send_text=AsyncMock(side_effect=confirmed_send),
     )
     runtime = SimpleNamespace(status="open", platform_type="bale_pv_enterprise", adapter=adapter)
     monkeypatch.setattr(bridge_module, "get_runtime", lambda _: runtime)

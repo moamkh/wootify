@@ -72,6 +72,7 @@ from wootify import runtime_registry
 from wootify.infrastructure.persistence.repositories.conversation_repository import ConversationRepository
 from wootify.infrastructure.persistence.repositories.message_mapping_repository import MessageMappingRepository
 from wootify.application.messaging.chatwoot_bridge import chatwoot_bridge
+from wootify.application.messaging.confirmed_outbound_delivery import CONFIRMED_DELIVERY_PLATFORMS
 from wootify.application.messaging.conversation_mapping import ConversationMappingService
 from wootify.application.enterprise.bale import EnterpriseBaleService
 from wootify.application.enterprise.telegram import EnterpriseTelegramService
@@ -1500,6 +1501,11 @@ def _log_delivery_result(resolved_instance_key: str, route_key: Optional[str], r
 
 def _chatwoot_delivery_key(instance_key: str, route_key: Optional[str], payload: dict[str, Any]) -> str:
     """Return a stable idempotency key for one exact Chatwoot callback."""
+    if payload.get('event') == 'message_created':
+        message_id = payload.get('id') or (payload.get('message') or {}).get('id')
+        conversation_id = (payload.get('conversation') or {}).get('id') or payload.get('conversation_id')
+        if message_id and conversation_id:
+            return hashlib.sha256(f'{instance_key}:{route_key or ""}:send:{conversation_id}:{message_id}'.encode()).hexdigest()
     encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str).encode("utf-8")
     digest = hashlib.sha256(encoded).hexdigest()
     return hashlib.sha256(f"{instance_key}:{route_key or ''}:{digest}".encode("utf-8")).hexdigest()
@@ -1515,6 +1521,39 @@ def _persist_chatwoot_delivery(
 ) -> str:
     """Durably queue a webhook before returning HTTP 200 to Chatwoot."""
     delivery_key = _chatwoot_delivery_key(instance_key, route_key, payload)
+    if platform_key in CONFIRMED_DELIVERY_PLATFORMS and payload.get('event') == 'message_created' and (payload.get('id') or (payload.get('message') or {}).get('id')):
+        message_id = str(payload.get('id') or (payload.get('message') or {}).get('id') or '')
+        conversation_id = str((payload.get('conversation') or {}).get('id') or payload.get('conversation_id') or '')
+        # Compatibility with already stored full-payload keys; never replay old
+        # failed jobs just because the upgraded worker now has safer retries.
+        existing = next((candidate for candidate in db.query(ChatwootWebhookDelivery).filter_by(instance_key=instance_key, platform_key=platform_key, route_key=route_key).all()
+                         if candidate.payload_json.get('event') == 'message_created'
+                         and str(candidate.payload_json.get('id') or (candidate.payload_json.get('message') or {}).get('id') or '') == message_id
+                         and str((candidate.payload_json.get('conversation') or {}).get('id') or candidate.payload_json.get('conversation_id') or '') == conversation_id), None)
+        if existing is not None:
+            if (existing.payload_json or {}).get('_wootify_cancelled'):
+                return str(existing.id)
+            request_id = str(payload.get('retry_request_id') or '')
+            consumed = set((existing.payload_json or {}).get('_wootify_consumed_retry_ids') or [])
+            if existing.status == 'failed' and payload.get('wootify_retry') is True and request_id and request_id not in consumed:
+                metadata = {key: value for key, value in (existing.payload_json or {}).items() if key.startswith('_wootify_failure_note')}
+                if request_id:
+                    consumed.add(request_id)
+                metadata['_wootify_consumed_retry_ids'] = sorted(consumed)
+                existing.payload_json = {**payload, **metadata}
+                existing.status = 'pending'
+                existing.attempts = 0
+                existing.next_attempt_at = dt.datetime.utcnow()
+                existing.last_error = None
+                db.commit()
+            elif request_id and request_id not in consumed and payload.get('wootify_retry') is True:
+                # Consume clicks received while a job is already pending too;
+                # delayed redelivery of that webhook cannot refill its budget.
+                existing.payload_json = {**(existing.payload_json or {}), '_wootify_consumed_retry_ids': sorted(consumed | {request_id})}
+                db.commit()
+            return str(existing.id)
+    if platform_key in CONFIRMED_DELIVERY_PLATFORMS and payload.get('wootify_retry') is True and payload.get('retry_request_id'):
+        payload = {**payload, '_wootify_consumed_retry_ids': [str(payload['retry_request_id'])]}
     row = ChatwootWebhookDelivery(
         delivery_key=delivery_key,
         instance_key=instance_key,
@@ -1537,11 +1576,21 @@ def _persist_chatwoot_delivery(
             .filter(ChatwootWebhookDelivery.delivery_key == delivery_key)
             .one()
         )
+        if (existing.payload_json or {}).get('_wootify_cancelled'):
+            return str(existing.id)
         # A deliberate Chatwoot retry should re-arm a terminal failure.
-        if existing.status == "failed":
+        request_id = str(payload.get('retry_request_id') or '')
+        consumed = set((existing.payload_json or {}).get('_wootify_consumed_retry_ids') or [])
+        if existing.status == "failed" and (platform_key not in CONFIRMED_DELIVERY_PLATFORMS or (payload.get('wootify_retry') is True and request_id and request_id not in consumed)):
+            if platform_key in CONFIRMED_DELIVERY_PLATFORMS:
+                if request_id:
+                    consumed.add(request_id)
+                metadata = {key: value for key, value in (existing.payload_json or {}).items() if key.startswith('_wootify_failure_note')}
+                existing.payload_json = {**payload, **metadata, '_wootify_consumed_retry_ids': sorted(consumed)}
             existing.status = "pending"
             existing.next_attempt_at = dt.datetime.utcnow()
             existing.last_error = None
+            existing.attempts = 0
             db.commit()
         return str(existing.id)
 
@@ -1554,7 +1603,7 @@ def _complete_chatwoot_delivery(delivery_id: str) -> None:
             db.commit()
 
 
-def _fail_chatwoot_delivery(delivery_id: str, error: str, *, terminal: bool = False) -> None:
+def _fail_chatwoot_delivery(delivery_id: str, error: str, *, terminal: bool = False, retry_after_seconds: Optional[int] = None) -> None:
     with SessionLocal() as db:
         row = db.get(ChatwootWebhookDelivery, str(delivery_id))
         if row is None:
@@ -1566,6 +1615,8 @@ def _fail_chatwoot_delivery(delivery_id: str, error: str, *, terminal: bool = Fa
             row.next_attempt_at = None
         else:
             delay = min(2 ** min(row.attempts, 8), _WEBHOOK_DELIVERY_RETRY_MAX_SECONDS)
+            if isinstance(retry_after_seconds, int) and retry_after_seconds > 0:
+                delay = max(delay, retry_after_seconds)
             row.status = "pending"
             row.next_attempt_at = dt.datetime.utcnow() + dt.timedelta(seconds=delay)
         db.commit()
@@ -1592,6 +1643,11 @@ async def _deliver_chatwoot_webhook_background(
     """Deliver one durably queued Chatwoot webhook to its platform."""
     db = SessionLocal()
     try:
+        queued = db.get(ChatwootWebhookDelivery, str(delivery_id))
+        if queued is None or queued.status != 'pending':
+            return
+        payload = {**dict(queued.payload_json or {}), '_wootify_delivery_id': delivery_id}
+        db.commit()
         if platform_key == 'bale_enterprise':
             result = await enterprise.receive_chatwoot_webhook(db, resolved_instance_key, payload)
         elif platform_key == 'telegram_enterprise':
@@ -1618,7 +1674,8 @@ async def _deliver_chatwoot_webhook_background(
                 _fail_chatwoot_delivery,
                 delivery_id,
                 str(result.get('detail') or result.get('message') or 'delivery_failed'),
-                terminal=True,
+                terminal=result.get('retryable') is not True,
+                retry_after_seconds=result.get('retry_after_seconds'),
             )
         else:
             await asyncio.to_thread(_complete_chatwoot_delivery, delivery_id)
@@ -1674,22 +1731,39 @@ async def _deliver_chatwoot_webhook_guarded(
                     resolved_instance_key,
                     route_key,
                 )
-                if platform_key == 'eitaa_pv_enterprise':
+                confirmed = False
+                retryable = platform_key not in CONFIRMED_DELIVERY_PLATFORMS
+                if platform_key in ('eitaa_pv_enterprise', 'bale_pv_enterprise'):
                     try:
                         with SessionLocal() as notification_db:
                             instance, cfg, client = chatwoot_bridge._chatwoot_client_for_instance(notification_db, resolved_instance_key)
-                            await chatwoot_bridge._notify_delivery_failure(
-                                client, int(cfg['account_id']), payload, None,
-                                RuntimeError('delivery_timeout: Eitaa did not acknowledge the send'),
-                                platform_type=platform_key,
-                            )
+                            queued = notification_db.get(ChatwootWebhookDelivery, str(delivery_id))
+                            notification_payload = {**dict(queued.payload_json if queued else payload), '_wootify_instance_key': resolved_instance_key}
+
+                            async def report_timeout() -> None:
+                                nonlocal retryable
+                                if platform_key in CONFIRMED_DELIVERY_PLATFORMS:
+                                    receipt = chatwoot_bridge._bale_outbound.mapping(notification_db, instance, notification_payload)
+                                    retryable = receipt is None or not chatwoot_bridge._bale_outbound.state(receipt).get('inflight')
+                                await chatwoot_bridge._notify_delivery_failure(
+                                    client, int(cfg['account_id']), notification_payload, None,
+                                    RuntimeError('delivery_timeout: platform send confirmation was not completed'),
+                                    platform_type=platform_key, db=notification_db, retryable=retryable)
+
+                            if platform_key in CONFIRMED_DELIVERY_PLATFORMS:
+                                confirmed = await chatwoot_bridge._bale_outbound.report_failure_or_confirm(
+                                    notification_db, instance, client, cfg, notification_payload, report_timeout)
+                            else:
+                                await report_timeout()
                     except Exception:
-                        logger.exception('eitaa_delivery_timeout_notification_failed instance=%s', resolved_instance_key)
-                await asyncio.to_thread(
-                    _fail_chatwoot_delivery,
-                    delivery_id,
-                    'delivery_timeout',
-                )
+                        # Durable terminal metadata prevents an ambiguous send
+                        # being repeated; retry only its failed reporting.
+                        retryable = True
+                        logger.exception('platform_delivery_timeout_notification_failed instance=%s', resolved_instance_key)
+                if confirmed:
+                    await asyncio.to_thread(_complete_chatwoot_delivery, delivery_id)
+                else:
+                    await asyncio.to_thread(_fail_chatwoot_delivery, delivery_id, 'delivery_timeout', terminal=not retryable)
             finally:
                 _release_webhook_delivery_lock(lock_key, lock)
 

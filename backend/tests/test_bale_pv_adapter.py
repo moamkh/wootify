@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
+import hashlib
 import httpx
 import pytest
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import ANY, AsyncMock, MagicMock, patch
 
 from wootify.connectors.bale_pv_connector import (
     bale_pv as bale_pv_connector,
@@ -15,6 +16,14 @@ from wootify.connectors.bale_pv_connector import (
 from wootify.adapters.bale_pv import BalePvAdapter
 from wootify.models import BalePvPhoneResolvedUser, Conversation, Instance, PlatformType
 from wootify.services.chatwoot_bridge_service import ChatwootBridgeService, chatwoot_bridge
+
+
+async def _confirmed_bale_send(peer_id, content, **options):
+    """Model a confirmed send and its durable pre-dispatch checkpoint."""
+    key = options["idempotency_key"]
+    rid = 2**60 + int.from_bytes(hashlib.sha256(key.encode()).digest()[:7], "big")
+    await options["before_dispatch"](rid)
+    return {"ok": True, "confirmed": True, "result": {"rid": rid}}
 
 
 def test_adapter_normalize_private_message():
@@ -302,7 +311,7 @@ async def test_webhook_resolves_phone_to_bale_user(db_session):
     db_session.commit()
 
     adapter = AsyncMock()
-    adapter.send_text = AsyncMock(return_value={"ok": True})
+    adapter.send_text = AsyncMock(side_effect=_confirmed_bale_send)
     adapter.cache_access_hash = MagicMock()
 
     runtime = MagicMock()
@@ -319,9 +328,12 @@ async def test_webhook_resolves_phone_to_bale_user(db_session):
 
     payload = {
         "event": "message_created",
+        "id": 9101,
         "message_type": "outgoing",
         "content": "Hello",
         "conversation": {
+            "id": 70,
+            "inbox_id": 5,
             "meta": {
                 "sender": {
                     "id": 42,
@@ -343,7 +355,10 @@ async def test_webhook_resolves_phone_to_bale_user(db_session):
 
     assert result["ok"] is True
     assert result["peer_id"] == "12345"
-    adapter.send_text.assert_awaited_once_with("12345", "Hello", reply_to=None, mirror_echo=False)
+    adapter.send_text.assert_awaited_once_with(
+        "12345", "Hello", reply_to=None, mirror_echo=False,
+        idempotency_key="bale-pv-phone:70:9101:text", before_dispatch=ANY,
+    )
 
 
 @pytest.mark.anyio
@@ -381,7 +396,7 @@ async def test_webhook_uses_cached_phone_resolution(db_session):
     db_session.commit()
 
     adapter = AsyncMock()
-    adapter.send_text = AsyncMock(return_value={"ok": True})
+    adapter.send_text = AsyncMock(side_effect=_confirmed_bale_send)
     adapter.cache_access_hash = MagicMock()
 
     runtime = MagicMock()
@@ -398,9 +413,12 @@ async def test_webhook_uses_cached_phone_resolution(db_session):
 
     payload = {
         "event": "message_created",
+        "id": 9102,
         "message_type": "outgoing",
         "content": "Hello again",
         "conversation": {
+            "id": 70,
+            "inbox_id": 5,
             "meta": {
                 "sender": {
                     "id": 42,
@@ -421,6 +439,7 @@ async def test_webhook_uses_cached_phone_resolution(db_session):
                 db_session, "bale-pv-cache", payload
             )
             # Second call should use cache
+            payload["id"] = 9103
             await chatwoot_bridge.handle_chatwoot_webhook(
                 db_session, "bale-pv-cache", payload
             )
@@ -454,7 +473,7 @@ async def test_webhook_does_not_resolve_when_identifier_present(db_session):
     db_session.commit()
 
     adapter = AsyncMock()
-    adapter.send_text = AsyncMock(return_value={"ok": True})
+    adapter.send_text = AsyncMock(side_effect=_confirmed_bale_send)
     adapter.cache_access_hash = MagicMock()
 
     runtime = MagicMock()
@@ -471,9 +490,12 @@ async def test_webhook_does_not_resolve_when_identifier_present(db_session):
 
     payload = {
         "event": "message_created",
+        "id": 9104,
         "message_type": "outgoing",
         "content": "Hello",
         "conversation": {
+            "id": 70,
+            "inbox_id": 5,
             "meta": {
                 "sender": {
                     "id": 42,
@@ -497,7 +519,10 @@ async def test_webhook_does_not_resolve_when_identifier_present(db_session):
     assert result["ok"] is True
     assert result["peer_id"] == "770408072"
     adapter.resolve_phone_to_user.assert_not_awaited()
-    adapter.send_text.assert_awaited_once_with("770408072", "Hello", reply_to=None, mirror_echo=False)
+    adapter.send_text.assert_awaited_once_with(
+        "770408072", "Hello", reply_to=None, mirror_echo=False,
+        idempotency_key="bale-pv-ident:70:9104:text", before_dispatch=ANY,
+    )
     client.update_contact.assert_not_awaited()
 
 
@@ -527,7 +552,7 @@ async def test_webhook_outbound_persists_conversation_mapping(db_session):
     db_session.commit()
 
     adapter = AsyncMock()
-    adapter.send_text = AsyncMock(return_value={"ok": True})
+    adapter.send_text = AsyncMock(side_effect=_confirmed_bale_send)
 
     runtime = MagicMock()
     runtime.platform_type = "bale_pv_enterprise"
@@ -543,6 +568,7 @@ async def test_webhook_outbound_persists_conversation_mapping(db_session):
 
     payload = {
         "event": "message_created",
+        "id": 9105,
         "message_type": "outgoing",
         "content": "Hello from the panel",
         "conversation": {
@@ -570,7 +596,8 @@ async def test_webhook_outbound_persists_conversation_mapping(db_session):
 
     assert result["ok"] is True
     adapter.send_text.assert_awaited_once_with(
-        "770408072", "Hello from the panel", reply_to=None, mirror_echo=False
+        "770408072", "Hello from the panel", reply_to=None, mirror_echo=False,
+        idempotency_key="bale-pv-pin:70:9105:text", before_dispatch=ANY,
     )
     mapped = (
         db_session.query(Conversation)
@@ -623,9 +650,7 @@ def _mk_dedup_env(db_session, instance_key):
     db_session.commit()
 
     adapter = AsyncMock()
-    adapter.send_text = AsyncMock(
-        return_value={"ok": True, "result": {"result": {"rid": 2**62 + 7}}}
-    )
+    adapter.send_text = AsyncMock(side_effect=_confirmed_bale_send)
 
     runtime = MagicMock()
     runtime.platform_type = "bale_pv_enterprise"
@@ -787,7 +812,7 @@ async def test_webhook_forwards_template_automation_message(db_session):
     db_session.commit()
 
     adapter = AsyncMock()
-    adapter.send_text = AsyncMock(return_value={"ok": True})
+    adapter.send_text = AsyncMock(side_effect=_confirmed_bale_send)
 
     runtime = MagicMock()
     runtime.platform_type = "bale_pv_enterprise"
@@ -803,9 +828,12 @@ async def test_webhook_forwards_template_automation_message(db_session):
 
     payload = {
         "event": "message_created",
+        "id": 9106,
         "message_type": "template",
         "content": "Welcome! How can we help?",
         "conversation": {
+            "id": 70,
+            "inbox_id": 5,
             "meta": {
                 "sender": {
                     "id": 42,
@@ -828,7 +856,8 @@ async def test_webhook_forwards_template_automation_message(db_session):
     assert result["ok"] is True
     assert result["peer_id"] == "770408072"
     adapter.send_text.assert_awaited_once_with(
-        "770408072", "Welcome! How can we help?", reply_to=None, mirror_echo=False
+        "770408072", "Welcome! How can we help?", reply_to=None, mirror_echo=False,
+        idempotency_key="bale-pv-template:70:9106:text", before_dispatch=ANY,
     )
 
 
@@ -857,7 +886,7 @@ async def test_webhook_forwards_bot_sender_message(db_session):
     db_session.commit()
 
     adapter = AsyncMock()
-    adapter.send_text = AsyncMock(return_value={"ok": True})
+    adapter.send_text = AsyncMock(side_effect=_confirmed_bale_send)
 
     runtime = MagicMock()
     runtime.platform_type = "bale_pv_enterprise"
@@ -873,6 +902,7 @@ async def test_webhook_forwards_bot_sender_message(db_session):
 
     payload = {
         "event": "message_created",
+        "id": 9107,
         "message_type": "incoming",
         "content": "Bot auto-reply",
         "sender": {
@@ -881,6 +911,8 @@ async def test_webhook_forwards_bot_sender_message(db_session):
             "type": "agent_bot",
         },
         "conversation": {
+            "id": 70,
+            "inbox_id": 5,
             "meta": {
                 "sender": {
                     "id": 42,
@@ -903,7 +935,8 @@ async def test_webhook_forwards_bot_sender_message(db_session):
     assert result["ok"] is True
     assert result["peer_id"] == "770408072"
     adapter.send_text.assert_awaited_once_with(
-        "770408072", "Bot auto-reply", reply_to=None, mirror_echo=False
+        "770408072", "Bot auto-reply", reply_to=None, mirror_echo=False,
+        idempotency_key="bale-pv-botsender:70:9107:text", before_dispatch=ANY,
     )
 
 

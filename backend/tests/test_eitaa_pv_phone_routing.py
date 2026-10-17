@@ -84,8 +84,16 @@ async def test_unmapped_outbound_recovers_and_next_message_uses_owned_map(db_ses
     i = instance(db_session)
     client = AsyncMock()
     client.base_url = "http://chatwoot"
+
+    async def confirmed_send(peer_id, content, **options):
+        random_id = EitaaPvConnector._send_random_id(options["idempotency_key"])
+        if options.get("before_dispatch") is not None:
+            await options["before_dispatch"](random_id)
+        return {"ok":True,"confirmed":True,
+                "result":{"message_id":str(100 + adapter.send_text.await_count),"random_id":random_id}}
+
     adapter = SimpleNamespace(resolve_phone_to_user=AsyncMock(return_value={"id":42,"access_hash":99}),
-        send_text=AsyncMock(return_value={"ok":True}))
+        send_text=AsyncMock(side_effect=confirmed_send))
     runtime = SimpleNamespace(status="open", platform_type="eitaa_pv_enterprise", adapter=adapter)
     monkeypatch.setattr(bridge_module, "get_runtime", lambda _: runtime)
     service = ChatwootBridgeService()
