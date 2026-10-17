@@ -1,7 +1,8 @@
 # Eitaa PV: confirmed delivery, native Retry and failure-note cleanup
 
-Status: local changes on top of Wootify 7.1.2, not deployed or version-bumped.
-Companion Chatvand backend changes are required; no frontend build or migration.
+Status: released under the explicitly updated Wootify v7.1.2 tag and deployed
+to prod/demo on 2026-10-17 with Chatvand v4.10.1-chatvand.3. No frontend build
+or migration. Verification/backups: `docs/deployments/v7.1.2-confirmed-delivery-20261017.md`.
 
 ## Same user-visible policy as Bale PV
 

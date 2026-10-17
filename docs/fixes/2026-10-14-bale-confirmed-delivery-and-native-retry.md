@@ -1,6 +1,8 @@
 # Bale PV: confirmed delivery, truthful Retry, and failure-note cleanup
 
-Status: local fixes on top of Wootify 7.1.2; no deployment or version bump.
+Status: released under the explicitly updated Wootify v7.1.2 tag and deployed
+to prod/demo on 2026-10-17 with Chatvand v4.10.1-chatvand.3. See
+`docs/deployments/v7.1.2-confirmed-delivery-20261017.md` for verification/backups.
 Date: 2026-10-14.
 
 ## Production incident
