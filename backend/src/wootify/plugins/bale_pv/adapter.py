@@ -11,10 +11,10 @@ import json
 import logging
 import mimetypes
 import random
-from typing import Any, AsyncIterator, Dict, List, Optional, Tuple
+from typing import Any, AsyncIterator, Awaitable, Callable, Dict, List, Optional, Tuple
 
 from wootify.adapters.base import BasePlatformAdapter
-from wootify.plugins.bale_pv.connector import bale_pv
+from wootify.plugins.bale_pv.connector import BalePreSendError, bale_pv
 
 logger = logging.getLogger("app.adapters.bale_pv")
 
@@ -107,6 +107,8 @@ class BalePvAdapter(BasePlatformAdapter):
         *,
         reply_to: Optional[str] = None,
         mirror_echo: bool = True,
+        idempotency_key: Optional[str] = None,
+        before_dispatch: Optional[Callable[[int], Awaitable[None]]] = None,
     ) -> Dict[str, Any]:
         """Send a text message via the authenticated Bale session.
 
@@ -115,11 +117,17 @@ class BalePvAdapter(BasePlatformAdapter):
         echoes own-session sends back to the sender). Chatwoot-webhook-
         originated sends pass ``mirror_echo=False`` because the Chatwoot
         message already exists.
+
+        Success includes ``confirmed=True`` only after Bale acknowledges the
+        RPC. The optional idempotency key preserves the message RID on retry.
         """
         quoted: Optional[Dict[str, Any]] = None
         if reply_to:
             quoted = {"message_id": reply_to}
         access_hash = self._access_hash_for(peer_id)
+        options = {"idempotency_key": idempotency_key} if idempotency_key else {}
+        if before_dispatch is not None:
+            options["before_dispatch"] = before_dispatch
         result = await bale_pv.send_text(
             self.instance_key,
             peer_id,
@@ -128,8 +136,10 @@ class BalePvAdapter(BasePlatformAdapter):
             access_hash=access_hash,
             mirror_echo=mirror_echo,
             peer_type=self._peer_type_for(peer_id),
+            **options,
         )
-        return {"ok": True, "result": result}
+        self._require_send_confirmation(result)
+        return {"ok": True, "confirmed": True, "result": result}
 
     async def prepare_outbound(self, peer_id: str) -> None:
         await bale_pv.prepare_outbound(
@@ -190,6 +200,8 @@ class BalePvAdapter(BasePlatformAdapter):
         caption: Optional[str] = None,
         reply_to: Optional[str] = None,
         mirror_echo: bool = True,
+        idempotency_key: Optional[str] = None,
+        before_dispatch: Optional[Callable[[int], Awaitable[None]]] = None,
     ) -> Dict[str, Any]:
         """Send media via the authenticated Bale session.
 
@@ -203,7 +215,15 @@ class BalePvAdapter(BasePlatformAdapter):
         if isinstance(media, bytes):
             file_bytes = media
         elif isinstance(media, str) and media.startswith(("http://", "https://")):
-            file_bytes = await self._download_url(media)
+            import httpx
+            try:
+                file_bytes = await self._download_url(media)
+            except httpx.TransportError as exc:
+                raise BalePreSendError(f"Media download transport failure: {exc}") from exc
+            except httpx.HTTPStatusError as exc:
+                if exc.response.status_code in (408, 429) or exc.response.status_code >= 500:
+                    raise BalePreSendError(f"Media download failed: HTTP {exc.response.status_code}") from exc
+                raise
         else:
             file_bytes = None
 
@@ -214,6 +234,9 @@ class BalePvAdapter(BasePlatformAdapter):
             filename = "file"
 
         access_hash = self._access_hash_for(peer_id)
+        options = {"idempotency_key": idempotency_key} if idempotency_key else {}
+        if before_dispatch is not None:
+            options["before_dispatch"] = before_dispatch
         result = await bale_pv.send_media(
             self.instance_key,
             peer_id,
@@ -224,8 +247,21 @@ class BalePvAdapter(BasePlatformAdapter):
             access_hash=access_hash,
             mirror_echo=mirror_echo,
             peer_type=self._peer_type_for(peer_id),
+            **options,
         )
-        return {"ok": True, "result": result}
+        self._require_send_confirmation(result)
+        return {"ok": True, "confirmed": True, "result": result}
+
+    @staticmethod
+    def _require_send_confirmation(result: Any) -> None:
+        if (
+            not isinstance(result, dict)
+            or result.get("ok") is not True
+            or not isinstance(result.get("result"), dict)
+            or result["result"].get("delivery_confirmed") is not True
+        ):
+            from bale_pv_connector.exceptions import BaleRequestUnconfirmedError
+            raise BaleRequestUnconfirmedError("Bale SendMessage acceptance was not confirmed")
 
     async def poll_events(self) -> AsyncIterator[Dict[str, Any]]:
         while self._connected:

@@ -37,6 +37,7 @@ by filename prefix and re-tagged as ``image/webp`` before forwarding to Chatwoot
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import random
@@ -45,7 +46,7 @@ import time
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple
 
 from wootify.config import settings
 from wootify.paths import DEFAULT_BALE_PV_SESSION_DIR, PROJECT_ROOT, VAR_ROOT
@@ -65,6 +66,22 @@ FILE_DOWNLOAD_RETRYABLE_STATUSES = frozenset({500, 502, 503, 504})
 # from this peer, but they are not customer messages and must not enter a
 # Chatwoot customer conversation.
 BALE_SYSTEM_USER_IDS = frozenset({10})
+
+
+class BalePreSendError(RuntimeError):
+    """A temporary failure before SendMessage; no user message was dispatched."""
+
+    retryable = True
+    delivery_uncertain = False
+
+
+def _request_rid(instance: str, chat_id: str, idempotency_key: Optional[str]) -> int:
+    """Retain the protocol message identity across queue and operator retries."""
+    if not idempotency_key:
+        return random.randint(2**60, 2**63 - 1)
+    scope = json.dumps([instance, str(chat_id), str(idempotency_key)], separators=(",", ":"))
+    digest = hashlib.sha256(scope.encode("utf-8")).digest()
+    return (int.from_bytes(digest[:8], "big") & (2**62 - 1)) | 2**62
 
 
 # ---------------------------------------------------------------------------
@@ -600,12 +617,16 @@ class BalePvConnector:
         access_hash: Optional[int] = None,
         mirror_echo: bool = True,
         peer_type: Any = None,
+        idempotency_key: Optional[str] = None,
+        before_dispatch: Optional[Callable[[int], Awaitable[None]]] = None,
     ) -> Dict:
         """Send a text message via the userbot.
 
         Returns ``{"ok": True, "result": {"rid": ..., "date": ...}}`` where
-        ``rid``/``date`` come from the SendMessage ack (``None`` when the
-        server did not answer). When ``mirror_echo`` is true (default), a
+        ``rid`` is the request identity; success requires the SendMessage RPC
+        acknowledgement, never just a generated RID. An optional stable
+        ``idempotency_key`` preserves the RID across retries. When
+        ``mirror_echo`` is true (default), a
         synthetic outgoing echo is queued so the message is mirrored into
         Chatwoot — Bale never pushes own-message echoes back to the
         originating session. Chatwoot-webhook-originated sends pass
@@ -620,7 +641,7 @@ class BalePvConnector:
                 "bale_pv messaging_client_not_connected instance=%s",
                 instance,
             )
-            raise RuntimeError(
+            raise BalePreSendError(
                 "Bale PV messaging client is not connected. "
                 "Please re-authenticate if the session has expired."
             )
@@ -633,13 +654,18 @@ class BalePvConnector:
             # Bale uses the request rid as the permanent message ID. The
             # SendMessage acknowledgement's small integer is a server date,
             # not the message rid used by UpdateMessage/DeleteMessage.
-            request_rid = random.randint(2**60, 2**63 - 1)
+            request_rid = _request_rid(instance, chat_id, idempotency_key)
             reply_to = None
             if quoted:
                 reply_to_val = quoted.get("message_id") or quoted.get("id")
                 if reply_to_val is not None:
                     reply_to = int(reply_to_val)
 
+            if before_dispatch is not None:
+                try:
+                    await before_dispatch(request_rid)
+                except Exception as exc:
+                    raise BalePreSendError("Send checkpoint failed before Bale dispatch") from exc
             response = await runtime.client.send_message(
                 peer_id=peer_id,
                 text=text,
@@ -648,6 +674,9 @@ class BalePvConnector:
                 random_id=request_rid,
                 peer_type=resolved_peer_type,
             )
+            if response is None:
+                from bale_pv_connector.exceptions import BaleRequestUnconfirmedError
+                raise BaleRequestUnconfirmedError("SendMessage acknowledgement missing")
             ack = self._parse_send_ack(response)
             rid = request_rid
             date = ack.get("date")
@@ -672,6 +701,7 @@ class BalePvConnector:
                     "rid": rid,
                     "date": date,
                     "raw_response": response.hex() if response else None,
+                    "delivery_confirmed": True,
                 },
             }
         except Exception as exc:
@@ -680,6 +710,8 @@ class BalePvConnector:
                 instance,
                 chat_id,
             )
+            if hasattr(exc, "delivery_uncertain"):
+                raise
             raise RuntimeError(f"send_text failed: {exc}") from exc
 
     async def prepare_outbound(self, instance: str, chat_id: str, peer_type: Any = None) -> None:
@@ -826,6 +858,8 @@ class BalePvConnector:
         access_hash: Optional[int] = None,
         mirror_echo: bool = True,
         peer_type: Any = None,
+        idempotency_key: Optional[str] = None,
+        before_dispatch: Optional[Callable[[int], Awaitable[None]]] = None,
     ) -> Dict:
         """Send media via the userbot.
 
@@ -843,7 +877,7 @@ class BalePvConnector:
             raise RuntimeError(f"Instance {instance} is not authenticated")
 
         if runtime.client is None:
-            raise RuntimeError("Bale PV messaging client is not connected")
+            raise BalePreSendError("Bale PV messaging client is not connected")
 
         # Resolve media to bytes
         file_bytes: Optional[bytes] = None
@@ -867,7 +901,8 @@ class BalePvConnector:
                 if resp.status_code == 200:
                     file_bytes = resp.content
                 else:
-                    raise RuntimeError(
+                    error_type = BalePreSendError if resp.status_code in (408, 429) or resp.status_code >= 500 else RuntimeError
+                    raise error_type(
                         f"Media download failed: HTTP {resp.status_code} - {resp.text[:200]}"
                     )
             except Exception as exc:
@@ -877,6 +912,9 @@ class BalePvConnector:
                     media_url_or_bytes[:120],
                     exc,
                 )
+                import httpx
+                if isinstance(exc, httpx.TransportError):
+                    raise BalePreSendError(f"Media download transport failure: {exc}") from exc
                 if isinstance(exc, RuntimeError):
                     raise
                 raise RuntimeError(f"Media download failed: {exc}") from exc
@@ -888,6 +926,8 @@ class BalePvConnector:
             uploaded = await self._upload_file_to_nasim(
                 instance, chat_id, file_bytes, filename, caption, quoted, access_hash,
                 mirror_echo=mirror_echo, peer_type=peer_type,
+                idempotency_key=idempotency_key,
+                before_dispatch=before_dispatch,
             )
         except Exception as exc:
             self._logger.exception(
@@ -895,7 +935,7 @@ class BalePvConnector:
                 instance,
                 exc,
             )
-            if isinstance(exc, RuntimeError):
+            if isinstance(exc, RuntimeError) or hasattr(exc, "delivery_uncertain"):
                 raise
             raise RuntimeError(f"Media upload failed: {exc}") from exc
 
@@ -915,6 +955,8 @@ class BalePvConnector:
         access_hash: Optional[int] = None,
         mirror_echo: bool = True,
         peer_type: Any = None,
+        idempotency_key: Optional[str] = None,
+        before_dispatch: Optional[Callable[[int], Awaitable[None]]] = None,
     ) -> Optional[Dict]:
         """Upload file to Bale Nasim storage and send as DocumentMessage."""
         import httpx
@@ -978,7 +1020,7 @@ class BalePvConnector:
                     },
                 )
                 break
-            except (httpx.ConnectTimeout, httpx.ConnectError, httpx.ReadTimeout) as exc:
+            except httpx.TransportError as exc:
                 last_cookie_err = exc
                 self._logger.warning(
                     "bale_pv set_cookie_retry instance=%s attempt=%s/%s error=%s",
@@ -990,13 +1032,12 @@ class BalePvConnector:
                 if attempt < 3:
                     await asyncio.sleep(2 ** attempt)
         if cookie_resp is None:
-            raise RuntimeError(
+            raise BalePreSendError(
                 f"Bale set-cookie failed after retries: {last_cookie_err}"
-            )
+            ) from last_cookie_err
         if cookie_resp.status_code != 200:
-            raise RuntimeError(
-                f"Bale set-cookie failed: HTTP {cookie_resp.status_code}"
-            )
+            error_type = BalePreSendError if cookie_resp.status_code in (408, 429) or cookie_resp.status_code >= 500 else RuntimeError
+            raise error_type(f"Bale set-cookie failed: HTTP {cookie_resp.status_code}")
 
         # Call GetNasimFileUploadUrl with retries on transient network errors.
         resp = None
@@ -1022,7 +1063,7 @@ class BalePvConnector:
                     },
                 )
                 break
-            except (httpx.ConnectTimeout, httpx.ConnectError, httpx.ReadTimeout) as exc:
+            except httpx.TransportError as exc:
                 last_upload_url_err = exc
                 self._logger.warning(
                     "bale_pv get_upload_url_retry instance=%s attempt=%s/%s error=%s",
@@ -1034,9 +1075,12 @@ class BalePvConnector:
                 if attempt < 3:
                     await asyncio.sleep(2 ** attempt)
         if resp is None:
-            raise RuntimeError(
+            raise BalePreSendError(
                 f"GetNasimFileUploadUrl failed after retries: {last_upload_url_err}"
-            )
+            ) from last_upload_url_err
+        if resp.status_code >= 400:
+            error_type = BalePreSendError if resp.status_code in (408, 429) or resp.status_code >= 500 else RuntimeError
+            raise error_type(f"GetNasimFileUploadUrl failed: HTTP {resp.status_code}")
 
         msg, status, grpc_msg = parse_grpc_web_response(resp.content)
         self._logger.info(
@@ -1045,7 +1089,8 @@ class BalePvConnector:
             msg.hex() if msg else "empty",
         )
         if status != 0:
-            raise RuntimeError(
+            error_type = BalePreSendError if status in (4, 8, 13, 14) else RuntimeError
+            raise error_type(
                 f"GetNasimFileUploadUrl failed: gRPC status {status} - {grpc_msg}"
             )
 
@@ -1126,14 +1171,15 @@ class BalePvConnector:
                     connect=10, read=upload_timeout, write=upload_timeout, pool=10
                 ),
             )
-        except (httpx.ConnectTimeout, httpx.ConnectError, httpx.ReadTimeout, httpx.WriteTimeout) as exc:
-            raise RuntimeError(
+        except httpx.TransportError as exc:
+            raise BalePreSendError(
                 f"File upload to Nasim timed out (size={len(file_bytes)} bytes, "
                 f"timeout={upload_timeout}s). Consider increasing "
                 f"BALE_PV_MEDIA_UPLOAD_TIMEOUT_SECONDS: {exc}"
             ) from exc
         if upload_resp.status_code not in (200, 201, 204):
-            raise RuntimeError(
+            error_type = BalePreSendError if upload_resp.status_code in (408, 429) or upload_resp.status_code >= 500 else RuntimeError
+            raise error_type(
                 f"File upload to Nasim failed: HTTP {upload_resp.status_code} - {upload_resp.text[:200]}"
             )
 
@@ -1172,9 +1218,15 @@ class BalePvConnector:
         # Bale's request random_id is the permanent message id used by
         # UpdateMessage/DeleteMessage. The SendMessage response's numeric
         # value is a server timestamp, not a reliable document message id.
-        # Retain the request id just as send_text does so retries are
-        # deduplicated and the sent file can later be deleted.
-        request_rid = random.randint(2**60, 2**63 - 1)
+        # Retain the request identity across retries, just as send_text does,
+        # so the accepted file can later be edited/deleted. An uncertain ACK
+        # does not imply success and must not be blindly retried.
+        request_rid = _request_rid(instance, chat_id, idempotency_key)
+        if before_dispatch is not None:
+            try:
+                await before_dispatch(request_rid)
+            except Exception as exc:
+                raise BalePreSendError("Send checkpoint failed before Bale dispatch") from exc
         send_response = await runtime.client.send_document(
             peer_id=peer_id,
             file_id=file_id,
@@ -1190,6 +1242,9 @@ class BalePvConnector:
             random_id=request_rid,
             peer_type=resolved_peer_type,
         )
+        if send_response is None:
+            from bale_pv_connector.exceptions import BaleRequestUnconfirmedError
+            raise BaleRequestUnconfirmedError("SendMessage(document) acknowledgement missing")
         ack = self._parse_send_ack(send_response)
         rid = request_rid
         date = ack.get("date")
@@ -1217,6 +1272,7 @@ class BalePvConnector:
                 "name": filename,
                 "rid": rid,
                 "date": date,
+                "delivery_confirmed": True,
             },
         }
 
