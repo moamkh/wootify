@@ -11,9 +11,10 @@ import os
 import random
 import secrets
 import tempfile
+from contextvars import ContextVar
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Awaitable, Callable, Optional
 
 import httpx
 
@@ -22,6 +23,34 @@ from wootify.plugins.eitaa_pv.session_client import EitaaLoginRequired, EitaaRef
 
 logger = logging.getLogger("wootify.plugins.eitaa_pv")
 DEFAULT_EITAA_PV_SESSION_DIR = legacy_or_var("data/eitaa_pv_sessions", "sessions/eitaa_pv")
+_FINAL_SEND: ContextVar[bool] = ContextVar("eitaa_final_send", default=False)
+
+
+class EitaaPreSendError(RuntimeError):
+    """A temporary failure before a customer-message send could be accepted."""
+
+    retryable = True
+    delivery_uncertain = False
+
+
+class EitaaSendUnconfirmedError(RuntimeError):
+    """The final send may have reached Eitaa; do not blindly repeat it."""
+
+    retryable = False
+    delivery_uncertain = True
+
+
+class EitaaSendRejectedError(RuntimeError):
+    """A definitive negative acknowledgement, not a positive delivery receipt."""
+
+    retryable = False
+    delivery_uncertain = False
+    delivery_rejected = True
+
+    def __init__(self, message: str, *, retryable: bool = False, retry_after_seconds: Optional[int] = None) -> None:
+        super().__init__(message)
+        self.retryable = retryable
+        self.retry_after_seconds = retry_after_seconds
 
 
 class _StickyEitaaTransport:
@@ -33,7 +62,14 @@ class _StickyEitaaTransport:
     """
 
     def __init__(self, settings: Any) -> None:
+        from eitaa_cli.tl.codec import TLCodec
+
         self.settings = settings
+        self._codec = TLCodec()
+        self._send_method_ids = {
+            self._codec.schema.method(method).id & 0xFFFFFFFF
+            for method in ("messages.sendMessage", "messages.sendMedia")
+        }
         self._client = httpx.AsyncClient(
             timeout=httpx.Timeout(settings.timeout),
             follow_redirects=False,
@@ -53,19 +89,44 @@ class _StickyEitaaTransport:
         if selected in endpoints:
             endpoints.remove(selected)
             endpoints.insert(0, selected)
+        # Session renewal shares this task with the send. Inspect the known
+        # envelope so renewal/read/upload-part failover stays unchanged; only
+        # final customer-message writes must not replay after a lost response.
+        guarded_send = _FINAL_SEND.get() and self._is_final_send_payload(payload)
+        if guarded_send and not endpoints:
+            raise EitaaPreSendError("No Eitaa send endpoint configured")
         errors: list[str] = []
         for endpoint in endpoints:
             try:
                 response = await self._client.post(endpoint, content=payload)
             except httpx.HTTPError as exc:
+                if guarded_send:
+                    if isinstance(exc, (httpx.ConnectError, httpx.ConnectTimeout, httpx.PoolTimeout)):
+                        raise EitaaPreSendError("Eitaa connection failed before send dispatch") from exc
+                    raise EitaaSendUnconfirmedError("Eitaa send transport response was lost") from exc
                 errors.append(f"{endpoint}: {type(exc).__name__}")
                 continue
             if response.status_code != httpx.codes.OK or not response.content:
+                if guarded_send:
+                    raise EitaaSendUnconfirmedError(
+                        f"Eitaa send acknowledgement missing: HTTP {response.status_code}"
+                    )
                 errors.append(f"{endpoint}: HTTP {response.status_code}")
                 continue
             self._selected[kind] = endpoint
             return response.content
         raise EitaaTransportError(f"all Eitaa {kind} endpoints failed: {'; '.join(errors)}")
+
+    def _is_final_send_payload(self, payload: bytes) -> bool:
+        """Identify only captured send methods inside the stateless envelope."""
+        try:
+            envelope = self._codec.decode_method_request("eitaaObject", payload)
+            packed = envelope.get("packed_data")
+            return isinstance(packed, bytes) and int.from_bytes(packed[:4], "little") in self._send_method_ids
+        except Exception:
+            # While a send is active, an uninspectable envelope cannot be
+            # assumed replay-safe. Malformed data fails closed.
+            return True
 
 
 @dataclass
@@ -193,24 +254,30 @@ class EitaaPvConnector:
         value = getattr(profile, "user_id", None) or getattr(profile, "id", None)
         return str(value) if value is not None else None
 
-    async def send_text(self, instance: str, chat_id: str, text: str, quoted: Optional[dict[str, Any]] = None, reply_markup: Any = None, *, idempotency_key: Optional[str] = None) -> dict[str, Any]:
+    async def send_text(self, instance: str, chat_id: str, text: str, quoted: Optional[dict[str, Any]] = None, reply_markup: Any = None, *, idempotency_key: Optional[str] = None, before_dispatch: Optional[Callable[[int], Awaitable[None]]] = None) -> dict[str, Any]:
         del reply_markup
         runtime = self._authenticated_runtime(instance)
         reply_to = self._message_id(quoted)
-        if idempotency_key:
+        try:
             peer = await runtime.client.peers.resolve(self._peer_ref(runtime, chat_id))
-            params = {"peer": peer, "message": text, "random_id": self._send_random_id(idempotency_key)}
-            if reply_to is not None:
-                params["reply_to_msg_id"] = reply_to
-            result = await runtime.client.invoke("messages.sendMessage", params)
-        else:
-            result = await runtime.client.messages.send_text(self._peer_ref(runtime, chat_id), text, reply_to=reply_to)
-        return dict(result)
+        except Exception as exc:
+            self._raise_pre_send_if_transient(exc)
+            raise
+        random_id = self._scoped_random_id(instance, chat_id, idempotency_key)
+        params = {"peer": peer, "message": text, "random_id": random_id}
+        if reply_to is not None:
+            params["reply_to_msg_id"] = reply_to
+        return await self._invoke_final_send(runtime, "messages.sendMessage", params,
+            kind="client", chat_id=chat_id, before_dispatch=before_dispatch)
 
-    async def send_media(self, instance: str, chat_id: str, media_url_or_bytes: Any, filename: str, caption: Optional[str] = None, quoted: Optional[dict[str, Any]] = None, reply_markup: Any = None, *, idempotency_key: Optional[str] = None) -> dict[str, Any]:
+    async def send_media(self, instance: str, chat_id: str, media_url_or_bytes: Any, filename: str, caption: Optional[str] = None, quoted: Optional[dict[str, Any]] = None, reply_markup: Any = None, *, idempotency_key: Optional[str] = None, before_dispatch: Optional[Callable[[int], Awaitable[None]]] = None) -> dict[str, Any]:
         del reply_markup
         runtime = self._authenticated_runtime(instance)
-        payload = await self._media_path(media_url_or_bytes, filename)
+        try:
+            payload = await self._media_path(media_url_or_bytes, filename)
+        except Exception as exc:
+            self._raise_pre_send_if_transient(exc)
+            raise
         try:
             # Uploaded file parts must be finalized on their upload host.
             # Sending their inputFile to a regular client host produces
@@ -223,13 +290,20 @@ class EitaaPvConnector:
                 content_type=content_type,
                 caption=caption or "",
                 reply_to=self._message_id(quoted),
-                random_id=self._send_random_id(idempotency_key) if idempotency_key else None,
+                random_id=self._scoped_random_id(instance, chat_id, idempotency_key),
+                before_dispatch=before_dispatch,
+                chat_id=chat_id,
             )
             return dict(result)
         finally:
             if payload.parent.parent.name == "wootify-eitaa-upload":
-                payload.unlink(missing_ok=True)
-                payload.parent.rmdir()
+                try:
+                    payload.unlink(missing_ok=True)
+                    payload.parent.rmdir()
+                except OSError as exc:
+                    # Local housekeeping must never hide an accepted send and
+                    # invite an operator to duplicate the attachment.
+                    logger.warning("eitaa_upload_temp_cleanup_failed error=%s", type(exc).__name__)
 
     @staticmethod
     async def _send_media_with_checksum(
@@ -241,6 +315,8 @@ class EitaaPvConnector:
         caption: str,
         reply_to: Optional[int],
         random_id: Optional[int] = None,
+        before_dispatch: Optional[Callable[[int], Awaitable[None]]] = None,
+        chat_id: Optional[str] = None,
     ) -> dict[str, Any]:
         """Upload and send media with an MD5 checksum for small input files."""
         from eitaa_cli.services.peers import input_peer_to_peer
@@ -254,7 +330,11 @@ class EitaaPvConnector:
         if parts > 4000:
             raise RuntimeError(f"Attachment requires {parts} upload parts; Eitaa supports at most 4000")
 
-        peer = await runtime.client.peers.resolve(peer_reference)
+        try:
+            peer = await runtime.client.peers.resolve(peer_reference)
+        except Exception as exc:
+            EitaaPvConnector._raise_pre_send_if_transient(exc)
+            raise
         plain_peer = input_peer_to_peer(peer)
         file_id = secrets.randbits(63) or 1
         checksum = "" if is_big else await asyncio.to_thread(EitaaPvConnector._md5_file, path)
@@ -272,9 +352,14 @@ class EitaaPvConnector:
                     params["peer"] = plain_peer
                 if is_big:
                     params["file_total_parts"] = parts
-                    accepted = await runtime.client.invoke("upload.saveBigFilePart", params, kind="upload")
+                    method = "upload.saveBigFilePart"
                 else:
-                    accepted = await runtime.client.invoke("upload.saveFilePart", params, kind="upload")
+                    method = "upload.saveFilePart"
+                try:
+                    accepted = await runtime.client.invoke(method, params, kind="upload")
+                except Exception as exc:
+                    EitaaPvConnector._raise_pre_send_if_transient(exc)
+                    raise
                 if accepted is not True:
                     raise RuntimeError(f"Eitaa rejected attachment part {index}")
         finally:
@@ -314,7 +399,113 @@ class EitaaPvConnector:
         }
         if reply_to is not None:
             params["reply_to_msg_id"] = reply_to
-        return dict(await runtime.client.invoke("messages.sendMedia", params, kind="upload"))
+        target = chat_id or EitaaPvConnector._chat_id_from_peer(peer)
+        return await EitaaPvConnector._invoke_final_send(runtime, "messages.sendMedia", params,
+            kind="upload", chat_id=target, before_dispatch=before_dispatch)
+
+    @staticmethod
+    def _scoped_random_id(instance: str, chat_id: str, key: Optional[str]) -> int:
+        # The workflow already scopes keys as instance:peer:message:part.
+        # Keep its established hash so retries of existing batches cannot
+        # acquire a different protocol identity after this upgrade.
+        del instance, chat_id
+        return EitaaPvConnector._send_random_id(key) if key else secrets.randbits(63) or 1
+
+    @staticmethod
+    def _raise_pre_send_if_transient(error: Exception) -> None:
+        from eitaa_cli.errors import EitaaRPCError, EitaaTransportError
+        current = error
+        seen = set()
+        while current is not None and id(current) not in seen:
+            seen.add(id(current))
+            if isinstance(current, (httpx.TransportError, EitaaTransportError, EitaaRefreshPending)):
+                raise EitaaPreSendError(f"Eitaa pre-send service temporarily unavailable: {error}") from error
+            if isinstance(current, httpx.HTTPStatusError) and (current.response.status_code in (408, 429) or current.response.status_code >= 500):
+                raise EitaaPreSendError(f"Eitaa attachment download temporarily failed: HTTP {current.response.status_code}") from error
+            if isinstance(current, EitaaRPCError) and current.retryable:
+                raise EitaaPreSendError(f"Eitaa pre-send RPC temporarily failed: {current}") from error
+            current = current.__cause__
+
+    @staticmethod
+    async def _invoke_final_send(runtime: EitaaPvRuntime, method: str, params: dict[str, Any], *,
+                                 kind: str, chat_id: str,
+                                 before_dispatch: Optional[Callable[[int], Awaitable[None]]]) -> dict[str, Any]:
+        from eitaa_cli.errors import EitaaRPCError
+        if before_dispatch is not None:
+            try:
+                await before_dispatch(int(params["random_id"]))
+            except Exception as exc:
+                raise EitaaPreSendError("Eitaa send checkpoint failed before dispatch") from exc
+        token = _FINAL_SEND.set(True)
+        try:
+            try:
+                result = await runtime.client.invoke(method, params, kind=kind)
+            except (EitaaPreSendError, EitaaSendUnconfirmedError):
+                raise
+            except EitaaRefreshPending as exc:
+                # Renewal raises only before the business RPC or after an
+                # explicit auth rejection; an ambiguous renewal write is not
+                # an ambiguous customer-message send.
+                raise EitaaPreSendError(str(exc)) from None
+            except EitaaLoginRequired as exc:
+                raise EitaaSendRejectedError(str(exc)) from None
+            except EitaaRPCError as exc:
+                if exc.code >= 500 or "TIMEOUT" in exc.normalized_text:
+                    raise EitaaSendUnconfirmedError(f"Eitaa send failed without a delivery receipt: {exc}") from exc
+                raise EitaaSendRejectedError(str(exc), retryable=exc.code in (420, 429),
+                    retry_after_seconds=exc.retry_after_seconds) from exc
+            except Exception as exc:
+                raise EitaaSendUnconfirmedError(f"Eitaa send acknowledgement unavailable: {exc}") from exc
+        finally:
+            _FINAL_SEND.reset(token)
+        return EitaaPvConnector._confirmed_send_result(result, chat_id, int(params["random_id"]))
+
+    @staticmethod
+    def _chat_id_from_peer(peer: dict[str, Any]) -> str:
+        if not isinstance(peer, dict):
+            return ""
+        kind = peer.get("_")
+        if kind in {"peerUser", "inputPeerUser"}:
+            return str(peer.get("user_id") or "")
+        if kind in {"peerChat", "inputPeerChat"}:
+            return f"chat:{peer.get('chat_id')}"
+        if kind in {"peerChannel", "inputPeerChannel"}:
+            return f"channel:{peer.get('channel_id')}"
+        return ""
+
+    @staticmethod
+    def _confirmed_send_result(response: Any, chat_id: str, random_id: Optional[int]) -> dict[str, Any]:
+        """Select a positive ACK for this request, never an unrelated update."""
+        if not isinstance(response, dict):
+            raise EitaaSendUnconfirmedError("eitaa_send_not_acknowledged: response is not an object")
+        positive_id = lambda value: isinstance(value, int) and not isinstance(value, bool) and value > 0
+        message_id = None
+        if response.get("_") == "updateShortSentMessage" and positive_id(response.get("id")):
+            message_id = response["id"]
+        elif response.get("_") in {"updates", "updatesCombined"}:
+            matched, new_messages = set(), set()
+            has_message_mapping = False
+            updates = response.get("updates") or []
+            if not isinstance(updates, list):
+                raise EitaaSendUnconfirmedError("eitaa_send_not_acknowledged: invalid update list")
+            for update in updates:
+                if not isinstance(update, dict):
+                    continue
+                if update.get("_") == "updateMessageID":
+                    has_message_mapping = True
+                    if random_id is not None and update.get("random_id") == random_id and positive_id(update.get("id")):
+                        matched.add(update["id"])
+                if update.get("_") in {"updateNewMessage", "updateNewChannelMessage"}:
+                    message = update.get("message") or {}
+                    if isinstance(message, dict) and bool(message.get("out") or (message.get("pFlags") or {}).get("out")) and EitaaPvConnector._chat_id_from_peer(message.get("peer_id") or {}) == str(chat_id) and positive_id(message.get("id")):
+                        new_messages.add(message["id"])
+            candidates = matched if has_message_mapping else new_messages
+            if len(candidates) == 1:
+                message_id = next(iter(candidates))
+        if message_id is None:
+            raise EitaaSendUnconfirmedError(f"eitaa_send_not_acknowledged: {response.get('_', 'unknown response')}")
+        return {**response, "message_id": str(message_id), "random_id": random_id,
+                "delivery_confirmed": True, "confirmation_kind": "eitaa_server_message_id"}
 
     @staticmethod
     def _send_random_id(key: str) -> int:
@@ -428,9 +619,17 @@ class EitaaPvConnector:
         events: list[dict[str, Any]] = []
         deletions: list[dict[str, Any]] = []
         messages = list(difference.get("new_messages") or [])
+        confirmations: list[dict[str, Any]] = []
         for update in difference.get("other_updates") or []:
             update_kind = update.get("_")
-            if update_kind in {"updateNewMessage", "updateNewChannelMessage", "updateEditMessage", "updateEditChannelMessage"}:
+            if update_kind == "updateMessageID":
+                request_id, message_id = update.get("random_id"), update.get("id")
+                if all(isinstance(value, int) and not isinstance(value, bool) and value > 0 for value in (request_id, message_id)):
+                    confirmations.append({"delivery_confirmation": True, "request_id": str(request_id),
+                        "message_id": str(message_id), "platform_message_id": str(message_id),
+                        "outgoing": True, "chat_id": "",
+                        "update_id": f"eitaa-send-confirmation:{request_id}:{message_id}"})
+            elif update_kind in {"updateNewMessage", "updateNewChannelMessage", "updateEditMessage", "updateEditChannelMessage"}:
                 messages.append(update.get("message") or {})
             elif update_kind in {"updateDeleteMessages", "updateDeleteChannelMessages"}:
                 chat_id = f"channel:{update['channel_id']}" if update.get("channel_id") else ""
@@ -462,6 +661,15 @@ class EitaaPvConnector:
             events.append({"chat_id": chat_id, "peer": peer, "peer_ref": peer_ref,
                            "message": message, "entities": encoded_entities,
                            "update_id": f"{chat_id}:{message['id']}:{message.get('edit_date') or 0}{edit_suffix}"})
+        for confirmation in confirmations:
+            peers = {event["chat_id"] for event in events if isinstance(event.get("message"), dict)
+                and str(event["message"].get("id")) == confirmation["message_id"]
+                and bool(event["message"].get("out") or (event["message"].get("pFlags") or {}).get("out"))}
+            if len(peers) == 1:
+                confirmation["chat_id"] = peers.pop()
+        # Correlation receipts must be processed before their native echoes,
+        # otherwise a lost send ACK could create a duplicate Chatwoot bubble.
+        events = confirmations + events
         events.extend(deletions)
         # A delete in the same difference as its original needs to share its
         # delivery stream, otherwise an attachment failure could let it overtake.

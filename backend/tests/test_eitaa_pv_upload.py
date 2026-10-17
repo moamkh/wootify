@@ -23,7 +23,7 @@ async def test_uploaded_media_is_finalized_on_upload_transport(tmp_path, name, m
             return True
         # The regular messaging host cannot see the uploaded parts.
         assert kind == 'upload'
-        return {'_': 'updates'}
+        return {'_': 'updateShortSentMessage', 'id': 24}
 
     runtime = SimpleNamespace(client=SimpleNamespace(
         peers=SimpleNamespace(resolve=AsyncMock(return_value=peer)), invoke=invoke,

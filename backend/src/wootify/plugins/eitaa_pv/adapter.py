@@ -6,7 +6,7 @@ import asyncio
 import mimetypes
 import math
 from collections import OrderedDict
-from typing import Any, AsyncIterator, Optional
+from typing import Any, AsyncIterator, Awaitable, Callable, Optional
 
 from wootify.adapters.base import BasePlatformAdapter
 from wootify.plugins.eitaa_pv.connector import eitaa_pv
@@ -21,28 +21,18 @@ class EitaaPvAdapter(BasePlatformAdapter):
     async def disconnect(self) -> None:
         await eitaa_pv.disconnect(self.instance_key)
 
-    async def send_text(self, peer_id: str, text: str, *, reply_to: Optional[str] = None, mirror_echo: bool = True, idempotency_key: Optional[str] = None) -> dict[str, Any]:
-        result = await eitaa_pv.send_text(self.instance_key, peer_id, text, {"message_id": reply_to} if reply_to else None, idempotency_key=idempotency_key)
+    async def send_text(self, peer_id: str, text: str, *, reply_to: Optional[str] = None, mirror_echo: bool = True, idempotency_key: Optional[str] = None, before_dispatch: Optional[Callable[[int], Awaitable[None]]] = None) -> dict[str, Any]:
+        result = await eitaa_pv.send_text(self.instance_key, peer_id, text, {"message_id": reply_to} if reply_to else None, idempotency_key=idempotency_key, before_dispatch=before_dispatch)
         return self._sent_result(peer_id, result, mirror_echo=mirror_echo)
 
-    async def send_media(self, peer_id: str, media: Any, *, filename: Optional[str] = None, caption: Optional[str] = None, reply_to: Optional[str] = None, mirror_echo: bool = True, idempotency_key: Optional[str] = None) -> dict[str, Any]:
-        result = await eitaa_pv.send_media(self.instance_key, peer_id, media, filename or "file", caption, {"message_id": reply_to} if reply_to else None, idempotency_key=idempotency_key)
+    async def send_media(self, peer_id: str, media: Any, *, filename: Optional[str] = None, caption: Optional[str] = None, reply_to: Optional[str] = None, mirror_echo: bool = True, idempotency_key: Optional[str] = None, before_dispatch: Optional[Callable[[int], Awaitable[None]]] = None) -> dict[str, Any]:
+        result = await eitaa_pv.send_media(self.instance_key, peer_id, media, filename or "file", caption, {"message_id": reply_to} if reply_to else None, idempotency_key=idempotency_key, before_dispatch=before_dispatch)
         return self._sent_result(peer_id, result, mirror_echo=mirror_echo)
 
     def _sent_result(self, peer_id: str, response: dict[str, Any], *, mirror_echo: bool) -> dict[str, Any]:
-        result = dict(response)
-        message_id = result.get("message_id")
-        if result.get("_") == "updateShortSentMessage":
-            message_id = result.get("id")
-        updates = result.get("updates") or []
-        for update in updates:
-            if update.get("_") == "updateMessageID":
-                message_id = update.get("id")
-                break
-            if update.get("_") in {"updateNewMessage", "updateNewChannelMessage"}:
-                message_id = (update.get("message") or {}).get("id")
-        if message_id is None:
-            raise RuntimeError(f"eitaa_send_not_acknowledged: {result.get('_', 'unknown response')}")
+        from wootify.plugins.eitaa_pv.connector import EitaaPvConnector
+        result = EitaaPvConnector._confirmed_send_result(response, peer_id, response.get("random_id") if isinstance(response, dict) else None)
+        message_id = result["message_id"]
         if message_id is not None:
             result["message_id"] = str(message_id)
             if not mirror_echo:
@@ -53,7 +43,7 @@ class EitaaPvAdapter(BasePlatformAdapter):
                 self._sent_echoes[(str(peer_id), str(message_id))] = None
                 while len(self._sent_echoes) > 2048:
                     self._sent_echoes.popitem(last=False)
-        return {"ok": True, "result": result}
+        return {"ok": True, "confirmed": True, "result": result}
 
     async def edit_message(self, peer_id: str, message_id: str, text: str) -> dict[str, Any]:
         return {"ok": True, "result": await eitaa_pv.update_message(self.instance_key, peer_id, message_id, text)}
@@ -81,6 +71,11 @@ class EitaaPvAdapter(BasePlatformAdapter):
             await asyncio.sleep(eitaa_pv.poll_interval(self.instance_key))
 
     def normalize_incoming_update(self, raw_update: Any) -> Optional[dict[str, Any]]:
+        if isinstance(raw_update, dict) and raw_update.get("delivery_confirmation") is True:
+            request_id, message_id = raw_update.get("request_id"), raw_update.get("platform_message_id")
+            if not all(str(value or "").isdigit() and int(str(value)) > 0 for value in (request_id, message_id)):
+                return None
+            return {**raw_update, "raw": raw_update}
         if isinstance(raw_update, dict) and raw_update.get("channel_gap"):
             raise RuntimeError(f"eitaa_channel_difference_required: {raw_update.get('chat_id')}")
         if isinstance(raw_update, dict) and raw_update.get("deleted"):
