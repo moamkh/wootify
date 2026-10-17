@@ -1,5 +1,23 @@
 # Changelog
 
+### 7.1.2 hotfix — 2026-10-17
+
+- Require positive Bale PV/Eitaa PV message confirmation before marking sent;
+  keep failures red with native Retry and an actionable error.
+- Use one durable per-part delivery ledger: retry proven pre-send failures,
+  respect Eitaa flood waits, skip confirmed attachments and correlate late ACKs.
+- Stop hidden Eitaa endpoint replay after uncertain final sends; preserve token
+  renewal, existing request hashes and media-upload host behavior.
+- Send Eitaa files first and one caption last. Import older accepted batch parts
+  safely, including crashes before caption mapping handover.
+- Remove only matching tagged private failure notes after confirmed success;
+  retry status/note bookkeeping without repeating customer sends.
+- Coalesce explicit Retry UUIDs, cancel deleted unsent jobs, preserve edit/reply
+  mappings, and never automatically replay historical failed messages on upgrade.
+- Companion Chatvand v4.10.1-chatvand.3 supplies truthful native Retry and scoped
+  note cleanup. No frontend build, dependency change or schema migration.
+- Verification: 617 Python tests, plus 26 isolated actual-service Chatvand checks.
+
 ## 7.1.2 — 2026-10-14
 
 - Add an editable per-inbox **Reopen resolved conversation** setting. Apply
