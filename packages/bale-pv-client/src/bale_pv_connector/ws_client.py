@@ -600,6 +600,7 @@ class BaleWebSocketClient:
                             BaleRpcError(
                                 f"{resp.error.get('code')}: {resp.error.get('message')}",
                                 code=resp.error.get("code"),
+                                delivery_rejected=True,
                             )
                         )
                     else:
@@ -618,12 +619,17 @@ class BaleWebSocketClient:
         timeout: float = 30.0,
     ) -> bytes:
         """Send a unary request and wait for response."""
+        from .exceptions import (
+            BaleRequestNotDispatchedError,
+            BaleRequestUnconfirmedError,
+            BaleRpcError,
+        )
+
         if not self._connected or not self._ws:
-            raise ConnectionError("WebSocket not connected")
+            raise BaleRequestNotDispatchedError("WebSocket not connected")
 
         index = self._next_index()
         future: asyncio.Future = asyncio.get_event_loop().create_future()
-        self._pending_responses[index] = future
 
         req = WsRequest(
             service_name=service_name,
@@ -633,13 +639,41 @@ class BaleWebSocketClient:
             index=index,
         )
 
-        await self._ws.send(req.serialize())
-
+        # Serialize before entering the uncertain transport phase. Once send
+        # starts, even an exception cannot prove that no bytes reached Bale.
+        wire_payload = req.serialize()
+        self._pending_responses[index] = future
         try:
-            return await asyncio.wait_for(future, timeout=timeout)
-        except asyncio.TimeoutError:
+            await self._ws.send(wire_payload)
+            try:
+                return await asyncio.wait_for(future, timeout=timeout)
+            except BaleRpcError:
+                # An explicit server rejection is different from a lost ACK.
+                raise
+            except asyncio.TimeoutError as exc:
+                if method != "SendMessage":
+                    raise TimeoutError(f"Request timeout for {service_name}/{method}") from exc
+                raise BaleRequestUnconfirmedError(
+                    f"Request acknowledgement timeout for {service_name}/{method}"
+                ) from exc
+            except Exception as exc:
+                if method != "SendMessage":
+                    raise
+                raise BaleRequestUnconfirmedError(
+                    f"Request acknowledgement lost for {service_name}/{method}: {exc}"
+                ) from exc
+        except (BaleRpcError, BaleRequestUnconfirmedError):
+            raise
+        except Exception as exc:
+            if method != "SendMessage":
+                raise
+            raise BaleRequestUnconfirmedError(
+                f"Request dispatch unconfirmed for {service_name}/{method}: {exc}"
+            ) from exc
+        finally:
             self._pending_responses.pop(index, None)
-            raise TimeoutError(f"Request timeout for {service_name}/{method}")
+            if not future.done():
+                future.cancel()
 
     async def send_update(
         self,

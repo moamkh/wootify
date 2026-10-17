@@ -33,6 +33,7 @@ from .messaging_messages import (
     GetContactsRequest,
 )
 from .ws_client import BaleWebSocketClient
+from .exceptions import BaleRequestUnconfirmedError
 
 logger = logging.getLogger("bale_pv_connector.messaging")
 
@@ -79,8 +80,7 @@ class BaleMessagingClient:
         """Close connection."""
         await self.ws.close()
 
-    # How long to wait for the SendMessage ack before giving up. The message
-    # is already sent by then, so a timeout only means "no rid known".
+    # How long to await Bale's acceptance. A timeout is NOT a successful send.
     SEND_ACK_TIMEOUT_SECONDS = 15.0
 
     async def send_message(
@@ -97,9 +97,8 @@ class BaleMessagingClient:
         Bale pushes new own-messages only to the account's *other* sessions,
         never back to the originating one, so the SendMessage RPC response is
         this session's only source of the assigned message rid/date. We
-        therefore send it as a unary request and capture the response. If the
-        server never answers (the historical assumption in this codebase), the
-        message is still delivered — we log a warning and return ``None``.
+        therefore send it as a unary request and capture the response. A lost
+        acknowledgement is uncertain delivery, never reported as success.
         """
         req = SendMessageRequest(
             peer_id=peer_id,
@@ -110,18 +109,17 @@ class BaleMessagingClient:
             random_id=random_id,
         )
         try:
-            return await self.ws.send_request(
+            response = await self.ws.send_request(
                 service_name=self.SERVICE,
                 method="SendMessage",
                 payload=req.serialize(),
                 timeout=self.SEND_ACK_TIMEOUT_SECONDS,
             )
-        except TimeoutError:
-            logger.warning(
-                "SendMessage ack timeout peer_id=%s; message delivered but rid unknown",
-                peer_id,
-            )
-            return None
+        except TimeoutError as exc:
+            raise BaleRequestUnconfirmedError("SendMessage acknowledgement timeout") from exc
+        if response is None:
+            raise BaleRequestUnconfirmedError("SendMessage acknowledgement missing")
+        return response
 
     async def update_message(
         self,
@@ -285,8 +283,8 @@ class BaleMessagingClient:
         and the target peer independently.
 
         Like ``send_message`` this awaits the SendMessage response (which
-        carries the assigned rid/date); on ack timeout the message is still
-        delivered and ``None`` is returned.
+        carries the assigned rid/date). An acknowledgement timeout is uncertain
+        delivery and raises; it must not fabricate a successful media send.
         """
         doc = DocumentMessage(
             file_id=file_id,
@@ -307,18 +305,19 @@ class BaleMessagingClient:
             access_hash=peer_access_hash or None,
         )
         try:
-            return await self.ws.send_request(
+            response = await self.ws.send_request(
                 service_name=self.SERVICE,
                 method="SendMessage",
                 payload=req.serialize(),
                 timeout=self.SEND_ACK_TIMEOUT_SECONDS,
             )
-        except TimeoutError:
-            logger.warning(
-                "SendMessage(document) ack timeout peer_id=%s; message delivered but rid unknown",
-                peer_id,
-            )
-            return None
+        except TimeoutError as exc:
+            raise BaleRequestUnconfirmedError(
+                "SendMessage(document) acknowledgement timeout"
+            ) from exc
+        if response is None:
+            raise BaleRequestUnconfirmedError("SendMessage(document) acknowledgement missing")
+        return response
 
     async def import_contacts(
         self,
