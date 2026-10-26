@@ -151,6 +151,7 @@ class EitaaPvRuntime:
     pending_updates: Optional[list[dict[str, Any]]] = None
     web_poll_interval: Optional[float] = None
     peers_loaded: bool = False
+    phone_resolution_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
 
 
 class EitaaPvConnector:
@@ -787,30 +788,127 @@ class EitaaPvConnector:
         return {"ok": True, "result": events}
 
     async def resolve_phone_to_user(self, instance: str, phone_number: str) -> dict[str, Any]:
-        """Verify an exact phone match; never use the search resolver's first hit."""
+        """Resolve within this account; import one phone only after read-only lookup."""
         from wootify.application.messaging.payload_parser import ChatwootPayloadParser
 
         runtime = self._authenticated_runtime(instance)
         normalized = ChatwootPayloadParser.normalize_bale_pv_phone(phone_number)
-        if not normalized:
+        if not normalized.isascii() or not normalized.isdigit() or not 8 <= len(normalized) <= 15:
             raise RuntimeError("eitaa_invalid_phone_number")
-        contacts = await runtime.client.invoke("contacts.getContacts", {"hash": 0})
-        dialogs = await runtime.client.dialogs.list(limit=100)
-        for response in (contacts, dialogs):
-            if response.get("_") == "eitaa_updates_expire_token":
-                self._check_response(runtime, response)
+        # Serialize imports for one account. Another resolver can then observe
+        # the newly saved contact instead of importing it concurrently.
+        async with runtime.phone_resolution_lock:
+            contacts = await runtime.client.invoke("contacts.getContacts", {"hash": 0})
+            self._check_expiry(runtime, contacts)
+            if not isinstance(contacts.get("users"), list):
+                raise EitaaPreSendError("eitaa_contacts_lookup_incomplete: retry contact resolution")
+            user = self._matching_phone_user(contacts, normalized)
+            if user is None:
+                user = await self._find_phone_in_dialogs(runtime, normalized)
+            if user is None:
+                # getContacts/getDialogs only expose known/visible users. An
+                # empty search is NOT proof that this phone is unregistered.
+                # Import only the requested phone, correlated by our client_id.
+                client_id = secrets.randbelow((1 << 63) - 1) + 1
+                imported = await runtime.client.invoke("contacts.importContacts", {"contacts": [{
+                    "_": "inputPhoneContact", "client_id": client_id,
+                    "phone": "+" + normalized, "first_name": "Eitaa contact", "last_name": "",
+                }]})
+                self._check_expiry(runtime, imported)
+                if str(client_id) in {str(value) for value in imported.get("retry_contacts") or []}:
+                    raise EitaaPreSendError("eitaa_phone_import_retry_requested: Eitaa asked to retry the lookup")
+                ids = {str(item.get("user_id")) for item in imported.get("imported") or []
+                       if str(item.get("client_id")) == str(client_id) and item.get("user_id")}
+                if len(ids) > 1:
+                    raise RuntimeError("eitaa_phone_ambiguous")
+                candidates = [item for item in imported.get("users") or [] if str(item.get("id")) in ids]
+                if candidates:
+                    # The explicit imported client_id -> user_id association is
+                    # valid even when privacy hides the returned phone field.
+                    if any(item.get("phone") and ChatwootPayloadParser.normalize_bale_pv_phone(
+                            str(item["phone"])) != normalized for item in candidates):
+                        raise RuntimeError("eitaa_phone_import_identity_mismatch")
+                    if any(item != candidates[0] for item in candidates[1:]):
+                        raise RuntimeError("eitaa_phone_ambiguous")
+                    if self._has_user_access_hash(candidates[0]):
+                        user = candidates[0]
+                if user is None:
+                    raise RuntimeError("eitaa_phone_unresolved_for_account: Eitaa did not return a verified "
+                                       "recipient for this account; check phone discoverability or ask the "
+                                       "customer to message this Eitaa account first")
+            runtime.peer_refs[str(user["id"])] = f"user:{user['id']}:{user['access_hash']}"
+            return user
+
+    @staticmethod
+    def _has_user_access_hash(user: dict[str, Any]) -> bool:
+        return (str(user.get("id") or "").isdigit() and int(user["id"]) > 0
+                and not isinstance(user.get("access_hash"), bool)
+                and str(user.get("access_hash") or "").lstrip("-").isdigit()
+                and int(user["access_hash"]) != 0)
+
+    @classmethod
+    def _matching_phone_user(cls, response: dict[str, Any], normalized: str) -> Optional[dict[str, Any]]:
+        from wootify.application.messaging.payload_parser import ChatwootPayloadParser
+
         matches = {
             str(user["id"]): user
-            for response in (contacts, dialogs)
             for user in response.get("users") or []
-            if user.get("id") and user.get("access_hash") is not None
+            if user.get("id")
             and ChatwootPayloadParser.normalize_bale_pv_phone(str(user.get("phone") or "")) == normalized
         }
-        if len(matches) != 1:
-            raise RuntimeError("eitaa_phone_not_found" if not matches else "eitaa_phone_ambiguous")
-        user = next(iter(matches.values()))
-        runtime.peer_refs[str(user["id"])] = f"user:{user['id']}:{user['access_hash']}"
-        return user
+        if len(matches) > 1:
+            raise RuntimeError("eitaa_phone_ambiguous")
+        user = next(iter(matches.values()), None)
+        return user if user is not None and cls._has_user_access_hash(user) else None
+
+    async def _find_phone_in_dialogs(self, runtime: EitaaPvRuntime, normalized: str) -> Optional[dict[str, Any]]:
+        """Page known dialogs without generic search or first-hit routing.
+
+        Bound the read-only scan; a missing cursor or capped scan still falls
+        back to targeted import, never a claim that the phone is unregistered.
+        """
+        response = await runtime.client.dialogs.list(limit=100)
+        cursors: set[tuple[int, int, str]] = set()
+        for page in range(20):
+            self._check_expiry(runtime, response)
+            if not isinstance(response.get("dialogs"), list) or not isinstance(response.get("users"), list):
+                raise EitaaPreSendError("eitaa_dialog_lookup_incomplete: retry contact resolution")
+            user = self._matching_phone_user(response, normalized)
+            if user is not None:
+                return user
+            dialogs = response["dialogs"]
+            if not dialogs or (response.get("_") != "messages.dialogsSlice" and len(dialogs) < 100):
+                break
+            last = dialogs[-1]
+            peer = last.get("peer") or {}
+            top_id = int(last.get("top_message") or 0)
+            messages = [item for item in response.get("messages") or []
+                        if int(item.get("id") or 0) == top_id
+                        and (not item.get("peer_id") or item["peer_id"] == peer)]
+            date = int(messages[0].get("date") or 0) if len(messages) == 1 else 0
+            kind = peer.get("_")
+            entity_type = "user" if kind == "peerUser" else "channel"
+            identifier = peer.get("user_id") if kind == "peerUser" else peer.get("channel_id")
+            entity = self._entity_map(response).get((entity_type, int(identifier or 0)), {})
+            if kind == "peerChat" and str(peer.get("chat_id") or "").isdigit() and int(peer["chat_id"]) > 0:
+                input_peer = {"_": "inputPeerChat", "chat_id": peer.get("chat_id")}
+            elif kind in {"peerUser", "peerChannel"} and self._has_user_access_hash(entity):
+                input_peer = {"_": "inputPeerUser" if kind == "peerUser" else "inputPeerChannel",
+                              "user_id" if kind == "peerUser" else "channel_id": identifier,
+                              "access_hash": entity["access_hash"]}
+            else:
+                break
+            cursor = (top_id, date, str(peer))
+            if not top_id or not date or cursor in cursors:
+                break
+            cursors.add(cursor)
+            if page == 19:
+                break
+            response = await runtime.client.invoke("messages.getDialogs", {
+                "exclude_pinned": True, "offset_date": date, "offset_id": top_id,
+                "offset_peer": input_peer, "limit": 100, "hash": 0,
+            })
+        return None
 
     def _runtime(self, instance: str) -> EitaaPvRuntime:
         runtime = self._runtimes.get(instance)

@@ -40,7 +40,7 @@ async def test_exact_phone_resolution_ignores_nonmatching_first_hit():
     assert c._runtimes["test"].peer_refs["42"] == "user:42:99"
 
 
-@pytest.mark.parametrize("users,error", [([], "not_found"),
+@pytest.mark.parametrize("users,error", [([], "unresolved_for_account"),
     ([{"id":1,"phone":"989904905660","access_hash":8},
       {"id":2,"phone":"989904905660","access_hash":9}], "ambiguous")])
 @pytest.mark.anyio

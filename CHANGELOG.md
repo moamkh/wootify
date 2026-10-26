@@ -1,5 +1,18 @@
 # Changelog
 
+### 7.1.2 hotfix — 2026-10-26
+
+- Resolve unknown Eitaa phone destinations with a targeted contact import after
+  checking saved contacts and paginated dialogs. Require the response's exact
+  client-ID/user-ID association; never choose an unrelated search result.
+- Obtain access hashes from the sending account only. Preserve instance-owned
+  Chatwoot maps and WhatsApp identifiers; imports may add the requested phone to
+  the authenticated Eitaa account's contacts, not change Chatwoot contact names.
+- Distinguish unresolved/account-private phones and incomplete/retryable lookups
+  from an unregistered number. Reject mismatched/ambiguous import results and
+  missing access hashes; keep failed sends red with the existing Retry behavior.
+- No frontend, dependencies, schema migrations, credentials or inbox settings change.
+
 ### 7.1.2 hotfix — 2026-10-17
 
 - Require positive Bale PV/Eitaa PV message confirmation before marking sent;
