@@ -449,6 +449,15 @@ class ChatwootBridgeService:
             "private": False,
             "source_id": source_id,
         }
+        raw_message = (event.get('raw') or {}).get('message') or {}
+        try:
+            source_time = float(event.get('date') or raw_message.get('date') or 0)
+            if source_time > 1e12:
+                source_time /= 1000
+            if 946684800 <= source_time <= dt.datetime.now(dt.timezone.utc).timestamp() + 300:
+                post_data['external_created_at'] = source_time
+        except (TypeError, ValueError):
+            pass
         reply_reference = event.get("reply_to")
         platform_parent_id = (
             str(reply_reference.get("message_id") or reply_reference.get("id") or "").strip()
