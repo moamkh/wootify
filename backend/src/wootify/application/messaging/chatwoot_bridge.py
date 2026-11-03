@@ -1230,7 +1230,8 @@ class ChatwootBridgeService:
         if state.get("deleted") is True:
             return {"ok": True, "ignored": True, "reason": "already_deleted"}
 
-        chatwoot_message_id = str(mapping.chatwoot_message_id or "").strip()
+        batch_id = str(state.get('batch_message_id') or '').strip()
+        chatwoot_message_id = str(mapping.chatwoot_message_id or batch_id or "").strip()
         chatwoot_conversation_id = str(
             conversation.chatwoot_conversation_id or ""
         ).strip()
@@ -1244,16 +1245,30 @@ class ChatwootBridgeService:
             )
             return {"ok": True, "ignored": True, "reason": "delete_mapping_invalid"}
 
+        members = [member for member in db.query(MessageMapping).filter(
+            MessageMapping.conversation_id == conversation.id,
+            MessageMapping.direction == MessageDirection.chatwoot_to_platform,
+        ).all() if str((member.platform_payload_json or {}).get('batch_message_id') or '') == batch_id] if batch_id else []
+        primary = next((member for member in members if member.chatwoot_message_id), None)
+        ledger = self._bale_outbound.state(primary) if primary else {}
+        multipart = len(members) > 1 or len(ledger.get('plan') or []) > 1
         try:
-            await client.delete_message(
+            if multipart:
+                part = str(state.get('batch_part') or '')
+                if part != 'text' and not re.fullmatch(r'media:[1-9]\d*', part):
+                    raise RuntimeError('delete_attachment_mapping_unavailable')
+                await client.delete_message_part(account_id, int(chatwoot_conversation_id), int(chatwoot_message_id),
+                    part=part, remove_content=part == 'text' or (part == ledger.get('primary_part') and 'text' not in ledger.get('plan', [])))
+            else:
+                await client.delete_message(
                 account_id=account_id,
                 conversation_id=int(chatwoot_conversation_id),
                 message_id=int(chatwoot_message_id),
-            )
+                )
         except httpx.HTTPStatusError as exc:
             # A 404 means Chatwoot already deleted the row. Treat it as an
             # idempotent success and remember that state locally.
-            if exc.response.status_code != 404:
+            if multipart or exc.response.status_code != 404:
                 raise
 
         state["deleted"] = True
@@ -2826,6 +2841,9 @@ class ChatwootBridgeService:
         us the platform message id, and the adapter deletes it via the
         authenticated platform session.
         """
+        attributes = payload.get('content_attributes') or {}
+        if isinstance(attributes, dict) and attributes.get('wootify_deleted_parts'):
+            return {'ok': True, 'ignored': True, 'reason': 'platform_part_delete_echo', 'detail': 'platform_part_delete_echo'}
         message_id = MessagePayloadParser.extract_message_id(payload)
         if not message_id:
             return {"ok": True, "ignored": True, "reason": "no_message_id", "detail": "no_message_id"}
@@ -2863,12 +2881,7 @@ class ChatwootBridgeService:
         if ":edit:" in str(mapping.platform_message_id or ""):
             return {"ok": True, "ignored": True, "reason": "edit_reply", "detail": "edit_reply"}
 
-        if not mapping.platform_message_id:
-            return {"ok": True, "ignored": True, "reason": "no_platform_message_id", "detail": "no_platform_message_id"}
-
         payload_state = mapping.platform_payload_json
-        if isinstance(payload_state, dict) and payload_state.get("deleted") is True:
-            return {"ok": True, "ignored": True, "reason": "already_deleted", "detail": "already_deleted"}
 
         if not conversation:
             return {"ok": False, "detail": "conversation_not_found"}
@@ -2885,11 +2898,25 @@ class ChatwootBridgeService:
         if adapter_delete is None:
             return {"ok": True, "ignored": True, "reason": "delete_not_supported", "detail": "delete_not_supported"}
 
+        batch_id = str((payload_state or {}).get('batch_message_id') or message_id)
+        members = [member for member in db.query(MessageMapping).filter(
+            MessageMapping.conversation_id == conversation.id,
+            MessageMapping.direction == MessageDirection.chatwoot_to_platform,
+        ).all() if member.id == mapping.id or str((member.platform_payload_json or {}).get('batch_message_id') or '') == batch_id]
+        if all((member.platform_payload_json or {}).get('deleted') for member in members):
+            return {'ok': True, 'ignored': True, 'reason': 'already_deleted', 'detail': 'already_deleted'}
+        if not any(member.platform_message_id for member in members):
+            return {'ok': True, 'ignored': True, 'reason': 'no_platform_message_id', 'detail': 'no_platform_message_id'}
+        result = None
         try:
-            result = await adapter_delete(
-                peer_id=str(peer_id),
-                message_id=mapping.platform_message_id,
-            )
+            for member in members:
+                if not member.platform_message_id or (member.platform_payload_json or {}).get('deleted'):
+                    continue
+                result = await adapter_delete(peer_id=str(peer_id), message_id=member.platform_message_id)
+                if isinstance(result, dict) and result.get('ok') is False:
+                    raise RuntimeError('platform rejected delete')
+                member.platform_payload_json = {**(member.platform_payload_json or {}), 'deleted': True}
+                db.commit()  # A retry resumes only the remaining confirmed parts.
         except Exception as exc:
             logger.exception(
                 "chatwoot_bridge.delete_propagation_failed instance=%s chatwoot_message_id=%s platform_message_id=%s error=%s",
@@ -2904,7 +2931,7 @@ class ChatwootBridgeService:
             return {"ok": False, "detail": "delete_failed: platform rejected delete"}
 
         mapping.platform_payload_json = {
-            **(payload_state if isinstance(payload_state, dict) else {}),
+            **(mapping.platform_payload_json or {}),
             "deleted": True,
         }
         db.commit()

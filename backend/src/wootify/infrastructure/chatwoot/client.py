@@ -696,6 +696,13 @@ class ChatwootClient:
                 return {'ok': True, 'already_removed': True}
             raise
 
+    async def delete_message_part(self, account_id: int, conversation_id: int, message_id: int,
+                                  *, part: str, remove_content: bool = False) -> Any:
+        """Delete only the attachment/text belonging to one confirmed native part."""
+        return await self._request('DELETE',
+            f'/api/v1/accounts/{account_id}/conversations/{conversation_id}/messages/{message_id}',
+            json_data={'wootify_part': part, 'wootify_remove_content': remove_content})
+
     async def delete_message(
         self,
         account_id: int,

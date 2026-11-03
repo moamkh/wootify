@@ -865,3 +865,47 @@ async def test_deleted_failed_voice_cancels_durable_queue_and_cannot_be_rearmed(
                                                         retry, route_key=None, delivery_id=row_id)
     assert case.adapter.send_media.await_count == int(runtime_available)
     assert "sent" not in statuses(case)
+
+
+@pytest.mark.anyio
+async def test_native_delete_removes_only_the_corresponding_batch_attachment(delivery_case):
+    from wootify.models import MessageDirection, MessageKind, MessageStatus
+    case = delivery_case
+    parent = MessageMapping(conversation_id=case.conversation.id,
+        direction=MessageDirection.chatwoot_to_platform, message_kind=MessageKind.media,
+        chatwoot_message_id='9001', platform_message_id='101', status=MessageStatus.sent,
+        platform_payload_json={'batch_message_id': '9001', 'batch_part': 'media:10',
+            'bale_delivery': {'plan': ['media:10', 'media:11'], 'primary_part': 'media:10'}})
+    child = MessageMapping(conversation_id=case.conversation.id,
+        direction=MessageDirection.chatwoot_to_platform, message_kind=MessageKind.media,
+        chatwoot_message_id=None, platform_message_id='102', status=MessageStatus.sent,
+        platform_payload_json={'batch_message_id': '9001', 'batch_part': 'media:11'})
+    case.db.add_all([parent, child]); case.db.commit()
+    result = await case.bridge._handle_platform_message_deleted(db=case.db, instance=case.instance,
+        instance_key=case.instance.instance_key, client=case.client, account_id=1,
+        event={'chat_id': '123', 'message_id': '102'})
+    assert result['ok']
+    case.client.delete_message_part.assert_awaited_once_with(1, 77, 9001, part='media:11', remove_content=False)
+    case.client.delete_message.assert_not_awaited()
+    assert not parent.platform_payload_json.get('deleted')
+    assert child.platform_payload_json['deleted']
+
+
+@pytest.mark.anyio
+async def test_chatwoot_delete_removes_every_confirmed_batch_part(delivery_case, monkeypatch):
+    from wootify.models import MessageDirection, MessageKind, MessageStatus
+    case = delivery_case
+    for index in range(3):
+        case.db.add(MessageMapping(conversation_id=case.conversation.id,
+            direction=MessageDirection.chatwoot_to_platform, message_kind=MessageKind.media,
+            chatwoot_message_id='9001' if index == 0 else None,
+            platform_message_id=str(101 + index), status=MessageStatus.sent,
+            platform_payload_json={'batch_message_id': '9001', 'batch_part': f'media:{10+index}'}))
+    case.db.commit()
+    monkeypatch.setattr(bridge_module, 'get_runtime', lambda _: case.runtime)
+    case.adapter.delete_message.return_value = {'ok': True}
+    result = await case.bridge._handle_chatwoot_message_deleted(case.db, case.instance, case.payload)
+    assert result['ok']
+    assert [call.kwargs['message_id'] for call in case.adapter.delete_message.await_args_list] == ['101', '102', '103']
+    await case.bridge._handle_chatwoot_message_deleted(case.db, case.instance, case.payload)
+    assert case.adapter.delete_message.await_count == 3
