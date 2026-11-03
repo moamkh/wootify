@@ -18,7 +18,7 @@ from pathlib import Path
 from typing import Any, Optional
 
 import httpx
-from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile, status
+from fastapi import APIRouter, Depends, File, Form, Header, HTTPException, UploadFile, status
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -659,6 +659,23 @@ async def configure_chatwoot_webhook(instance_key: str, db: Session = Depends(ge
         )
     except Exception as exc:
         _raise_http_error(status_code=500, detail='internal server error', endpoint='configure_chatwoot_webhook', exc=exc, instance_key=instance_key)
+
+
+@router.post('/webhooks/chatwoot/{instance_key}/conversation-policy')
+async def chatwoot_conversation_policy(
+    instance_key: str, payload: dict[str, Any],
+    x_wootify_inbox_token: str = Header(default=''), db: Session = Depends(get_db),
+):
+    """Resolve a managed inbox's verified identity before creating a ticket."""
+    try:
+        return await chatwoot_bridge.conversation_policy_snapshot(db, instance_key, payload, x_wootify_inbox_token)
+    except HTTPException:
+        db.rollback()
+        raise
+    except Exception:
+        db.rollback()
+        logger.exception('conversation_policy_preflight_failed instance=%s', instance_key)
+        raise HTTPException(503, 'conversation_identity_temporarily_unavailable')
 
 
 @router.post('/webhooks/chatwoot/{instance_key}', response_model=GenericMessageResponse)

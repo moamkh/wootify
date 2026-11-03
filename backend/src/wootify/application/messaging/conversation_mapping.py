@@ -109,6 +109,7 @@ class ConversationMappingService:
         chatwoot_conversation_id: str,
         chatwoot_contact_id: Optional[str] = None,
         chatwoot_inbox_id: Optional[str] = None,
+        promote: bool = True,
     ) -> Conversation:
         """Create or update a conversation mapping row."""
         try:
@@ -128,17 +129,21 @@ class ConversationMappingService:
 
             row.platform_conversation_id = str(platform_conversation_id)
             row.chatwoot_conversation_id = str(chatwoot_conversation_id)
-            row.chatwoot_contact_id = str(chatwoot_contact_id) if chatwoot_contact_id else None
-            row.chatwoot_inbox_id = str(chatwoot_inbox_id) if chatwoot_inbox_id else None
-            row.is_active = True
+            if promote or not row.chatwoot_contact_id:
+                row.chatwoot_contact_id = str(chatwoot_contact_id) if chatwoot_contact_id else None
+            if promote or not row.chatwoot_inbox_id:
+                row.chatwoot_inbox_id = str(chatwoot_inbox_id) if chatwoot_inbox_id else None
+            activate = promote or current_row is None or current_row is row
+            row.is_active = activate
             row.last_activity_at = dt.datetime.utcnow()
 
             repo.save(row)
-            repo.deactivate_platform_mappings(
-                instance_id,
-                platform_conversation_id,
-                exclude_conversation_id=row.id,
-            )
+            if activate:
+                repo.deactivate_platform_mappings(
+                    instance_id,
+                    platform_conversation_id,
+                    exclude_conversation_id=row.id,
+                )
             return row
         except Exception:
             logger.exception(

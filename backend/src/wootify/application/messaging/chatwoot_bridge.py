@@ -10,7 +10,9 @@ cleaner pattern from evolution-api/messenger_chatwoot_connector:
 from __future__ import annotations
 
 import asyncio
+import copy
 import datetime as dt
+import hmac
 import logging
 import re
 import uuid
@@ -34,6 +36,7 @@ from wootify.connectors.registry import connector_registry
 from wootify.infrastructure.persistence.models import (
     BalePvPhoneResolvedUser,
     ChatwootWebhookDelivery,
+    ContactAlias,
     Conversation,
     Instance,
     MessageDirection,
@@ -563,6 +566,32 @@ class ChatwootBridgeService:
             "chatwoot_message_id": chatwoot_message_id,
         }
 
+    @staticmethod
+    def _redirect_consolidated_conversation(db, instance, config, payload):
+        """Normalize delayed callbacks after an audited same-peer history repair."""
+        if str(payload.get('event') or 'message_created').lower() not in {'message_created', 'message_updated'}:
+            return payload  # Resolving the archived shell must never resolve its target.
+        old_id = str(MessagePayloadParser.extract_conversation_id(payload) or '')
+        redirects = config.get('verified_conversation_redirects') or {}
+        entry = redirects.get(old_id)
+        if not entry:
+            return payload
+        old = db.query(Conversation).filter_by(instance_id=instance.id, chatwoot_conversation_id=old_id).one_or_none()
+        target_id, peer_id, inbox_id = str(entry['conversation_id']), str(entry['peer_id']), str(entry['inbox_id'])
+        target = db.query(Conversation).filter_by(instance_id=instance.id, chatwoot_conversation_id=target_id).one_or_none()
+        if (not old or not target or old.platform_conversation_id != peer_id or target.platform_conversation_id != peer_id
+                or str(old.chatwoot_inbox_id) != inbox_id or str(target.chatwoot_inbox_id) != inbox_id):
+            raise ContactMappingConflict('invalid_verified_conversation_redirect')
+        supplied_inbox = str((payload.get('conversation') or {}).get('inbox_id') or payload.get('inbox_id') or inbox_id)
+        if supplied_inbox != inbox_id:
+            raise ContactMappingConflict('conversation_redirect_inbox_mismatch')
+        result = copy.deepcopy(payload)
+        result['conversation_id'] = int(target_id)
+        result['conversation'] = {**(result.get('conversation') or {}), 'id': int(target_id)}
+        if isinstance(result.get('message'), dict):
+            result['message']['conversation_id'] = int(target_id)
+        return result
+
     async def handle_chatwoot_webhook(
         self,
         db: Session,
@@ -578,6 +607,7 @@ class ChatwootBridgeService:
             return {"ok": False, "detail": "instance_not_found"}
 
         account_id = int(chatwoot_cfg["account_id"])
+        payload = self._redirect_consolidated_conversation(db, instance, chatwoot_cfg, payload)
 
         event = str(payload.get("event") or "").strip().lower()
         # Cleanup broadcasts for private failure notes are not platform edits.
@@ -1167,6 +1197,7 @@ class ChatwootBridgeService:
                     chatwoot_conversation_id=str(chatwoot_conversation_id),
                     chatwoot_contact_id=chatwoot_contact_id,
                     chatwoot_inbox_id=chatwoot_inbox_id,
+                    promote=False,
                 )
                 mapping_db.commit()
             except Exception:
@@ -1458,7 +1489,6 @@ class ChatwootBridgeService:
                 Conversation.instance_id == instance.id,
                 Conversation.platform_conversation_id == chat_id,
                 Conversation.is_active.is_(True),
-                Conversation.chatwoot_contact_id == str(contact_id),
                 or_(Conversation.chatwoot_inbox_id == str(inbox_id), Conversation.chatwoot_inbox_id.is_(None)),
             )
             .order_by(Conversation.updated_at.desc())
@@ -1468,12 +1498,16 @@ class ChatwootBridgeService:
         # Read remote status too: a missed resolution webhook must not silently
         # reopen a ticket when the operator selected "new conversation".
         try:
-            remote_convs = await client.list_contact_conversations(account_id, contact_id)
+            contact_ids = self._verified_peer_contacts(db, client, instance.id, account_id, chat_id, contact_id)
+            rows = []
+            for candidate_id in contact_ids:
+                remote_convs = await client.list_contact_conversations(account_id, int(candidate_id))
+                rows.extend({**item, '_wootify_contact_id': candidate_id}
+                            for item in self._extract_conversation_list(remote_convs))
         except httpx.HTTPStatusError as exc:
             if existing and exc.response is not None and exc.response.status_code == 404:
                 return existing  # Posting invokes the existing deleted-contact recovery.
             raise
-        rows = self._extract_conversation_list(remote_convs)
         mapped = None
         if existing:
             mapped = next((row for row in rows if str(row.get("inbox_id")) == str(inbox_id)
@@ -1492,7 +1526,8 @@ class ChatwootBridgeService:
                     # Explicitly set open (not an implicit flip). On failure the
                     # inbound delivery queue retries without posting the message.
                     await client.toggle_conversation_status(account_id, int(conv_id), "open")
-                return self._ensure_local_conversation(db, instance, chat_id, conv_id, contact_id, inbox_id)
+                return self._ensure_local_conversation(db, instance, chat_id, conv_id,
+                                                       selected.get('_wootify_contact_id', contact_id), inbox_id)
 
         created = await client.create_conversation(
             account_id,
@@ -1502,6 +1537,76 @@ class ChatwootBridgeService:
         if not conv_id:
             raise RuntimeError("Failed to create Chatwoot conversation")
         return self._ensure_local_conversation(db, instance, chat_id, conv_id, contact_id, inbox_id)
+
+    @staticmethod
+    def _verified_peer_contacts(db, client, instance_id, account_id, peer_id, fallback_contact_id):
+        """Only canonical/verified aliases may participate in conversation reuse."""
+        mapping = ContactMappingRepository(db).get(instance_id, str(peer_id))
+        ids = {str(fallback_contact_id)}
+        if mapping:
+            scope = contact_scope(client, account_id)
+            if mapping.chatwoot_scope and mapping.chatwoot_scope != scope:
+                raise ContactMappingConflict('chatwoot_account_changed_for_contact_mapping')
+            ids.add(str(mapping.chatwoot_contact_id))
+            ids.update(str(row.chatwoot_contact_id) for row in db.query(ContactAlias).filter_by(
+                instance_id=str(instance_id), platform_contact_id=str(peer_id), chatwoot_scope=scope,
+            ).filter(ContactAlias.verification_method != 'retired_contact').all())
+        return sorted(ids, key=int)
+
+    async def conversation_policy_snapshot(self, db, instance_key, payload, token):
+        """Authenticate Chatvand and resolve a recipient before it creates a ticket.
+
+        This returns identity/policy only; it never creates a conversation or
+        sends a platform message. Authentication uses the existing inbox HMAC
+        secret fetched from the configured Chatwoot account, not caller URLs.
+        """
+        from fastapi import HTTPException
+        instance, config, client = self._chatwoot_client_for_instance(db, instance_key)
+        account_id, inbox_id = int(payload['account_id']), int(payload['inbox_id'])
+        if account_id != int(config['account_id']) or inbox_id != int(config.get('inbox_id') or 0):
+            raise HTTPException(403, 'conversation_policy_scope_mismatch')
+        inbox = await client.get_inbox(account_id, inbox_id)
+        expected = str(inbox.get('hmac_token') or '')
+        if not expected or not token or not hmac.compare_digest(expected, token):
+            raise HTTPException(403, 'conversation_policy_authentication_failed')
+        platform = str(instance.platform_type.key)
+        if platform not in {'bale_pv_enterprise', 'eitaa_pv_enterprise'}:
+            return {'managed': False}
+        contact_id = int(payload['contact_id'])
+        contact = contact_identity._contact(await client.get_contact(account_id, contact_id))
+        if int(contact['id']) != contact_id:
+            raise ContactMappingConflict('chatwoot_contact_response_id_mismatch')
+        mappings, scope = ContactMappingRepository(db), contact_scope(client, account_id)
+        peer_id = mappings.unique_platform_id_for_chatwoot(instance.id, str(contact_id), chatwoot_scope=scope)
+        if not peer_id:
+            phone = self._normalize_bale_pv_phone(str(contact.get('phone_number') or ''))
+            runtime = get_runtime(instance_key)
+            if not phone or not runtime or runtime.status != 'open':
+                raise HTTPException(409, 'recipient_identity_needs_verified_platform_phone')
+            user = await runtime.adapter.resolve_phone_to_user(phone)
+            if not user or not user.get('id'):
+                raise HTTPException(409, 'recipient_phone_not_found_on_platform')
+            peer_id = str(user['id'])
+            canonical = mappings.get(instance.id, peer_id)
+            if canonical and str(canonical.chatwoot_contact_id) != str(contact_id):
+                mappings.save_verified_alias(instance.id, peer_id, str(contact_id), chatwoot_scope=scope,
+                    verification_method='bale_phone' if platform == 'bale_pv_enterprise' else 'eitaa_phone')
+            elif not canonical:
+                mappings.save(instance.id, peer_id, str(contact_id), chatwoot_scope=scope, platform_contact_type='user')
+            db.commit()
+        canonical = mappings.get(instance.id, peer_id)
+        if not canonical or (canonical.chatwoot_scope and canonical.chatwoot_scope != scope):
+            raise ContactMappingConflict('conversation_policy_missing_scoped_identity')
+        ids = self._verified_peer_contacts(db, client, instance.id, account_id, peer_id, contact_id)
+        preferred = db.query(Conversation).filter(
+            Conversation.instance_id == instance.id, Conversation.platform_conversation_id == peer_id,
+            Conversation.is_active.is_(True), Conversation.chatwoot_contact_id.in_(ids),
+            or_(Conversation.chatwoot_inbox_id == str(inbox_id), Conversation.chatwoot_inbox_id.is_(None)),
+        ).order_by(Conversation.updated_at.desc()).first()
+        return {'managed': True, 'account_id': account_id, 'inbox_id': inbox_id,
+                'peer_key': f'{instance.id}:{peer_id}', 'contact_id': int(canonical.chatwoot_contact_id),
+                'contact_ids': [int(value) for value in ids], 'reopen': reopen_enabled(config, inbox_id),
+                'preferred_conversation_id': int(preferred.chatwoot_conversation_id) if preferred else None}
 
     async def _get_remote_conversation_status(
         self,

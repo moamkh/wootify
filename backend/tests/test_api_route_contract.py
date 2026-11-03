@@ -25,6 +25,7 @@ EXPECTED_ROUTES = {
         ("GET", "/api/v1/instances/{instance_key}/chatwoot/webhook"),
         ("POST", "/api/v1/instances/{instance_key}/chatwoot/webhook"),
         ("POST", "/api/v1/webhooks/chatwoot/{instance_key}"),
+        ("POST", "/api/v1/webhooks/chatwoot/{instance_key}/conversation-policy"),
         ("POST", "/api/v1/webhooks/chatwoot/{instance_key}/enterprise/{route_key}"),
         ("POST", "/api/v1/instances/{instance_key}/bale-pv/auth/send-code"),
         ("POST", "/api/v1/instances/{instance_key}/bale-pv/auth/validate-code"),

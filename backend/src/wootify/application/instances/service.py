@@ -762,6 +762,21 @@ class InstanceService:
                 raise ValueError('reopen conversation inbox overrides must be booleans')
             normalized_overrides[str(int(key))] = enabled
 
+        redirects = data.get('verified_conversation_redirects', {})
+        if not isinstance(redirects, dict):
+            raise ValueError('verified conversation redirects must be an object')
+        normalized_redirects = {}
+        for old_id, entry in redirects.items():
+            if (not str(old_id).isdigit() or int(old_id) <= 0 or not isinstance(entry, dict)
+                    or any(not str(entry.get(key) or '').isdigit() or int(entry[key]) <= 0
+                           for key in ('conversation_id', 'inbox_id'))
+                    or str(entry['conversation_id']) == str(old_id) or not str(entry.get('peer_id') or '').strip()):
+                raise ValueError('invalid verified conversation redirect')
+            normalized_redirects[str(int(old_id))] = {'conversation_id': int(entry['conversation_id']),
+                'inbox_id': int(entry['inbox_id']), 'peer_id': str(entry['peer_id'])}
+        if any(str(value['conversation_id']) in normalized_redirects for value in normalized_redirects.values()):
+            raise ValueError('chained conversation redirects are not supported')
+
         return {
             'base_url': str(data.get('base_url') or settings.CHATWOOT_BASE_URL).strip(),
             'api_access_token': str(data.get('api_access_token') or settings.CHATWOOT_API_TOKEN).strip(),
@@ -770,6 +785,7 @@ class InstanceService:
             'auto_create': bool(data.get('auto_create', False)),
             'reopen_conversation': self._coerce_bool(reopen_conversation, default=False),
             'reopen_conversation_by_inbox': normalized_overrides,
+            'verified_conversation_redirects': normalized_redirects,
             'inbox_name': (str(data.get('inbox_name') or '').strip() or None),
         }
 
