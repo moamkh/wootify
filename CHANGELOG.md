@@ -1,6 +1,6 @@
 # Changelog
 
-## 7.1.2.3 — 2026-11-03
+## 7.1.3 — 2026-11-03
 
 - Preserve validated native source timestamps separately from insertion/audit time.
 - Propagate per-part attachment/text deletion and checkpoint full native batch deletion.
@@ -12,7 +12,9 @@
   the active inbound route. Add alias, route, retry and batch-deletion regressions.
 - Publish the previously deployed October 31/November 3 hotfix source as atomic
   commits. No schema migration, queue purge, session reset or new deployment.
-- Full explanation: `docs/releases/v7.1.2.3.md`.
+- Correct the previously published release number `v7.1.2.3` to `v7.1.3`;
+  the earlier tag remains a historical reference. No application behavior changes.
+- Full explanation: `docs/releases/v7.1.3.md`.
 
 ### 7.1.2 hotfix — 2026-10-26
 
