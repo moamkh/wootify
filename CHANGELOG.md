@@ -1,5 +1,19 @@
 # Changelog
 
+## 7.1.2.3 — 2026-11-03
+
+- Preserve validated native source timestamps separately from insertion/audit time.
+- Propagate per-part attachment/text deletion and checkpoint full native batch deletion.
+- Scope Eitaa revocations to their peers and durably supersede revoked undelivered media.
+- Apply the live reopen policy across verified contact aliases in the same instance/account.
+- Add authenticated Chatvand identity preflight before conversation creation and scoped
+  consolidation redirects without replacing WhatsApp contact identifiers.
+- Preserve historical send receipts and keep older outbound callbacks from stealing
+  the active inbound route. Add alias, route, retry and batch-deletion regressions.
+- Publish the previously deployed October 31/November 3 hotfix source as atomic
+  commits. No schema migration, queue purge, session reset or new deployment.
+- Full explanation: `docs/releases/v7.1.2.3.md`.
+
 ### 7.1.2 hotfix — 2026-10-26
 
 - Resolve unknown Eitaa phone destinations with a targeted contact import after
