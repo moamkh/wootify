@@ -952,6 +952,7 @@ class BalePollingService:
             by_instance.setdefault(item['instance_key'], []).append(item)
 
         for instance_key, items in by_instance.items():
+            self._resolve_eitaa_delete_peers(instance_key, items)
             try:
                 with SessionLocal() as db:
                     runtime = self._instances.get_runtime_instance(db, instance_key)
@@ -964,8 +965,6 @@ class BalePollingService:
                 continue
             blocked_streams: set[str] = set()
             for item in items:
-                if item['platform_key'] == 'eitaa_pv_enterprise' and item['payload'].get('deleted') and not item['payload'].get('chat_id') and blocked_streams:
-                    break  # Unknown-peer deletes must not overtake failed originals.
                 stream = self._retry_stream_key(item)
                 if stream in blocked_streams:
                     continue
@@ -975,6 +974,76 @@ class BalePollingService:
                 delivered = await self._retry_queued_event(item)
                 if not delivered:
                     blocked_streams.add(stream)
+
+    @staticmethod
+    def _resolve_eitaa_delete_peers(instance_key: str, items: list[dict[str, Any]]) -> None:
+        """Scope account-wide deletes to their peer, including undelivered originals.
+
+        A channel recovery failure must never become a barrier for private chats.
+        Keep an unresolved delete in its own stream; normalization still rejects
+        ambiguous IDs instead of selecting a different peer's message.
+        """
+        deletes = [item for item in items if item['platform_key'] == 'eitaa_pv_enterprise'
+                   and item['payload'].get('deleted') and not item['payload'].get('chat_id')]
+        if not any(item['platform_key'] == 'eitaa_pv_enterprise' and item['payload'].get('deleted') for item in items):
+            return
+        ids = {str(item['payload'].get('message_id') or '') for item in deletes}
+        peers: dict[str, set[str]] = {mid: set() for mid in ids}
+        with SessionLocal() as db:
+            rows = db.query(MessageMapping.platform_message_id, Conversation.platform_conversation_id).join(
+                Conversation, MessageMapping.conversation_id == Conversation.id,
+            ).join(Instance, Instance.id == Conversation.instance_id).filter(
+                Instance.instance_key == instance_key, MessageMapping.platform_message_id.in_(ids),
+                ~Conversation.platform_conversation_id.startswith('channel:'),
+            ).all()
+        for mid, peer in rows:
+            peers[str(mid)].add(str(peer))
+        for item in items:
+            if item['platform_key'] != 'eitaa_pv_enterprise':
+                continue
+            raw = item['payload']
+            message = raw.get('message') or {}
+            mid = str(message.get('id') or (raw.get('message_id') if raw.get('deleted') else '') or '')
+            peer = str(raw.get('chat_id') or '')
+            if mid in peers and peer and not peer.startswith('channel:'):
+                peers[mid].add(peer)
+        for item in deletes:
+            candidates = peers[str(item['payload'].get('message_id') or '')]
+            if len(candidates) == 1:
+                item['payload'] = {**item['payload'], 'chat_id': next(iter(candidates))}
+
+        # A later native revocation supersedes an undelivered original. In
+        # particular, deleted media can no longer be downloaded; waiting for
+        # that download before processing its delete would deadlock this peer.
+        later_deletes = {
+            (str(item['payload'].get('chat_id')), str(item['payload'].get('message_id'))): index
+            for index, item in enumerate(items)
+            if item['platform_key'] == 'eitaa_pv_enterprise' and item['payload'].get('deleted')
+            and item['payload'].get('chat_id')
+        }
+        with SessionLocal() as db:
+            changed = False
+            for index, item in enumerate(items):
+                if item['platform_key'] != 'eitaa_pv_enterprise' or item['payload'].get('deleted'):
+                    continue
+                original = item['payload']
+                peer = str(original.get('chat_id') or '')
+                mid = str((original.get('message') or {}).get('id') or '')
+                if not peer or later_deletes.get((peer, mid), -1) <= index:
+                    continue
+                row = db.query(InboundEventRetry).filter_by(id=item['id'], instance_key=instance_key).first()
+                if not row or row.payload_json != original:
+                    continue
+                replacement = {'deleted': True, 'chat_id': peer, 'message_id': mid,
+                               '_superseded_original': original}
+                row.payload_json = replacement
+                row.attempts = 0
+                row.last_error = None
+                row.next_attempt_at = None
+                item.update(payload=replacement, attempts=0, due=True)
+                changed = True
+            if changed:
+                db.commit()
 
     @staticmethod
     def _retry_stream_key(item: dict[str, Any]) -> str:
@@ -989,6 +1058,8 @@ class BalePollingService:
             peer_id = item['payload'].get('chat_id')
             if peer_id:
                 return f'peer:{peer_id}'
+            if item['payload'].get('deleted'):
+                return f"unresolved-delete:{item['payload'].get('message_id')}"
         return 'instance'
 
     async def _retry_queued_event(self, item: dict[str, Any]) -> bool:

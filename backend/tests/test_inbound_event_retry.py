@@ -281,6 +281,84 @@ def test_bale_failure_blocks_only_its_own_peer(monkeypatch, session_factory):
     assert [row['update_id'] for row in _queued_rows(session_factory)] == ['1', '2']
 
 
+def test_eitaa_gap_and_global_delete_do_not_block_other_chats(monkeypatch, session_factory):
+    service, _ = _service(monkeypatch, session_factory)
+    with session_factory() as db:
+        _make_instance(db)
+        for index, raw in enumerate([
+            {'chat_id': 'channel:9', 'channel_gap': True},
+            {'chat_id': 'user:7', 'message': {'id': 42}},
+            {'deleted': True, 'message_id': 42},
+            {'chat_id': 'user:8', 'message': {'id': 43}},
+        ]):
+            db.add(InboundEventRetry(instance_key='inst-1', platform_key='eitaa_pv_enterprise',
+                update_id=str(index), payload_json=raw, attempts=0,
+                created_at=datetime(2026, 1, 1) + timedelta(seconds=index)))
+        db.commit()
+    calls = []
+
+    async def normalize(instance_key, raw):
+        calls.append(raw)
+        if raw.get('channel_gap') or raw.get('chat_id') == 'user:7':
+            raise RuntimeError('temporary peer failure')
+        return {'chat_id': raw.get('chat_id')}
+
+    async def ingest(db, instance_key, event):
+        return {'ok': True}
+
+    service._normalize_with_adapter = normalize
+    monkeypatch.setattr(polling_module, 'chatwoot_bridge', SimpleNamespace(ingest_platform_event=ingest))
+    asyncio.run(service._drain_retry_queue())
+    assert [raw.get('chat_id') for raw in calls] == ['channel:9', 'user:7', 'user:8']
+    assert [row['update_id'] for row in _queued_rows(session_factory)] == ['0', '1', '2']
+
+
+@pytest.mark.parametrize('delete_peer', [None, 'user:7'])
+def test_eitaa_revoked_media_does_not_deadlock_its_later_messages(monkeypatch, session_factory, delete_peer):
+    service, _ = _service(monkeypatch, session_factory)
+    with session_factory() as db:
+        _make_instance(db)
+        for index, raw in enumerate([
+            {'chat_id': 'user:7', 'message': {'id': 42, 'media': {'_': 'messageMediaPhoto'}}},
+            {'deleted': True, 'message_id': 42, **({'chat_id': delete_peer} if delete_peer else {})},
+            {'chat_id': 'user:7', 'message': {'id': 43, 'message': 'later text'}},
+        ]):
+            db.add(InboundEventRetry(instance_key='inst-1', platform_key='eitaa_pv_enterprise',
+                update_id=str(index), payload_json=raw, attempts=12 if index == 0 else 0,
+                next_attempt_at=datetime.now(timezone.utc).replace(tzinfo=None) + timedelta(hours=1) if index == 0 else None,
+                created_at=datetime(2026, 1, 1) + timedelta(seconds=index)))
+        db.commit()
+    calls = []
+    available = False
+
+    async def normalize(instance_key, raw):
+        assert not (raw.get('message') or {}).get('media'), 'Revoked media must not be downloaded'
+        calls.append(raw)
+        return {'chat_id': raw['chat_id'], 'deleted': bool(raw.get('deleted'))}
+
+    async def ingest(db, instance_key, event):
+        if not available:
+            raise ConnectionError('temporary Chatwoot outage')
+        return {'ok': True}
+
+    service._normalize_with_adapter = normalize
+    monkeypatch.setattr(polling_module, 'chatwoot_bridge', SimpleNamespace(ingest_platform_event=ingest))
+    asyncio.run(service._drain_retry_queue())
+    remaining = _queued_rows(session_factory)
+    assert len(remaining) == 3
+    assert remaining[0]['payload']['deleted'] is True
+    assert remaining[0]['attempts'] == 1  # A new revocation resets the exhausted download backoff.
+    with session_factory() as db:
+        db.query(InboundEventRetry).filter_by(update_id='0').one().next_attempt_at = None
+        db.commit()
+    calls.clear()
+    available = True
+    asyncio.run(service._drain_retry_queue())
+    assert [bool(raw.get('deleted')) for raw in calls] == [True, True, False]
+    assert calls[0]['_superseded_original']['message']['id'] == 42
+    assert _queued_rows(session_factory) == []
+
+
 def test_bale_queue_retains_non_exception_delivery_failure(monkeypatch, session_factory):
     service, _ = _service(monkeypatch, session_factory)
     with session_factory() as db:
