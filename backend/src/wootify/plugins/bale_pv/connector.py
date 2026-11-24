@@ -183,6 +183,7 @@ class BalePvConnector:
         # authenticates transfers purely via cookies, so a shared jar would
         # let one instance's transfer authenticate as another instance.
         self._media_http_clients: Dict[str, Any] = {}
+        self._media_auth_locks: Dict[str, asyncio.Lock] = {}
 
     def _get_runtime(self, instance: str) -> BalePvInstanceRuntime:
         runtime = self._instances.get(instance)
@@ -1007,77 +1008,93 @@ class BalePvConnector:
         # Reuse the per-instance media client (created lazily, closed in
         # disconnect()/close()).
         client = self._get_media_http_client(instance)
-        # Establish cookie session with retries on transient network errors.
-        cookie_resp = None
-        last_cookie_err = None
-        for attempt in range(1, 4):
-            try:
-                cookie_resp = await client.post(
-                    "https://next-ws.bale.ai/set-cookie/",
-                    headers={
-                        "Authorization": f"Bearer {jwt}",
-                        "Origin": "https://web.bale.ai",
-                    },
-                )
-                break
-            except httpx.TransportError as exc:
-                last_cookie_err = exc
-                self._logger.warning(
-                    "bale_pv set_cookie_retry instance=%s attempt=%s/%s error=%s",
-                    instance,
-                    attempt,
-                    3,
-                    exc,
-                )
-                if attempt < 3:
-                    await asyncio.sleep(2 ** attempt)
-        if cookie_resp is None:
-            raise BalePreSendError(
-                f"Bale set-cookie failed after retries: {last_cookie_err}"
-            ) from last_cookie_err
-        if cookie_resp.status_code != 200:
-            error_type = BalePreSendError if cookie_resp.status_code in (408, 429) or cookie_resp.status_code >= 500 else RuntimeError
-            raise error_type(f"Bale set-cookie failed: HTTP {cookie_resp.status_code}")
+        async def establish_cookie() -> None:
+            cookie_resp = None
+            last_cookie_err = None
+            for attempt in range(1, 4):
+                try:
+                    cookie_resp = await client.post(
+                        "https://next-ws.bale.ai/set-cookie/",
+                        headers={
+                            "Authorization": f"Bearer {jwt}",
+                            "Origin": "https://web.bale.ai",
+                        },
+                    )
+                    break
+                except httpx.TransportError as exc:
+                    last_cookie_err = exc
+                    self._logger.warning(
+                        "bale_pv set_cookie_retry instance=%s attempt=%s/%s error=%s",
+                        instance,
+                        attempt,
+                        3,
+                        exc,
+                    )
+                    if attempt < 3:
+                        await asyncio.sleep(2 ** attempt)
+            if cookie_resp is None:
+                raise BalePreSendError(
+                    f"Bale set-cookie failed after retries: {last_cookie_err}"
+                ) from last_cookie_err
+            if cookie_resp.status_code != 200:
+                error_type = BalePreSendError if cookie_resp.status_code in (408, 429) or cookie_resp.status_code >= 500 else RuntimeError
+                raise error_type(f"Bale set-cookie failed: HTTP {cookie_resp.status_code}")
 
-        # Call GetNasimFileUploadUrl with retries on transient network errors.
-        resp = None
-        last_upload_url_err = None
-        for attempt in range(1, 4):
-            try:
-                resp = await client.post(
-                    "https://next-ws.bale.ai/ai.bale.server.Files/GetNasimFileUploadUrl",
-                    content=grpc_web_frame(req.serialize()),
-                    headers={
-                        "content-type": "application/grpc-web+proto",
-                        "x-grpc-web": "1",
-                        "mt_app_version": "157595",
-                        "app_version": "157595",
-                        "browser_type": "1",
-                        "mt_browser_type": "1",
-                        "browser_version": "148.0.0.0",
-                        "mt_browser_version": "148.0.0.0",
-                        "os_type": "3",
-                        "mt_os_type": "3",
-                        "session_id": str(int(time.time() * 1000)),
-                        "mt_session_id": str(int(time.time() * 1000)),
-                    },
-                )
-                break
-            except httpx.TransportError as exc:
-                last_upload_url_err = exc
-                self._logger.warning(
-                    "bale_pv get_upload_url_retry instance=%s attempt=%s/%s error=%s",
-                    instance,
-                    attempt,
-                    3,
-                    exc,
-                )
-                if attempt < 3:
-                    await asyncio.sleep(2 ** attempt)
-        if resp is None:
-            raise BalePreSendError(
-                f"GetNasimFileUploadUrl failed after retries: {last_upload_url_err}"
-            ) from last_upload_url_err
+        async def negotiate_upload_url() -> Any:
+            resp = None
+            last_upload_url_err = None
+            for attempt in range(1, 4):
+                try:
+                    resp = await client.post(
+                        "https://next-ws.bale.ai/ai.bale.server.Files/GetNasimFileUploadUrl",
+                        content=grpc_web_frame(req.serialize()),
+                        headers={
+                            "content-type": "application/grpc-web+proto",
+                            "x-grpc-web": "1",
+                            "mt_app_version": "157595",
+                            "app_version": "157595",
+                            "browser_type": "1",
+                            "mt_browser_type": "1",
+                            "browser_version": "148.0.0.0",
+                            "mt_browser_version": "148.0.0.0",
+                            "os_type": "3",
+                            "mt_os_type": "3",
+                            "session_id": str(int(time.time() * 1000)),
+                            "mt_session_id": str(int(time.time() * 1000)),
+                        },
+                    )
+                    break
+                except httpx.TransportError as exc:
+                    last_upload_url_err = exc
+                    self._logger.warning(
+                        "bale_pv get_upload_url_retry instance=%s attempt=%s/%s error=%s",
+                        instance,
+                        attempt,
+                        3,
+                        exc,
+                    )
+                    if attempt < 3:
+                        await asyncio.sleep(2 ** attempt)
+            if resp is None:
+                raise BalePreSendError(
+                    f"GetNasimFileUploadUrl failed after retries: {last_upload_url_err}"
+                ) from last_upload_url_err
+            return resp
+
+        # Cookie replacement and negotiation share one per-instance lock so a
+        # concurrent upload cannot clear or consume another attempt's session.
+        auth_lock = self._media_auth_locks.get(instance)
+        if auth_lock is None:
+            auth_lock = asyncio.Lock()
+            self._media_auth_locks[instance] = auth_lock
+        async with auth_lock:
+            await establish_cookie()
+            resp = await negotiate_upload_url()
+            if resp.status_code == 401:
+                client.cookies.clear()
+                self._logger.info("bale_pv upload_url_auth_refresh instance=%s", instance)
+                await establish_cookie()
+                resp = await negotiate_upload_url()
         if resp.status_code >= 400:
             error_type = BalePreSendError if resp.status_code in (408, 429) or resp.status_code >= 500 else RuntimeError
             raise error_type(f"GetNasimFileUploadUrl failed: HTTP {resp.status_code}")
@@ -2333,44 +2350,48 @@ class BalePvConnector:
             # Reuse the per-instance media client (created lazily, closed in
             # disconnect()/close()).
             client = self._get_media_http_client(instance)
-            # Establish cookie session
-            cookie_resp = await client.post(
-                "https://next-ws.bale.ai/set-cookie/",
-                headers={
-                    "Authorization": f"Bearer {jwt}",
-                    "Origin": "https://web.bale.ai",
-                },
-            )
-            if cookie_resp.status_code != 200:
-                self._logger.warning(
-                    "bale_pv set_cookie_failed instance=%s status=%s",
-                    instance,
-                    cookie_resp.status_code,
-                )
-                return b"", None, None
-
             download_url: Optional[str] = None
 
-            # Try GetNasimFileUrl first (single file URL).
+            # Try GetNasimFileUrl first (single file URL), sharing the upload
+            # auth lock so a 401 refresh cannot clear this negotiation's cookie.
             req = GetNasimFileUrlRequest(file_id=fid, access_hash=ahash, file_storage_version=file_storage_version)
-            resp = await client.post(
-                "https://next-ws.bale.ai/ai.bale.server.Files/GetNasimFileUrl",
-                content=grpc_web_frame(req.serialize()),
-                headers={
-                    "content-type": "application/grpc-web+proto",
-                    "x-grpc-web": "1",
-                    "mt_app_version": "157595",
-                    "app_version": "157595",
-                    "browser_type": "1",
-                    "mt_browser_type": "1",
-                    "browser_version": "148.0.0.0",
-                    "mt_browser_version": "148.0.0.0",
-                    "os_type": "3",
-                    "mt_os_type": "3",
-                    "session_id": str(int(time.time() * 1000)),
-                    "mt_session_id": str(int(time.time() * 1000)),
-                },
-            )
+            auth_lock = self._media_auth_locks.get(instance)
+            if auth_lock is None:
+                auth_lock = asyncio.Lock()
+                self._media_auth_locks[instance] = auth_lock
+            async with auth_lock:
+                cookie_resp = await client.post(
+                    "https://next-ws.bale.ai/set-cookie/",
+                    headers={
+                        "Authorization": f"Bearer {jwt}",
+                        "Origin": "https://web.bale.ai",
+                    },
+                )
+                if cookie_resp.status_code != 200:
+                    self._logger.warning(
+                        "bale_pv set_cookie_failed instance=%s status=%s",
+                        instance,
+                        cookie_resp.status_code,
+                    )
+                    return b"", None, None
+                resp = await client.post(
+                    "https://next-ws.bale.ai/ai.bale.server.Files/GetNasimFileUrl",
+                    content=grpc_web_frame(req.serialize()),
+                    headers={
+                        "content-type": "application/grpc-web+proto",
+                        "x-grpc-web": "1",
+                        "mt_app_version": "157595",
+                        "app_version": "157595",
+                        "browser_type": "1",
+                        "mt_browser_type": "1",
+                        "browser_version": "148.0.0.0",
+                        "mt_browser_version": "148.0.0.0",
+                        "os_type": "3",
+                        "mt_os_type": "3",
+                        "session_id": str(int(time.time() * 1000)),
+                        "mt_session_id": str(int(time.time() * 1000)),
+                    },
+                )
 
             msg, status, grpc_msg = parse_grpc_web_response(resp.content)
             if status != 0:
@@ -2404,24 +2425,25 @@ class BalePvConnector:
                     peer_id=int(peer_id),
                     files=[{"file_id": fid, "access_hash": ahash, "file_storage_version": file_storage_version}],
                 )
-                urls_resp = await client.post(
-                    "https://next-ws.bale.ai/ai.bale.server.Files/GetNasimFileUrls",
-                    content=grpc_web_frame(urls_req.serialize()),
-                    headers={
-                        "content-type": "application/grpc-web+proto",
-                        "x-grpc-web": "1",
-                        "mt_app_version": "157595",
-                        "app_version": "157595",
-                        "browser_type": "1",
-                        "mt_browser_type": "1",
-                        "browser_version": "148.0.0.0",
-                        "mt_browser_version": "148.0.0.0",
-                        "os_type": "3",
-                        "mt_os_type": "3",
-                        "session_id": str(int(time.time() * 1000)),
-                        "mt_session_id": str(int(time.time() * 1000)),
-                    },
-                )
+                async with auth_lock:
+                    urls_resp = await client.post(
+                        "https://next-ws.bale.ai/ai.bale.server.Files/GetNasimFileUrls",
+                        content=grpc_web_frame(urls_req.serialize()),
+                        headers={
+                            "content-type": "application/grpc-web+proto",
+                            "x-grpc-web": "1",
+                            "mt_app_version": "157595",
+                            "app_version": "157595",
+                            "browser_type": "1",
+                            "mt_browser_type": "1",
+                            "browser_version": "148.0.0.0",
+                            "mt_browser_version": "148.0.0.0",
+                            "os_type": "3",
+                            "mt_os_type": "3",
+                            "session_id": str(int(time.time() * 1000)),
+                            "mt_session_id": str(int(time.time() * 1000)),
+                        },
+                    )
                 urls_msg, urls_status, urls_grpc_msg = parse_grpc_web_response(
                     urls_resp.content
                 )

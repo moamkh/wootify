@@ -2134,7 +2134,14 @@ class ChatwootBridgeService:
             ids.add(int(note_id))
             stored['_wootify_failure_note_ids'] = sorted(ids)
             row.payload_json = stored
-        db.commit()
+        instance = db.query(Instance).filter_by(instance_key=instance_key).one_or_none()
+        receipt = self._bale_outbound.mapping(db, instance, payload) if instance is not None else None
+        ledger = self._bale_outbound.state(receipt) if receipt is not None else {}
+        if ledger:
+            ledger['failure_note_ids'] = sorted(set(ledger.get('failure_note_ids') or []) | {int(note_id)})
+            self._bale_outbound.save(db, receipt, ledger)
+        else:
+            db.commit()
 
     async def _find_tagged_failure_notes(self, client: ChatwootClient, account_id: int, conversation_id: int,
                                           instance_key: str, message_id: str, *, before: Optional[int] = None) -> list[int]:
@@ -2151,8 +2158,10 @@ class ChatwootBridgeService:
                 if not isinstance(note, dict) or not str(note.get('id') or '').isdigit():
                     continue
                 valid_ids.append(int(note['id']))
-                marker = (note.get('content_attributes') or {}).get('wootify_delivery_failure') or {}
-                if note.get('private') is True and marker.get('instance_key') == instance_key and str(marker.get('message_id')) == message_id:
+                attributes = note.get('content_attributes') or {}
+                marker = attributes.get('wootify_delivery_failure') if isinstance(attributes, dict) else {}
+                if (note.get('private') is True and isinstance(marker, dict)
+                        and marker.get('instance_key') == instance_key and str(marker.get('message_id')) == message_id):
                     found.add(int(note['id']))
             if not valid_ids or min(valid_ids) == before or (message_id.isdigit() and min(valid_ids) <= int(message_id)):
                 break
@@ -2166,14 +2175,27 @@ class ChatwootBridgeService:
         message_id = str(MessagePayloadParser.extract_message_id(payload) or '')
         conversation_id = int(MessagePayloadParser.extract_conversation_id(payload))
         rows = self._delivery_rows(db, instance.instance_key, payload)
+        receipt = self._bale_outbound.mapping(db, instance, payload)
+        ledger = self._bale_outbound.state(receipt) if receipt is not None else {}
         note_ids = {int(note_id) for row in rows for note_id in (row.payload_json or {}).get('_wootify_failure_note_ids', [])}
-        # No scan on ordinary success. A recorded failure/sync retry needs the
-        # recovery scan too, to clean up notes after ambiguous POST responses.
+        note_ids.update(int(note_id) for note_id in ledger.get('failure_note_ids', []))
+        # Ordinary confirmed successes do not scan Chatwoot. Native Retry starts
+        # one legacy recovery scan; the durable ledger resumes it even when the
+        # original queue rows and their note metadata are no longer available.
         scan_rows = [row for row in rows if (row.payload_json or {}).get('_wootify_failure_note_scan_before')
                      or ((row.payload_json or {}).get('_wootify_failure_note_attempted') and not (row.payload_json or {}).get('_wootify_failure_note_ids'))]
-        if scan_rows:
-            cursor = min([int(row.payload_json['_wootify_failure_note_scan_before']) for row in scan_rows
-                          if row.payload_json.get('_wootify_failure_note_scan_before')] or [0]) or None
+        durable_scan = ledger.get('failure_note_scan_before') or (
+            ledger.get('failure_note_attempted') and not ledger.get('failure_note_ids'))
+        retry_scan = (self._bale_outbound.platform_key(instance) == 'bale_pv_enterprise'
+                      and payload.get('wootify_retry') is True and ledger.get('complete') is True
+                      and ledger.get('failure_note_scan_complete') is not True)
+        should_scan = bool(scan_rows or durable_scan or retry_scan)
+        if should_scan:
+            cursors = [int(row.payload_json['_wootify_failure_note_scan_before']) for row in scan_rows
+                       if row.payload_json.get('_wootify_failure_note_scan_before')]
+            if ledger.get('failure_note_scan_before'):
+                cursors.append(int(ledger['failure_note_scan_before']))
+            cursor = min(cursors or [0]) or None
             try:
                 note_ids.update(await self._find_tagged_failure_notes(client, int(config['account_id']), conversation_id,
                     instance.instance_key, message_id, before=cursor))
@@ -2182,8 +2204,27 @@ class ChatwootBridgeService:
                 for row in rows:
                     row.payload_json = {**(row.payload_json or {}), '_wootify_failure_note_ids': sorted(note_ids),
                                         '_wootify_failure_note_scan_before': pending.before}
-                db.commit()
+                if ledger:
+                    ledger['failure_note_ids'] = sorted(note_ids)
+                    ledger['failure_note_scan_before'] = pending.before
+                    self._bale_outbound.save(db, receipt, ledger)
+                else:
+                    db.commit()
                 raise
+        if note_ids or should_scan:
+            # Checkpoint discovered IDs before the first DELETE. A transient
+            # cleanup failure is then resumable by any repeated confirmation.
+            for row in rows:
+                row.payload_json = {**(row.payload_json or {}), '_wootify_failure_note_ids': sorted(note_ids),
+                                    '_wootify_failure_note_attempted': True}
+                row.payload_json.pop('_wootify_failure_note_scan_before', None)
+            if ledger:
+                ledger['failure_note_ids'] = sorted(note_ids)
+                ledger['failure_note_attempted'] = True
+                ledger.pop('failure_note_scan_before', None)
+                self._bale_outbound.save(db, receipt, ledger)
+            else:
+                db.commit()
         for note_id in sorted(note_ids):
             await client.delete_delivery_failure_note(int(config['account_id']), conversation_id, note_id)
         for row in rows:
@@ -2192,7 +2233,15 @@ class ChatwootBridgeService:
             stored.pop('_wootify_failure_note_attempted', None)
             stored.pop('_wootify_failure_note_scan_before', None)
             row.payload_json = stored
-        db.commit()
+        if ledger:
+            ledger['failure_note_ids'] = []
+            ledger.pop('failure_note_attempted', None)
+            ledger.pop('failure_note_scan_before', None)
+            if should_scan:
+                ledger['failure_note_scan_complete'] = True
+            self._bale_outbound.save(db, receipt, ledger)
+        else:
+            db.commit()
 
     async def _notify_delivery_failure(
         self,
@@ -2236,6 +2285,12 @@ class ChatwootBridgeService:
             instance_key = str(payload.get('_wootify_instance_key') or '')
             status_error = None
             managed_bale = db is not None and platform_key in CONFIRMED_DELIVERY_PLATFORMS and bool(instance_key)
+            delivery_row = None
+            delivery_state = {}
+            if managed_bale:
+                instance = db.query(Instance).filter_by(instance_key=instance_key).one_or_none()
+                delivery_row = self._bale_outbound.mapping(db, instance, payload) if instance is not None else None
+                delivery_state = self._bale_outbound.state(delivery_row) if delivery_row is not None else {}
             if managed_bale and not retryable:
                 for row in self._delivery_rows(db, instance_key, payload):
                     row.payload_json = {**(row.payload_json or {}), '_wootify_terminal_failure': {
@@ -2288,19 +2343,28 @@ class ChatwootBridgeService:
             if managed_bale:
                 known = [note_id for row in self._delivery_rows(db, instance_key, payload)
                          for note_id in (row.payload_json or {}).get('_wootify_failure_note_ids', [])]
+                known.extend(delivery_state.get('failure_note_ids') or [])
                 if known:
                     if status_error and managed_bale:
                         raise DeliveryStatusSyncError('Cannot mark the failed platform message red in Chatwoot') from status_error
                     return
-                cursor = min([int(row.payload_json['_wootify_failure_note_scan_before']) for row in self._delivery_rows(db, instance_key, payload)
-                              if row.payload_json.get('_wootify_failure_note_scan_before')] or [0]) or None
+                cursors = [int(row.payload_json['_wootify_failure_note_scan_before']) for row in self._delivery_rows(db, instance_key, payload)
+                           if row.payload_json.get('_wootify_failure_note_scan_before')]
+                if delivery_state.get('failure_note_scan_before'):
+                    cursors.append(int(delivery_state['failure_note_scan_before']))
+                cursor = min(cursors or [0]) or None
                 try:
                     found = await self._find_tagged_failure_notes(client, account_id, int(conversation_id), instance_key, str(source_message_id), before=cursor)
                 except FailureNoteScanPending as pending:
                     for row in self._delivery_rows(db, instance_key, payload):
                         row.payload_json = {**(row.payload_json or {}), '_wootify_failure_note_ids': pending.note_ids,
                                             '_wootify_failure_note_scan_before': pending.before}
-                    db.commit()
+                    if delivery_state:
+                        delivery_state['failure_note_ids'] = pending.note_ids
+                        delivery_state['failure_note_scan_before'] = pending.before
+                        self._bale_outbound.save(db, delivery_row, delivery_state)
+                    else:
+                        db.commit()
                     raise
                 if found:
                     for note_id in found:
@@ -2331,7 +2395,11 @@ class ChatwootBridgeService:
                     if db is not None:
                         for row in self._delivery_rows(db, instance_key, payload):
                             row.payload_json = {**(row.payload_json or {}), '_wootify_failure_note_attempted': True}
-                        db.commit()
+                        if delivery_state:
+                            delivery_state['failure_note_attempted'] = True
+                            self._bale_outbound.save(db, delivery_row, delivery_state)
+                        else:
+                            db.commit()
                 result = await client.post_message(
                     account_id,
                     int(conversation_id),

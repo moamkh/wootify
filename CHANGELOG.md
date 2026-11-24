@@ -14,6 +14,10 @@
   commits. No schema migration, queue purge, session reset or new deployment.
 - Correct the previously published release number `v7.1.2.3` to `v7.1.3`;
   the earlier tag remains a historical reference. No application behavior changes.
+- Serialize Bale PV media authentication per instance and refresh once after an
+  upload-url 401; persistent authentication failures stop before upload or send.
+- Keep failure-note IDs and scan checkpoints in the durable Bale delivery ledger
+  so retries and late confirmations clean up exact tagged notes without resending.
 - Full explanation: `docs/releases/v7.1.3.md`.
 
 ### 7.1.2 hotfix — 2026-10-26

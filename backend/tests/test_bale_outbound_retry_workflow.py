@@ -382,6 +382,109 @@ async def test_more_than_five_note_pages_preserve_cursor_and_resume_cleanup_with
     assert statuses(case)[-1] == "sent"
 
 
+async def confirm_without_queue(case, rid=5400):
+    case.payload["content"] = "sample"
+    async def confirmed(*args, **options):
+        return await accepted(case, rid, options)
+    case.adapter.send_text.side_effect = confirmed
+    await deliver(case, content="sample")
+    assert case.db.query(ChatwootWebhookDelivery).count() == 0
+    assert case.adapter.send_text.await_count == 1
+    case.client.list_conversation_messages.assert_not_awaited()
+
+
+def retry_client(case, monkeypatch):
+    monkeypatch.setattr(bridge_module, "get_runtime", lambda _: None)
+    monkeypatch.setattr(case.bridge, "_chatwoot_client_for_instance",
+                        lambda *_: (case.instance, case.config, case.client))
+
+
+@pytest.mark.anyio
+async def test_confirmed_retry_without_queue_metadata_deletes_only_exact_tag_once(delivery_case, monkeypatch):
+    case = delivery_case
+    del case.bridge.__dict__["_remove_delivery_failure_notes"]
+    await confirm_without_queue(case)
+    marker = {"instance_key": case.instance.instance_key, "message_id": "9001"}
+    case.client.list_conversation_messages.side_effect = [{"payload": [
+        {"id": 9601, "private": True, "content_attributes": {"wootify_delivery_failure": marker}},
+        {"id": 9602, "private": True, "content_attributes": {"wootify_delivery_failure": {**marker, "instance_key": "other"}}},
+        {"id": 9603, "private": True, "content_attributes": {"wootify_delivery_failure": {**marker, "message_id": "9002"}}},
+        {"id": 9604, "private": False, "content_attributes": {"wootify_delivery_failure": marker}},
+        {"id": 9605, "private": True, "content": "Delivery to Bale PV failed", "content_attributes": {}},
+        {"id": 9606, "private": True, "content_attributes": {"wootify_delivery_failure": "invalid"}},
+    ]}, {"payload": []}]
+    retry_client(case, monkeypatch)
+    retry = {**case.payload, "wootify_retry": True, "retry_request_id": "legacy-retry"}
+
+    result = await case.bridge.handle_chatwoot_webhook(case.db, case.instance.instance_key, retry)
+
+    assert result["reason"] == "duplicate_delivery"
+    case.client.delete_delivery_failure_note.assert_awaited_once_with(1, 77, 9601)
+    assert case.adapter.send_text.await_count == 1
+    await case.bridge.handle_chatwoot_webhook(case.db, case.instance.instance_key, retry)
+    assert case.client.list_conversation_messages.await_count == 2
+    case.client.delete_delivery_failure_note.assert_awaited_once()
+    assert case.adapter.send_text.await_count == 1
+
+
+@pytest.mark.anyio
+async def test_transient_note_cleanup_failure_resumes_on_repeated_webhook_without_resend(delivery_case, monkeypatch):
+    case = delivery_case
+    del case.bridge.__dict__["_remove_delivery_failure_notes"]
+    await confirm_without_queue(case, rid=5401)
+    marker = {"instance_key": case.instance.instance_key, "message_id": "9001"}
+    case.client.list_conversation_messages.side_effect = [
+        {"payload": [{"id": 9601, "private": True, "content_attributes": {"wootify_delivery_failure": marker}}]},
+        {"payload": []},
+    ]
+    case.client.delete_delivery_failure_note.side_effect = [ConnectionError("Chatwoot unavailable"), None]
+    retry_client(case, monkeypatch)
+
+    with pytest.raises(DeliveryStatusSyncError):
+        await case.bridge.handle_chatwoot_webhook(case.db, case.instance.instance_key,
+            {**case.payload, "wootify_retry": True, "retry_request_id": "cleanup-retry"})
+    row = case.delivery.mapping(case.db, case.instance, case.payload)
+    assert case.delivery.state(row)["failure_note_ids"] == [9601]
+
+    result = await case.bridge.handle_chatwoot_webhook(case.db, case.instance.instance_key, case.payload)
+
+    assert result["reason"] == "duplicate_delivery"
+    assert case.client.list_conversation_messages.await_count == 2
+    assert case.client.delete_delivery_failure_note.await_count == 2
+    assert case.adapter.send_text.await_count == 1
+    assert statuses(case)[-1] == "sent"
+
+
+@pytest.mark.anyio
+async def test_durable_note_scan_cursor_resumes_without_queue_or_transport_resend(delivery_case, monkeypatch):
+    case = delivery_case
+    del case.bridge.__dict__["_remove_delivery_failure_notes"]
+    await confirm_without_queue(case, rid=5402)
+    marker = {"instance_key": case.instance.instance_key, "message_id": "9001"}
+    def page(note_id, tagged=False):
+        return {"payload": [{"id": note_id, "private": tagged,
+            "content_attributes": {"wootify_delivery_failure": marker} if tagged else {}}]}
+    case.client.list_conversation_messages.side_effect = [
+        page(10000, tagged=True), page(9900), page(9800), page(9700), page(9600),
+        page(9500, tagged=True), page(9001),
+    ]
+    retry_client(case, monkeypatch)
+
+    with pytest.raises(DeliveryStatusSyncError) as failed_cleanup:
+        await case.bridge.handle_chatwoot_webhook(case.db, case.instance.instance_key,
+            {**case.payload, "wootify_retry": True, "retry_request_id": "paged-cleanup"})
+    assert isinstance(failed_cleanup.value.__cause__, FailureNoteScanPending)
+    row = case.delivery.mapping(case.db, case.instance, case.payload)
+    assert case.delivery.state(row)["failure_note_scan_before"] == 9600
+
+    await case.bridge.handle_chatwoot_webhook(case.db, case.instance.instance_key, case.payload)
+
+    assert case.client.list_conversation_messages.await_args_list[5].kwargs == {"before": 9600}
+    assert [call.args[2] for call in case.client.delete_delivery_failure_note.await_args_list] == [9500, 10000]
+    assert case.adapter.send_text.await_count == 1
+    assert case.db.query(ChatwootWebhookDelivery).count() == 0
+
+
 @pytest.mark.anyio
 async def test_bridge_pre_dispatch_failure_retry_delivers_voice_and_removes_its_note(integration_case, monkeypatch):
     case = integration_case
@@ -431,6 +534,42 @@ async def test_native_echo_before_lost_ack_is_authoritative_and_cannot_turn_red_
     case.client.post_message.assert_not_awaited()
     assert case.adapter.send_text.await_count == 1
     assert case.delivery.state(case.delivery.mapping(case.db, case.instance, case.payload))["complete"] is True
+
+
+@pytest.mark.anyio
+async def test_failure_note_id_in_media_ledger_is_cleaned_by_late_native_ack_after_queue_loss(delivery_case):
+    case = delivery_case
+    del case.bridge.__dict__["_remove_delivery_failure_notes"]
+    case.payload["attachments"] = media_parts()[:1]
+    case.payload["_wootify_instance_key"] = case.instance.instance_key
+    async def uncertain(*args, **options):
+        await options["before_dispatch"](5503)
+        raise BaleRequestUnconfirmedError("ACK delayed")
+    case.adapter.send_media.side_effect = uncertain
+    with pytest.raises(BaleRequestUnconfirmedError):
+        await deliver(case, media_parts()[:1])
+    queued = add_queue_note_ledger(case)
+    case.client.list_conversation_messages.return_value = {"payload": []}
+    case.client.post_message.return_value = {"id": 9703}
+
+    await case.bridge._notify_delivery_failure(case.client, 1, case.payload, "123",
+        BaleRequestUnconfirmedError("ACK delayed"), platform_type="bale_pv_enterprise", db=case.db)
+
+    row = case.delivery.mapping(case.db, case.instance, case.payload)
+    assert case.delivery.state(row)["failure_note_attempted"] is True
+    assert case.delivery.state(row)["failure_note_ids"] == [9703]
+    assert queued.payload_json["_wootify_failure_note_ids"] == [9703]
+    case.db.delete(queued)
+    case.db.commit()
+
+    result = await case.delivery.reconcile_echo(case.db, case.instance, case.client, case.config,
+        {"outgoing": True, "chat_id": "123", "platform_message_id": "5503"})
+
+    assert result["confirmation_reconciled"] is True
+    case.client.delete_delivery_failure_note.assert_awaited_once_with(1, 77, 9703)
+    assert case.client.list_conversation_messages.await_count == 1
+    assert case.adapter.send_media.await_count == 1
+    assert statuses(case)[-1] == "sent"
 
 
 @pytest.mark.anyio

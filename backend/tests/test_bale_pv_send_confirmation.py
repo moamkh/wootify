@@ -26,6 +26,7 @@ def _runtime(connector):
 
 def _media_client(connector):
     client = AsyncMock()
+    client.cookies = MagicMock()
     cookie = httpx.Response(200)
     upload_url = ProtobufMessage().add_int64(1, 123).add_string(2, "https://storage.test/upload").add_int64(3, 456)
     client.post.side_effect = [cookie, httpx.Response(200, content=grpc_web_frame(upload_url.serialize()))]
@@ -122,6 +123,51 @@ async def test_preflight_http_status_classification(stage, status, expected_type
         await connector.send_media(runtime.instance_key, "123", b"voice", "voice.ogg")
     if status == 403:
         assert not isinstance(caught.value, BalePreSendError)
+    runtime.client.send_document.assert_not_awaited()
+
+
+@pytest.mark.anyio
+async def test_upload_url_401_refreshes_cookie_once_then_sends_once():
+    connector = BalePvConnector()
+    runtime = _runtime(connector)
+    client = _media_client(connector)
+    upload_url = ProtobufMessage().add_int64(1, 123).add_string(2, "https://storage.test/upload").add_int64(3, 456)
+    client.post.side_effect = [
+        httpx.Response(200),
+        httpx.Response(401),
+        httpx.Response(200),
+        httpx.Response(200, content=grpc_web_frame(upload_url.serialize())),
+    ]
+    runtime.client.send_document.return_value = b""
+
+    result = await connector.send_media(
+        runtime.instance_key, "123", b"voice", "voice.ogg", mirror_echo=False,
+        idempotency_key="cw:42:media:0",
+    )
+
+    assert result["ok"] is True
+    client.cookies.clear.assert_called_once_with()
+    assert client.post.await_count == 4
+    client.put.assert_awaited_once()
+    runtime.client.send_document.assert_awaited_once()
+
+
+@pytest.mark.anyio
+async def test_persistent_upload_url_401_fails_without_storage_or_message_dispatch():
+    connector = BalePvConnector()
+    runtime = _runtime(connector)
+    client = _media_client(connector)
+    client.post.side_effect = [
+        httpx.Response(200), httpx.Response(401),
+        httpx.Response(200), httpx.Response(401),
+    ]
+
+    with pytest.raises(RuntimeError, match="GetNasimFileUploadUrl failed: HTTP 401"):
+        await connector.send_media(runtime.instance_key, "123", b"voice", "voice.ogg")
+
+    client.cookies.clear.assert_called_once_with()
+    assert client.post.await_count == 4
+    client.put.assert_not_awaited()
     runtime.client.send_document.assert_not_awaited()
 
 
